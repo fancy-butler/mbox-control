@@ -1,5 +1,17 @@
 # Changelog
 
+## 4.15
+- **EQ that follows the Spkr button.** Speakers & apps → EQ: give each speaker set its own EQ, so your
+  headphones get their correction and your speakers theirs. Switching is instant and silent, and
+  "Off (flat)" is bit-for-bit the same as no EQ.
+- **Find my headphones (AutoEQ):** search over 5,000 measured headphones (e.g. Sennheiser HD 280 Pro by
+  oratory1990) and apply the correction in one click. You can also import ParametricEQ.txt files
+  from REW or Equalizer APO for room or speaker correction.
+- **Tone:** bass and treble on top of any profile, with automatic headroom so boosts never clip.
+- **Clean mic (voice chain):** a new input, "Mic — clean (Mbox)", with low-cut, noise reduction (RNNoise)
+  and a gentle compressor, using whichever of those plugins you have.
+- Fix: lists that rebuild (EQ, apps, AirPlay) no longer leave stale rows behind.
+
 ## 4.14.1
 - **The window no longer freezes when the Mbox locks up.** Any helper that stops answering (PipeWire
   or the Mbox's control service) is skipped for 30 seconds instead of being waited on over and over.

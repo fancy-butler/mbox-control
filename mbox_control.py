@@ -46,7 +46,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QPointF, QRectF
 
 APP_NAME = "Mbox Control"
-VERSION = "4.14.1"
+VERSION = "4.15"
 UPDATE_REPO = ""          # "owner/mbox-control" once the project is on GitHub; empty = no online checks
 HOME = Path.home()
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -503,6 +503,8 @@ PKGS = {   # feature → package names per package manager
     "numpy": {"pacman": ["python-numpy"], "apt-get": ["python3-numpy"], "dnf": ["python3-numpy"],
               "zypper": ["python3-numpy"]},
     "ffmpeg": {"pacman": ["ffmpeg"], "apt-get": ["ffmpeg"], "dnf": ["ffmpeg-free"], "zypper": ["ffmpeg"]},
+    "compressor": {"pacman": ["swh-plugins"], "apt-get": ["swh-plugins"], "dnf": ["ladspa-swh-plugins"],
+                   "zypper": ["ladspa-swh-plugins"]},
     "pipewire-jack": {"pacman": ["pipewire-jack"], "apt-get": ["pipewire-jack"],
                       "dnf": ["pipewire-jack-audio-connection-kit"], "zypper": ["pipewire-libjack-0_3"]},
 }
@@ -745,6 +747,8 @@ CARD_ICONS = {   # card title → icon names (KDE Breeze first, then freedesktop
     "What each output feeds": ["audio-speakers", "audio-speakers-symbolic", "speaker", "audio-volume-high"], "What's plugged into each input": ["audio-input-line", "audio-card"],
     "Where sound goes": ["view-media-visualization", "audio-speakers"], "Wiring": ["insert-link", "network-connect"],
     "Loopback": ["media-repeat-all", "media-playlist-repeat", "view-refresh"],
+    "EQ for each speaker set": ["view-media-equalizer"], "Tone": ["view-media-equalizer", "audio-volume-high"],
+    "Clean mic (voice chain)": ["audio-input-microphone", "view-media-equalizer"],
 }
 TAB_ICONS = {
     "Rip": ["media-record"], "Quick take": ["audio-input-microphone"], "Split & tag": ["edit-cut"],
@@ -752,6 +756,7 @@ TAB_ICONS = {
     "Sound": ["audio-card"], "Mbox": ["audio-card"], "Controls": ["input-keyboard"], "App": ["configure"],
     "Speaker sets": ["audio-speakers", "audio-speakers-symbolic", "speaker", "audio-volume-high"], "Apps": ["applications-multimedia", "audio-volume-high"],
     "Signal map": ["view-media-visualization", "network-connect"], "The box": ["audio-card"],
+    "EQ": ["view-media-equalizer", "configure"],
 }
 
 
@@ -2403,8 +2408,13 @@ def install_wake_hook():
 SA600_CONF = PW_CONF_DIR / "mbox-sa600.conf"
 
 
-def write_sa600_conf(sink, desc="Speakers (Mbox)"):
+def write_sa600_conf(sink, desc="Speakers (Mbox)", eq=None):
     PW_CONF_DIR.mkdir(parents=True, exist_ok=True)
+    if eq is None:
+        eq = load_json(STATE_FILE, {}).get("eq_on", False)
+    if eq:                                         # same node names and channels, with the EQ in between
+        SA600_CONF.write_text(eq_chain_conf(desc, "sa600_sink", sink, ["AUX7", "AUX6"]))
+        return
     SA600_CONF.write_text(f"""# Written by Mbox Control
 context.modules = [
   {{ name = libpipewire-module-loopback
@@ -4411,6 +4421,7 @@ class HintBar(QtWidgets.QFrame):
         while self.btns.count():
             it = self.btns.takeAt(0)
             if it.widget():
+                it.widget().hide()
                 it.widget().deleteLater()
         self.text.setText(text)
         for i, (label, fn) in enumerate(actions):
@@ -4572,6 +4583,241 @@ def import_settings(src):
             pw = True
     return True, "", pw
 
+# ================================================================== 4.15: EQ (headphones / speakers), voice chain
+
+# Fixed slots so any profile can be loaded live, without restarting PipeWire:
+# preamp + 2 low shelves + 2 high shelves + 12 peaking filters, per channel.
+EQ_SLOTS = [("pre", "bq_lowshelf")] + [(f"ls{i}", "bq_lowshelf") for i in (1, 2)] + \
+           [(f"hs{i}", "bq_highshelf") for i in (1, 2)] + [(f"pk{i}", "bq_peaking") for i in range(1, 13)]
+EQ_FLAT = {"name": "Off (flat)", "preamp": 0.0, "bands": []}
+AUTOEQ_RAW = "https://raw.githubusercontent.com/jaakkopasanen/AutoEq/master/results/"
+AUTOEQ_INDEX = CONF_DIR / "autoeq-index.md"
+
+
+def parse_parametric_eq(text, name="Custom"):
+    """AutoEQ / Equalizer APO 'ParametricEQ.txt' → profile. Accepts LSC/LS, HSC/HS and PK filters."""
+    pre, bands = 0.0, []
+    for line in text.splitlines():
+        m = re.match(r"\s*Preamp:\s*(-?[\d.]+)\s*dB", line, re.I)
+        if m:
+            pre = float(m.group(1))
+            continue
+        m = re.match(r"\s*Filter\s*\d*:\s*ON\s+(LSC|LS|HSC|HS|PK|PEQ)\b.*?Fc\s+([\d.]+)\s*Hz\s+Gain\s+(-?[\d.]+)\s*dB"
+                     r"(?:\s+Q\s+([\d.]+))?", line, re.I)
+        if m:
+            kind = {"LS": "LSC", "HS": "HSC", "PEQ": "PK"}.get(m.group(1).upper(), m.group(1).upper())
+            bands.append({"type": kind, "f": float(m.group(2)), "g": float(m.group(3)),
+                          "q": float(m.group(4) or 0.707)})
+    if not bands and not pre:
+        raise ValueError("No filters found — is this a ParametricEQ.txt file?")
+    return {"name": name, "preamp": pre, "bands": bands}
+
+
+def eq_params(profile):
+    """Profile → filter-chain control values for every slot (unused slots flat)."""
+    vals = {"pre": (20000.0, 0.707, float(profile.get("preamp", 0.0)))}   # shelf below 20 kHz = overall gain
+    slots = {"LSC": [s for s, _ in EQ_SLOTS if s.startswith("ls")], "HSC": [s for s, _ in EQ_SLOTS if s.startswith("hs")],
+             "PK": [s for s, _ in EQ_SLOTS if s.startswith("pk")]}
+    for b in profile.get("bands", []):
+        free = slots.get(b["type"])
+        if not free:
+            free = slots["PK"]                           # out of shelf slots: approximate with a peak
+        if not free:
+            break
+        vals[free.pop(0)] = (float(b["f"]), max(0.1, float(b["q"])), float(b["g"]))
+    for s, _ in EQ_SLOTS:
+        vals.setdefault(s, (1000.0, 0.707, 0.0))
+    return vals
+
+
+def eq_pw_params(profile, per_call=5):
+    """→ pw-cli parameter lists, a few slots each. pw-cli silently drops lists longer than ~500 characters
+    (and still says OK), so a whole profile is sent in small pieces."""
+    items = []
+    for slot, (f, q, g) in eq_params(profile).items():
+        items.append(f'"{slot}:Freq" {f:.2f} "{slot}:Q" {q:.3f} "{slot}:Gain" {g:.2f}')
+    return ["[ " + " ".join(items[i:i + per_call]) + " ]" for i in range(0, len(items), per_call)]
+
+
+def eq_chain_conf(desc, sink_node, target, positions, profile=None):
+    """A filter-chain that replaces the plain main-output loopback: same node names, same channels."""
+    vals = eq_params(profile or EQ_FLAT)
+    nodes = "\n".join(
+        f'          {{ type = builtin name = {s} label = {lbl} control = {{ "Freq" = {vals[s][0]:.2f} '
+        f'"Q" = {vals[s][1]:.3f} "Gain" = {vals[s][2]:.2f} }} }}' for s, lbl in EQ_SLOTS)
+    links = "\n".join(f'          {{ output = "{a}:Out" input = "{b}:In" }}'
+                      for (a, _), (b, _) in zip(EQ_SLOTS, EQ_SLOTS[1:]))
+    return f"""# Written by Mbox Control: main output with EQ (live-adjustable, flat = no change)
+context.modules = [
+  {{ name = libpipewire-module-filter-chain
+    args = {{
+      node.description = "{desc}"
+      media.name = "{desc}"
+      filter.graph = {{
+        nodes = [
+{nodes}
+        ]
+        links = [
+{links}
+        ]
+        inputs = [ "{EQ_SLOTS[0][0]}:In" ]
+        outputs = [ "{EQ_SLOTS[-1][0]}:Out" ]
+      }}
+      audio.channels = 2
+      audio.position = [ FL FR ]
+      capture.props = {{
+        node.name = "{sink_node}"
+        media.class = "Audio/Sink"
+        audio.position = [ FL FR ]
+      }}
+      playback.props = {{
+        node.name = "{sink_node}_out"
+        target.object = "{target}"
+        audio.position = [ {' '.join(positions)} ]
+        stream.dont-remix = true
+        node.passive = true
+      }}
+    }}
+  }}
+]
+"""
+
+
+def pw_node_id(name):
+    for o in json.loads(run_quiet("pw-dump", timeout=4) or "[]"):
+        if o.get("type") == "PipeWire:Interface:Node" and \
+                o.get("info", {}).get("props", {}).get("node.name") == name:
+            return o["id"]
+    return None
+
+
+def set_eq_live(sink_node, profile):
+    """Load a profile into the running chain. → True if PipeWire took it."""
+    nid = sink_node if pw_node_exists(sink_node, "sink") else pw_node_id(sink_node)
+    if nid is None:
+        return False
+    ok = True
+    for chunk in eq_pw_params(profile):
+        out = run_quiet("pw-cli", "set-param", str(nid), "Props", f"{{ params = {chunk} }}")
+        ok = ok and out is not None and "size 8," not in out          # "size 8" = pw-cli dropped it
+    return ok
+
+
+class AutoEqSearch(QtCore.QThread):
+    """Downloads AutoEQ's index once (cached), then answers searches; and fetches a chosen profile."""
+    listed = QtCore.Signal(list, str)            # [(name, source, path)], error
+    fetched = QtCore.Signal(dict, str)           # profile, error
+
+    def __init__(self, query="", path=None, name=""):
+        super().__init__()
+        self.query, self.path, self.name = query, path, name
+
+    @staticmethod
+    def _get(url):
+        req = urllib.request.Request(url, headers={"User-Agent": f"MboxControl/{VERSION}"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.read().decode("utf-8", errors="replace")
+
+    def run(self):
+        try:
+            if self.path:
+                url = autoeq_url(self.path, self.name)
+                self.fetched.emit(parse_parametric_eq(self._get(url), self.name), "")
+                return
+            if not AUTOEQ_INDEX.exists() or time.time() - AUTOEQ_INDEX.stat().st_mtime > 30 * 86400:
+                CONF_DIR.mkdir(parents=True, exist_ok=True)
+                AUTOEQ_INDEX.write_text(self._get(AUTOEQ_RAW + "INDEX.md"))
+            self.listed.emit(autoeq_search(AUTOEQ_INDEX.read_text(), self.query), "")
+        except Exception as e:  # noqa: BLE001
+            (self.fetched if self.path else self.listed).emit({} if self.path else [], str(e))
+
+
+def autoeq_url(path, name):
+    """INDEX.md path (already URL-encoded, ends in the model's folder) → its ParametricEQ.txt."""
+    return AUTOEQ_RAW + path.strip("/") + "/" + urllib.parse.quote(name) + "%20ParametricEQ.txt"
+
+
+def autoeq_search(index_text, query, limit=40):
+    """INDEX.md lines '- [Name](./source/rig/Name) by source on rig' → best matches for the query."""
+    words = [w for w in query.lower().split() if w]
+    out = []
+    for m in re.finditer(r"^- \[(.+?)\]\(\./(.+?)\) by (.+)$", index_text, re.M):
+        name, path, by = m.group(1), m.group(2), m.group(3)
+        if all(w in name.lower() for w in words):
+            out.append((name, by, path))
+    pref = {"oratory1990": 0, "crinacle": 1, "Rtings": 2}
+    out.sort(key=lambda r: (not r[0].lower().startswith(query.lower()), pref.get(r[1].split()[0], 9), r[0]))
+    return out[:limit]
+
+
+# ---- voice chain (mic) -------------------------------------------------------------
+
+LADSPA_DIRS = [Path(p) for p in os.environ.get("LADSPA_PATH", "").split(":") if p] + \
+    [Path("/usr/lib/ladspa"), Path("/usr/lib64/ladspa"), Path("/usr/local/lib/ladspa"),
+     Path("/usr/lib/x86_64-linux-gnu/ladspa")]
+
+
+def find_ladspa(*names):
+    for d in LADSPA_DIRS:
+        for n in names:
+            if (d / n).exists():
+                return str(d / n)
+    return None
+
+
+def voice_chain_conf(source, aux, desc="Mic — clean (Mbox)", denoise=True, compress=True):
+    """Mic → low-cut → (noise suppression) → (gentle compressor) → a new input apps can pick."""
+    rnn = find_ladspa("librnnoise_ladspa.so") if denoise else None
+    sc4 = find_ladspa("sc4m_1916.so") if compress else None
+    nodes = ['          { type = builtin name = lowcut label = bq_highpass control = { "Freq" = 80.0 "Q" = 0.707 } }']
+    chain = ["lowcut"]
+    if rnn:
+        nodes.append(f'          {{ type = ladspa name = denoise plugin = "{rnn}" label = noise_suppressor_mono '
+                     '}')
+        chain.append("denoise")
+    if sc4:
+        nodes.append(f'          {{ type = ladspa name = comp plugin = "{sc4}" label = sc4m control = {{ '
+                     '"Attack time (ms)" = 10 "Release time (ms)" = 200 "Threshold level (dB)" = -20 '
+                     '"Ratio (1:n)" = 3 "Knee radius (dB)" = 6 "Makeup gain (dB)" = 4 } }')
+        chain.append("comp")
+    ports = {"lowcut": ("In", "Out"), "denoise": ("Input", "Output"), "comp": ("Input", "Output")}
+    links = "\n".join(f'          {{ output = "{a}:{ports[a][1]}" input = "{b}:{ports[b][0]}" }}'
+                      for a, b in zip(chain, chain[1:]))
+    return f"""# Written by Mbox Control: a cleaned-up mic input
+context.modules = [
+  {{ name = libpipewire-module-filter-chain
+    args = {{
+      node.description = "{desc}"
+      media.name = "{desc}"
+      filter.graph = {{
+        nodes = [
+{chr(10).join(nodes)}
+        ]
+        links = [
+{links}
+        ]
+        inputs = [ "{chain[0]}:{ports[chain[0]][0]}" ]
+        outputs = [ "{chain[-1]}:{ports[chain[-1]][1]}" ]
+      }}
+      audio.channels = 1
+      audio.position = [ MONO ]
+      capture.props = {{
+        node.name = "mbox_voice_cap"
+        target.object = "{source}"
+        audio.position = [ {aux} ]
+        stream.dont-remix = true
+        node.passive = true
+      }}
+      playback.props = {{
+        node.name = "mbox_voice"
+        media.class = "Audio/Source"
+        audio.position = [ MONO ]
+      }}
+    }}
+  }}
+]
+""", bool(rnn), bool(sc4)
+
 # ================================================================== main window
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -4718,6 +4964,7 @@ class MainWindow(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(2000, self.check_update)
         QtCore.QTimer.singleShot(900, self.refresh_health)
         self.osd = Osd()
+        QtCore.QTimer.singleShot(3000, self.apply_eq)
         QtCore.QTimer.singleShot(1200, self.start_rules_watch)
         self.sniff_timer = QtCore.QTimer(self)
         self.sniff_timer.timeout.connect(self.sniff_inputs)
@@ -4963,6 +5210,7 @@ class MainWindow(QtWidgets.QMainWindow):
         while lay.count() > 1:
             it = lay.takeAt(1)
             if it.widget():
+                it.widget().hide()
                 it.widget().deleteLater()
         items = self.health_items()
         self.health_box.setVisible(bool(items))
@@ -6139,6 +6387,7 @@ class MainWindow(QtWidgets.QMainWindow):
         while self.airplay_grid.count():
             it = self.airplay_grid.takeAt(0)
             if it.widget():
+                it.widget().hide()
                 it.widget().deleteLater()
         srcs = mirror_sources(self.main_output_name())
         want = self.app_state.get("airplay_mirror", {})
@@ -6175,6 +6424,7 @@ class MainWindow(QtWidgets.QMainWindow):
         while self.apps_box.count():
             it = self.apps_box.takeAt(0)
             if it.widget():
+                it.widget().hide()
                 it.widget().deleteLater()
         for r, s in enumerate(streams):
             ic = QtGui.QIcon.fromTheme(s["icon"]) if s["icon"] else QtGui.QIcon()
@@ -7861,7 +8111,310 @@ class MainWindow(QtWidgets.QMainWindow):
     # ================================================================ SPEAKERS
     def _build_speakers(self):
         return self.wrap_tabs("Speakers & apps", "Which speakers play, and where each app's sound goes.",
-                              [("Speaker sets", self._build_speaker_sets()), ("Apps", self._build_apps())])
+                              [("Speaker sets", self._build_speaker_sets()), ("Apps", self._build_apps()),
+                               ("EQ", self._build_eq())])
+
+    # ---------------------------------------------------------------- 4.15: EQ
+    def _build_eq(self):
+        w = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(w)
+        lay.setContentsMargins(0, 8, 0, 0)
+        lay.setSpacing(14)
+        c, l = card("EQ for each speaker set", "Correct your headphones or speakers. The EQ follows the Spkr "
+                                               "button: headphones get theirs, speakers get theirs.")
+        top = QtWidgets.QHBoxLayout()
+        self.eq_on_btn = QtWidgets.QPushButton()
+        self.eq_on_btn.clicked.connect(self.toggle_eq)
+        top.addWidget(self.eq_on_btn)
+        self.eq_state = muted("")
+        top.addWidget(self.eq_state, 1)
+        l.addLayout(top)
+        self.eq_rows = QtWidgets.QGridLayout()
+        self.eq_rows.setColumnStretch(1, 1)
+        l.addLayout(self.eq_rows)
+        brow = QtWidgets.QHBoxLayout()
+        find = QtWidgets.QPushButton("Find my headphones (AutoEQ)…")
+        find.setToolTip("Searches AutoEQ's free database of measured corrections for over 5,000 headphones.")
+        find.clicked.connect(self.autoeq_dialog)
+        imp = QtWidgets.QPushButton("Import ParametricEQ.txt…")
+        imp.setToolTip("A file from autoeq.app, REW (room measurement) or Equalizer APO.")
+        imp.clicked.connect(self.import_eq_file)
+        brow.addWidget(find)
+        brow.addWidget(imp)
+        brow.addStretch(1)
+        l.addLayout(brow)
+        l.addWidget(muted("EQ changes computer sound only — things the Mbox mixes itself (like the TV on Aux 5/6) "
+                          "aren't touched. Switching profiles is instant and silent."))
+        lay.addWidget(c)
+        tc, tl = card("Tone", "Quick bass and treble on top of whatever profile is playing.")
+        self.tone = {}
+        for key, label, freq in (("bass", "Bass", 105), ("treble", "Treble", 8000)):
+            row = QtWidgets.QHBoxLayout()
+            row.addWidget(QtWidgets.QLabel(label), 0)
+            sl = QtWidgets.QSlider(Qt.Horizontal)
+            sl.setRange(-12, 12)
+            sl.setValue(int(self.app_state.get("eq_tone", {}).get(key, 0)))
+            val = QtWidgets.QLabel()
+            val.setMinimumWidth(56)
+            sl.valueChanged.connect(lambda v, val=val: val.setText(f"{v:+d} dB"))
+            sl.valueChanged.connect(lambda _: self.tone_debounce.start(150))
+            val.setText(f"{sl.value():+d} dB")
+            row.addWidget(sl, 1)
+            row.addWidget(val)
+            tl.addLayout(row)
+            self.tone[key] = sl
+        self.tone_debounce = QtCore.QTimer(self)
+        self.tone_debounce.setSingleShot(True)
+        self.tone_debounce.timeout.connect(self.tone_changed)
+        lay.addWidget(tc)
+        lay.addStretch(1)
+        self.refresh_eq_ui()
+        return scroll(w)
+
+    def eq_profiles(self):
+        return {"Off (flat)": EQ_FLAT, **self.app_state.get("eq_profiles", {})}
+
+    def refresh_eq_ui(self):
+        on = bool(self.app_state.get("eq_on"))
+        self.eq_on_btn.setText("Turn EQ off" if on else "Turn EQ on")
+        self.eq_on_btn.setToolTip("Puts an EQ between the computer and your main output (PipeWire restarts for a "
+                                  "second, once). Flat = exactly the same sound as without it.")
+        self.eq_state.setText("On — it follows the Spkr button." if on else "Off.")
+        while self.eq_rows.count():
+            it = self.eq_rows.takeAt(0)
+            if it.widget():
+                it.widget().hide()
+                it.widget().deleteLater()
+        names = list(self.eq_profiles())
+        assign = self.app_state.get("eq_sets", {})
+        for r, L in enumerate("ABC"):
+            own = self.label(f"spk{L}", "")
+            dot = LETTER_COLOUR[L][1]
+            self.eq_rows.addWidget(QtWidgets.QLabel(f"<span style='color:{dot}'>●</span> <b>Speakers {L}</b>"
+                                                    + (f" — {html_escape(own)}" if own else "")), r, 0)
+            cb = QtWidgets.QComboBox()
+            cb.addItems(names)
+            cb.setCurrentText(assign.get(L, "Off (flat)") if assign.get(L) in names else "Off (flat)")
+            cb.setEnabled(on)
+            cb.activated.connect(lambda _, L=L, cb=cb: self.assign_eq(L, cb.currentText()))
+            self.eq_rows.addWidget(cb, r, 1)
+
+    def assign_eq(self, letter, name):
+        self.app_state.setdefault("eq_sets", {})[letter] = name
+        self.save_app_state()
+        self.apply_eq()
+
+    def current_set(self):
+        it = (self.ctrl_item("spkr-button") or "").split("-")[0]
+        return SPEAKERS.get(it, ("A",))[0]
+
+    def eq_profile_now(self):
+        name = self.app_state.get("eq_sets", {}).get(self.current_set(), "Off (flat)")
+        prof = dict(self.eq_profiles().get(name, EQ_FLAT))
+        tone = self.app_state.get("eq_tone", {})
+        extra = [{"type": "LSC", "f": 105.0, "q": 0.7, "g": float(tone.get("bass", 0))},
+                 {"type": "HSC", "f": 8000.0, "q": 0.7, "g": float(tone.get("treble", 0))}]
+        prof["bands"] = list(prof.get("bands", [])) + [b for b in extra if b["g"]]
+        boost = max([0.0] + [b["g"] for b in extra])
+        prof["preamp"] = float(prof.get("preamp", 0.0)) - boost          # tone boosts never clip
+        return prof
+
+    def apply_eq(self):
+        if not self.app_state.get("eq_on") or os.environ.get("MBOX_AMIXER"):
+            return False
+        ok = set_eq_live("sa600_sink", self.eq_profile_now())
+        if not ok:
+            self.toast("Couldn't change the EQ — is the main output there? (Settings → Sound)", 6000)
+        return ok
+
+    def tone_changed(self):
+        self.app_state["eq_tone"] = {k: s.value() for k, s in self.tone.items()}
+        self.save_app_state()
+        self.apply_eq()
+
+    def toggle_eq(self):
+        on = not self.app_state.get("eq_on")
+        sink = mbox_pw_node("sink")
+        if not sink and not os.environ.get("MBOX_AMIXER"):
+            QtWidgets.QMessageBox.warning(self, APP_NAME, "Couldn't find the Mbox in PipeWire.")
+            return
+        self.app_state["eq_on"] = on
+        self.save_app_state()
+        if sink:
+            write_sa600_conf(sink, self.main_output_name(), eq=on)
+            restart_pipewire()
+            QtCore.QTimer.singleShot(2500, lambda: (fix_default_sink(), self.apply_eq()))
+        self.refresh_eq_ui()
+        self.toast("EQ on — pick a profile for each speaker set." if on else "EQ off.", 6000)
+
+    def save_eq_profile(self, prof, assign_to=None):
+        self.app_state.setdefault("eq_profiles", {})[prof["name"]] = prof
+        if assign_to:
+            self.app_state.setdefault("eq_sets", {})[assign_to] = prof["name"]
+        self.save_app_state()
+        self.refresh_eq_ui()
+        self.apply_eq()
+
+    def import_eq_file(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "ParametricEQ.txt", str(HOME / "Downloads"),
+                                                        "EQ files (*.txt);;All files (*)")
+        if not path:
+            return
+        try:
+            prof = parse_parametric_eq(Path(path).read_text(errors="replace"),
+                                       Path(path).stem.replace(" ParametricEQ", ""))
+        except (OSError, ValueError) as e:
+            QtWidgets.QMessageBox.warning(self, APP_NAME, str(e))
+            return
+        self.save_eq_profile(prof)
+        self.toast(f"Added “{prof['name']}” — pick it for a speaker set.", 6000)
+
+    def autoeq_dialog(self):
+        d = QtWidgets.QDialog(self)
+        d.setWindowTitle("Find your headphones")
+        d.resize(560, 480)
+        v = QtWidgets.QVBoxLayout(d)
+        q = QtWidgets.QLineEdit()
+        q.setPlaceholderText("Type the model, e.g. HD 280 Pro, DT 770, ATH-M50x…")
+        v.addWidget(q)
+        lst = QtWidgets.QListWidget()
+        v.addWidget(lst, 1)
+        note = muted("Profiles from AutoEQ (github.com/jaakkopasanen/AutoEq). oratory1990's measurements are "
+                     "listed first when there's a choice.")
+        v.addWidget(note)
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("Use it for"))
+        target = QtWidgets.QComboBox()
+        for L in "ABC":
+            own = self.label(f"spk{L}", "")
+            target.addItem(f"Speakers {L}" + (f" — {own}" if own else ""), L)
+        target.setCurrentIndex(1)                                   # B = headphones on most setups
+        row.addWidget(target, 1)
+        use = QtWidgets.QPushButton("Use this one")
+        use.setObjectName("primary")
+        row.addWidget(use)
+        v.addLayout(row)
+        timer = QtCore.QTimer(d)
+        timer.setSingleShot(True)
+
+        def search():
+            if len(q.text().strip()) < 2:
+                return
+            note.setText("Searching…")
+            d.job = AutoEqSearch(q.text().strip())
+            d.job.listed.connect(show)
+            d.job.start()
+
+        def show(rows, err):
+            lst.clear()
+            if err:
+                note.setText(f"Couldn't reach AutoEQ: {err}")
+                return
+            for name, by, path in rows:
+                it = QtWidgets.QListWidgetItem(f"{name}    — measured by {by}")
+                it.setData(Qt.UserRole, (name, path))
+                lst.addItem(it)
+            note.setText(f"{len(rows)} found." if rows else "Nothing found — try fewer words.")
+
+        def pick():
+            it = lst.currentItem()
+            if not it:
+                return
+            name, folder = it.data(Qt.UserRole)          # folder = results/<source>/<rig>/<model>
+            note.setText("Downloading…")
+            d.job = AutoEqSearch(path=folder, name=name)
+            d.job.fetched.connect(lambda prof, err: (
+                note.setText(f"Couldn't download it: {err}") if err else
+                (self.save_eq_profile(prof, target.currentData()), d.accept(),
+                 self.toast(f"{prof['name']} EQ is on Speakers {target.currentData()}.", 7000))))
+            d.job.start()
+        q.textChanged.connect(lambda _: timer.start(350))
+        timer.timeout.connect(search)
+        use.clicked.connect(pick)
+        lst.itemDoubleClicked.connect(lambda _: pick())
+        d.exec()
+
+    # ---------------------------------------------------------------- 4.15: voice chain
+    def build_voice_card(self, lay):
+        c, l = card("Clean mic (voice chain)", "A cleaned-up version of a mic input for calls, streams and "
+                                               "voice-overs: rumble cut, background noise reduced, levels evened out.")
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("Mic on"))
+        self.voice_in = QtWidgets.QComboBox()
+        for item, jack in INPUT_JACKS[:4]:
+            self.voice_in.addItem(jack, item)
+        self.voice_in.setCurrentIndex(max(0, self.voice_in.findData(self.app_state.get("voice_in", "Analog-A-1"))))
+        row.addWidget(self.voice_in)
+        self.voice_btn = QtWidgets.QPushButton()
+        self.voice_btn.clicked.connect(self.toggle_voice)
+        row.addWidget(self.voice_btn)
+        row.addStretch(1)
+        l.addLayout(row)
+        self.voice_note = muted("")
+        l.addWidget(self.voice_note)
+        prow = QtWidgets.QHBoxLayout()
+        self.voice_comp_btn = QtWidgets.QPushButton("Get the compressor")
+        self.voice_comp_btn.setToolTip("Installs the SWH audio plugins (one password prompt).")
+        self.voice_comp_btn.clicked.connect(lambda: self.run_root(install_argv("compressor"),
+                                                                  "Installing the compressor…",
+                                                                  lambda ok, _m: self.refresh_voice()))
+        prow.addWidget(self.voice_comp_btn)
+        self.voice_nr_link = QtWidgets.QLabel("<a href='https://github.com/werman/noise-suppression-for-voice'>"
+                                              "Get noise suppression (RNNoise)</a>")
+        self.voice_nr_link.setOpenExternalLinks(True)
+        prow.addWidget(self.voice_nr_link)
+        prow.addStretch(1)
+        l.addLayout(prow)
+        lay.addWidget(c)
+        self.refresh_voice()
+
+    VOICE_CONF = "mbox-voice.conf"
+
+    def refresh_voice(self):
+        on = (PW_CONF_DIR / self.VOICE_CONF).exists()
+        rnn, sc4 = bool(find_ladspa("librnnoise_ladspa.so")), bool(find_ladspa("sc4m_1916.so"))
+        self.voice_btn.setText("Turn off" if on else "Turn on")
+        self.voice_comp_btn.setVisible(not sc4 and bool(install_argv("compressor")))
+        self.voice_nr_link.setVisible(not rnn)
+        parts = ["low-cut"] + (["noise reduction"] if rnn else []) + (["compressor"] if sc4 else [])
+        self.voice_note.setText((f"On: apps can pick “Mic — clean (Mbox)”. Using {', '.join(parts)}."
+                                 if on else f"Off. Ready: {', '.join(parts)}.")
+                                + ("" if rnn and sc4 else "  Add the missing pieces below for the full chain."))
+
+    def toggle_voice(self):
+        path = PW_CONF_DIR / self.VOICE_CONF
+        if path.exists():
+            path.unlink()
+            restart_pipewire()
+            self.refresh_voice()
+            return
+        src = mbox_pw_node("source")
+        if not src:
+            QtWidgets.QMessageBox.warning(self, APP_NAME, "Couldn't find the Mbox input in PipeWire.")
+            return
+        item = self.voice_in.currentData()
+        self.app_state["voice_in"] = item
+        self.save_app_state()
+        n = int(item[-1])
+        self.set_stream(n - 1, item)                       # Input n → capture AUX(n-1)
+        conf, rnn, _ = voice_chain_conf(src, f"AUX{n - 1}")
+        PW_CONF_DIR.mkdir(parents=True, exist_ok=True)
+        path.write_text(conf)
+        restart_pipewire()
+
+        def check():
+            if pw_node_exists("mbox_voice"):
+                self.toast("“Mic — clean (Mbox)” is ready — pick it in your call or streaming app.", 8000)
+            elif rnn:                                      # the noise plugin wouldn't load: go without it
+                path.write_text(voice_chain_conf(src, f"AUX{n - 1}", denoise=False)[0])
+                restart_pipewire()
+                self.toast("Noise reduction wouldn't load here, so the clean mic runs without it.", 9000)
+            else:
+                self.toast("The clean mic didn't start — Copy diagnostics and send it over.", 9000)
+            QtCore.QTimer.singleShot(2500, fix_default_sink)
+            self.refresh_voice()
+        QtCore.QTimer.singleShot(3000, check)
+        self.refresh_voice()
 
     def _build_speaker_sets(self):
         w, lay = page("Speakers", "The Spkr button on the front cycles speaker sets A (green), B (red) "
@@ -7982,6 +8535,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh_soon()
 
     def on_speaker_change(self, item, force=False):
+        QtCore.QTimer.singleShot(0, self.apply_eq)            # each speaker set has its own EQ
         if not item or not self.app_state["cr_enabled"] or self.app_state.get("spk_mute"):
             self.last_spk = item
             return
@@ -8324,6 +8878,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refreshers.append(lambda: self.named_status.setText(
             "Installed ✓" if (PW_CONF_DIR / "mbox-inputs.conf").exists() else "Not installed yet."))
         self.build_loopback_card(lay)
+        self.build_voice_card(lay)
 
         gc, gl = card("Mic & instrument guide", "Pick what you're recording for placement tips and the "
                                                 "right settings.")
@@ -8413,7 +8968,8 @@ class MainWindow(QtWidgets.QMainWindow):
                                              "Live analysis"]),
                                     ("Quick take", ["Quick take"]),
                                     ("Split && tag", ["Split & tag"]),
-                                    ("Tools", ["Loopback", "Make a tape", "Tuner", "Named inputs for your apps"])])
+                                    ("Tools", ["Loopback", "Clean mic (voice chain)", "Make a tape", "Tuner",
+                                               "Named inputs for your apps"])])
 
     def pick_rip_dir(self):
         d = QtWidgets.QFileDialog.getExistingDirectory(self, "Save rips to", self.rip_dir.text())
