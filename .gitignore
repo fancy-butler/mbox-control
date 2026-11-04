@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.bak
+venv/
+/packaging/aur/*.tar.*
+/packaging/aur/pkg/
+/packaging/aur/src/

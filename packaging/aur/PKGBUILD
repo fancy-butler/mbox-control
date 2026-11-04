@@ -1,0 +1,35 @@
+# Maintainer: Fancy Butler <you@example.com>
+# Before publishing: set _ghuser, then run `updpkgsums && makepkg --printsrcinfo > .SRCINFO`
+_ghuser=CHANGE_ME
+pkgname=mbox-control
+pkgver=4.12.1
+pkgrel=1
+pkgdesc="Unofficial modern control panel for the Avid Mbox Pro 3 (FireWire): mixer, routing, ripping, guitar mode"
+arch=('any')
+url="https://github.com/${_ghuser}/mbox-control"
+license=('GPL-3.0-or-later')
+depends=('python' 'pyside6' 'python-numpy' 'ffmpeg' 'alsa-utils' 'libpulse'
+         'pipewire' 'pipewire-pulse' 'wireplumber' 'polkit'
+         'snd-firewire-ctl-services')
+optdepends=('guitarix: amp and effects for Guitar mode'
+            'pipewire-jack: needed by Guitar mode'
+            'audacity: open recordings for editing'
+            'chromaprint: identify songs in rips'
+            'avahi: AirPlay speakers'
+            'qpwgraph: see and change PipeWire connections by hand')
+source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
+sha256sums=('SKIP')   # replaced by updpkgsums once the tag exists
+
+package() {
+  cd "${pkgname}-${pkgver}"
+  install -Dm644 mbox_control.py "${pkgdir}/usr/lib/${pkgname}/mbox_control.py"
+  install -dm755 "${pkgdir}/usr/bin"
+  printf '#!/bin/sh\nexec /usr/bin/python3 /usr/lib/mbox-control/mbox_control.py "$@"\n' \
+    > "${pkgdir}/usr/bin/${pkgname}"
+  chmod 755 "${pkgdir}/usr/bin/${pkgname}"
+  install -Dm644 packaging/mbox-control.desktop "${pkgdir}/usr/share/applications/${pkgname}.desktop"
+  install -Dm644 packaging/mbox-control.svg "${pkgdir}/usr/share/icons/hicolor/scalable/apps/${pkgname}.svg"
+  install -Dm644 README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+  install -Dm644 CHANGELOG.md "${pkgdir}/usr/share/doc/${pkgname}/CHANGELOG.md"
+  install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

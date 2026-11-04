@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Mbox Control
+GenericName=Audio interface control
+Comment=Mixer, routing and recording for the Avid Mbox 3 Pro
+Exec=mbox-control
+Icon=mbox-control
+Terminal=false
+Categories=AudioVideo;Audio;Mixer;
+StartupWMClass=mbox-control
+Keywords=mbox;avid;firewire;mixer;
