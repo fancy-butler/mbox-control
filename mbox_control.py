@@ -46,7 +46,8 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QPointF, QRectF
 
 APP_NAME = "Mbox Control"
-VERSION = "4.12.1"
+VERSION = "4.13"
+UPDATE_REPO = ""          # "owner/mbox-control" once the project is on GitHub; empty = no online checks
 HOME = Path.home()
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
 CONF_DIR = XDG_CONFIG / "mbox-control"
@@ -274,9 +275,69 @@ def find_mbox_card():
     return None
 
 
+class DirectReader:
+    """Reads ALSA controls straight from /dev/snd/controlC<n> (one ioctl, no process).
+    Only switched on after it has proven it gets exactly what amixer gets."""
+    ELEM_READ = 0xC4C85512          # _IOWR('U', 0x12, struct snd_ctl_elem_value), 1224 bytes on 64-bit
+    SIZE, VALUE_OFF, NAME_OFF = 1224, 72, 16
+
+    def __init__(self, card):
+        import ctypes
+        if ctypes.sizeof(ctypes.c_long) != 8:
+            raise OSError("only on 64-bit systems")
+        path = f"/dev/snd/controlC{card}"
+        try:
+            self.fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+        except OSError:
+            self.fd = os.open(path, os.O_RDWR | os.O_CLOEXEC)
+
+    def read(self, numid, ctype, count):
+        """→ (name, values). ENUMERATED values are 32-bit item numbers, everything else 64-bit."""
+        import fcntl
+        import struct
+        buf = bytearray(self.SIZE)
+        struct.pack_into("I", buf, 0, numid)
+        fcntl.ioctl(self.fd, self.ELEM_READ, buf)
+        name = bytes(buf[self.NAME_OFF:self.NAME_OFF + 44]).split(b"\0", 1)[0].decode(errors="replace")
+        fmt = f"{count}I" if ctype == "ENUMERATED" else f"{count}q"
+        vals = list(struct.unpack_from(fmt, buf, self.VALUE_OFF))
+        if ctype == "BOOLEAN":
+            vals = [bool(v) for v in vals]
+        return name, vals
+
+    def close(self):
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+
 class Backend:
     def __init__(self, card):
         self.card = str(card)
+        self.direct, self.shapes = None, {}       # numid → (name, type, count, index) learned from amixer
+        self.direct_tried = False
+
+    def enable_direct(self):
+        """Try the fast path once; keep it only if it matches amixer exactly on unchanging controls."""
+        if self.direct_tried or os.environ.get("MBOX_AMIXER"):
+            return self.direct is not None
+        self.direct_tried = True
+        try:
+            ctrls = self.read_all()
+            rd = DirectReader(self.card)
+            checks = [c for c in ctrls.values() if c.type in ("INTEGER", "BOOLEAN", "ENUMERATED")
+                      and "meter" not in c.name][:6]
+            if not checks:
+                raise OSError("nothing to compare")
+            for c in checks:
+                name, vals = rd.read(c.numid, c.type, len(c.values))
+                if name != c.name or vals != c.values:
+                    raise OSError(f"mismatch on {c.name}")
+            self.direct = rd
+        except Exception:  # noqa: BLE001
+            self.direct = None
+        return self.direct is not None
 
     def _run(self, *args):
         r = subprocess.run([AMIXER, "-c", self.card, *args], capture_output=True, text=True, timeout=5)
@@ -285,9 +346,22 @@ class Backend:
         return r.stdout
 
     def read_all(self):
-        return parse_amixer(self._run("contents"))
+        ctrls = parse_amixer(self._run("contents"))
+        self.shapes = {n: c for n, c in ctrls.items()}
+        return ctrls
 
     def read(self, numid):
+        shape = self.shapes.get(numid)
+        if self.direct and shape:
+            try:
+                name, vals = self.direct.read(numid, shape.type, len(shape.values))
+                if name == shape.name:                 # same control → fast answer
+                    c = Control(numid, shape.name, shape.index)
+                    c.type, c.access, c.items, c.min, c.max = shape.type, shape.access, shape.items, shape.min, shape.max
+                    c.values = vals
+                    return c
+            except OSError:
+                pass                                    # card gone or renumbered: amixer will say what's up
         return parse_amixer(self._run("cget", f"numid={numid}")).get(numid)
 
     def write(self, ctrl, values):
@@ -591,6 +665,77 @@ def safe_name(s):
 
 # ================================================================== widgets
 
+CARD_ICONS = {   # card title → icon names (KDE Breeze first, then freedesktop fallbacks)
+    "AirPlay speakers": ["network-wireless", "network-wireless-symbolic"], "Always on": ["media-playlist-repeat"],
+    "Appearance": ["preferences-desktop-theme", "preferences-desktop-color"], "Audio engine": ["audio-card"],
+    "Background service & launcher": ["system-run", "applications-system"], "Big knob": ["audio-volume-high"],
+    "Connections": ["network-connect", "insert-link"], "Default output": ["audio-speakers", "audio-volume-high"],
+    "Dim, Mute & Mono": ["audio-volume-muted"], "Discogs": ["media-optical-audio", "media-optical"],
+    "Effect": ["preferences-desktop-sound", "audio-x-generic"], "Front-panel buttons": ["configure"],
+    "Guitar mode": ["audio-input-line", "audio-x-generic"], "Headphones output for apps": ["audio-headphones"],
+    "Inputs": ["audio-input-microphone"], "Keyboard shortcuts": ["input-keyboard", "preferences-desktop-keyboard"],
+    "Live analysis": ["view-statistics", "office-chart-line"], "MIDI controller": ["audio-midi", "input-gaming"],
+    "Make a tape": ["media-tape", "media-record"], "Master": ["audio-volume-high"],
+    "Mic & instrument guide": ["help-hint", "audio-input-microphone"], "Mixer": ["view-media-equalizer", "audio-card"],
+    "Music library": ["folder-music", "media-optical-audio"], "Named inputs for your apps": ["tag", "audio-input-line"],
+    "Output trims": ["audio-volume-medium"], "Playing now": ["media-playback-start"],
+    "Quick take": ["audio-input-microphone", "media-record"], "Rip queue": ["view-list-details", "format-list-ordered"],
+    "Rip tape / vinyl": ["media-record"], "Ripping": ["media-record"], "Scenes": ["view-media-playlist", "view-grid"],
+    "Song identification": ["search", "edit-find"], "Speaker sets": ["audio-speakers", "audio-speakers-symbolic", "speaker", "audio-volume-high"], "Split & tag": ["edit-cut"],
+    "Standalone mode": ["network-disconnect", "system-shutdown"], "Startup & tray": ["system-run"],
+    "Suggestions": ["help-hint", "dialog-information"], "Tuner": ["view-media-visualization", "audio-x-generic"],
+    "What each output feeds": ["audio-speakers", "audio-speakers-symbolic", "speaker", "audio-volume-high"], "What's plugged into each input": ["audio-input-line", "audio-card"],
+    "Where sound goes": ["view-media-visualization", "audio-speakers"], "Wiring": ["insert-link", "network-connect"],
+}
+TAB_ICONS = {
+    "Rip": ["media-record"], "Quick take": ["audio-input-microphone"], "Split & tag": ["edit-cut"],
+    "Tools": ["applications-utilities", "tools"], "Your setup": ["document-properties", "user-identity"],
+    "Sound": ["audio-card"], "Mbox": ["audio-card"], "Controls": ["input-keyboard"], "App": ["configure"],
+    "Speaker sets": ["audio-speakers", "audio-speakers-symbolic", "speaker", "audio-volume-high"], "Apps": ["applications-multimedia", "audio-volume-high"],
+    "Signal map": ["view-media-visualization", "network-connect"], "The box": ["audio-card"],
+}
+
+
+def ensure_icon_theme():
+    """pip-installed PySide6 doesn't look in /usr/share/icons: point it at the system's icons and theme."""
+    paths = list(QtGui.QIcon.themeSearchPaths())
+    dirs = [Path(d) / "icons" for d in os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":")]
+    for d in [HOME / ".local/share/icons", HOME / ".icons", *dirs]:
+        if d.is_dir() and str(d) not in paths:
+            paths.append(str(d))
+    QtGui.QIcon.setThemeSearchPaths(paths)
+    if QtGui.QIcon.hasThemeIcon("media-record"):
+        return
+    want = ""
+    try:
+        m = re.search(r"^\[Icons\][^\[]*?^Theme=(.+)$", (XDG_CONFIG / "kdeglobals").read_text(), re.M | re.S)
+        want = m.group(1).strip() if m else ""
+    except OSError:
+        pass
+    if not want:
+        want = (run_quiet("gsettings", "get", "org.gnome.desktop.interface", "icon-theme") or "").strip().strip("'")
+    for name in [want, "breeze-dark" if DARK else "breeze", "breeze", "Adwaita", "Papirus", "hicolor"]:
+        if name:
+            QtGui.QIcon.setThemeName(name)
+            if QtGui.QIcon.hasThemeIcon("media-record"):
+                return
+
+
+def themed_icon(names):
+    for n in names or []:
+        if QtGui.QIcon.hasThemeIcon(n):
+            return QtGui.QIcon.fromTheme(n)
+    return None
+
+
+def icon_tabs(tabs):
+    """Give a tab bar's tabs their icons (by tab text)."""
+    for i in range(tabs.count()):
+        ic = themed_icon(TAB_ICONS.get(tabs.tabText(i).replace("&&", "&")))
+        if ic:
+            tabs.setTabIcon(i, ic)
+
+
 def card(title=None, subtitle=None):
     f = QtWidgets.QFrame()
     f.setObjectName("card")
@@ -600,7 +745,18 @@ def card(title=None, subtitle=None):
     if title:
         t = QtWidgets.QLabel(title)
         t.setObjectName("title")
-        lay.addWidget(t)
+        ic = themed_icon(CARD_ICONS.get(title))
+        if ic:
+            row = QtWidgets.QHBoxLayout()
+            row.setSpacing(8)
+            il = QtWidgets.QLabel()
+            il.setPixmap(ic.pixmap(18, 18))
+            row.addWidget(il)
+            row.addWidget(t)
+            row.addStretch(1)
+            lay.addLayout(row)
+        else:
+            lay.addWidget(t)
     if subtitle:
         lay.addWidget(muted(subtitle))
     return f, lay
@@ -610,6 +766,8 @@ def muted(text):
     l = QtWidgets.QLabel(text)
     l.setObjectName("muted")
     l.setWordWrap(True)
+    if not text:
+        l.setProperty("keep_long", True)      # filled in later with live status: never shortened
     return l
 
 
@@ -1689,8 +1847,13 @@ h2{font-size:12px;color:var(--sub);font-weight:700;margin:16px 4px 8px;text-tran
 <div id="toast"></div>
 <script>
 const $=s=>document.querySelector(s);let vt=null,busy=0,fails=0,last={};
+const qk=new URLSearchParams(location.search).get('k');let K='';
+try{if(qk)localStorage.setItem('mboxkey',qk);K=qk||localStorage.getItem('mboxkey')||''}catch(e){K=qk||''}
+if(qk)history.replaceState(null,'','/');
 function toast(t){const e=$('#toast');e.textContent=t;e.style.opacity=1;clearTimeout(e.t);e.t=setTimeout(()=>e.style.opacity=0,1800)}
-async function go(a,b){try{await fetch('/do/'+a+'/'+encodeURIComponent(b||''),{method:'POST'});setTimeout(tick,150)}catch(e){toast('Not connected')}}
+async function go(a,b){try{const r=await fetch('/do/'+a+'/'+encodeURIComponent(b||''),{method:'POST',headers:{'X-Mbox-Key':K}});
+ if(r.status==403)locked();setTimeout(tick,150)}catch(e){toast('Not connected')}}
+function locked(){document.body.innerHTML='<div style="padding:40px 20px;text-align:center"><h1>🔒 Mbox</h1><p class="sub" style="font-size:16px">This phone isn\'t paired.<br><br>On the computer open <b>Mbox Control → Remote</b> and scan the QR code.</p></div>';clearTimeout(tick.t);tick.t=null;locked.on=1}
 document.querySelectorAll('#spkrow button').forEach(b=>b.onclick=()=>{go('speakers',b.dataset.l);if(navigator.vibrate)navigator.vibrate(15)});
 $('#mute').onclick=()=>go('mute',last.mute?'0':'1');
 $('#recbtn').onclick=()=>go('record','');$('#takebtn').onclick=()=>go('take','');
@@ -1715,7 +1878,8 @@ function render(s){last=s;
  const sc=$('#scenes'),key=JSON.stringify(s.scenes);if(sc.dataset.k!=key){sc.innerHTML='';s.scenes.forEach(x=>{const e=document.createElement('button');
   e.className='scene';e.innerHTML='';e.append(x.name);const sm=document.createElement('small');sm.textContent=x.short;e.append(sm);
   e.onclick=()=>{go('scene',x.id);toast(x.name)};sc.appendChild(e)});sc.dataset.k=key}}
-async function tick(){clearTimeout(tick.t);try{const s=await (await fetch('/state',{cache:'no-store'})).json();fails=0;$('#conn').classList.remove('off');render(s)}
+async function tick(){if(locked.on)return;clearTimeout(tick.t);try{const rr=await fetch('/state',{cache:'no-store',headers:{'X-Mbox-Key':K}});
+ if(rr.status==403){locked();return}const s=await rr.json();fails=0;$('#conn').classList.remove('off');render(s)}
  catch(e){if(++fails>2)$('#conn').classList.add('off')}tick.t=setTimeout(tick,document.hidden?3000:500)}
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)tick()});tick();
 if('serviceWorker' in navigator&&window.isSecureContext)navigator.serviceWorker.register('/sw.js').catch(()=>{});
@@ -1760,6 +1924,7 @@ class RemoteServer:
         self.state = {}
         self.lock = threading.Lock()
         self.files = {}                               # path → (bytes, content type); filled on the GUI thread
+        self.token = ""                               # phones must know it (it's in the QR link)
 
     def set_state(self, st):
         with self.lock:
@@ -1780,7 +1945,18 @@ class RemoteServer:
                 if body:
                     self.wfile.write(body)
 
+            def _authed(self):
+                q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                given = (q.get("k") or [""])[0] or self.headers.get("X-Mbox-Key", "")
+                import hmac
+                return bool(srv.token) and hmac.compare_digest(given, srv.token)
+
             def do_GET(self):
+                path = urllib.parse.urlsplit(self.path).path
+                if path == "/state" and not self._authed():
+                    self._send(403, b'{"locked":true}', "application/json")
+                    return
+                self.path = path
                 if self.path in ("/", "/index.html"):
                     self._send(200, REMOTE_HTML.encode(), "text/html; charset=utf-8")
                 elif self.path in srv.files:
@@ -1794,7 +1970,10 @@ class RemoteServer:
                     self._send(404)
 
             def do_POST(self):
-                m = re.fullmatch(r"/do/(\w+)/(.*)", self.path)
+                if not self._authed():
+                    self._send(403)
+                    return
+                m = re.fullmatch(r"/do/(\w+)/(.*)", urllib.parse.urlsplit(self.path).path)
                 if not m:
                     self._send(404)
                     return
@@ -2405,20 +2584,17 @@ def firewall_kind():
     return None
 
 
-def open_firewall(port):
-    """Let devices on the home network reach `port`. Asks for the password once. → (ok, message)"""
+def firewall_open_cmd(port):
+    """Root command that lets devices on the home network reach `port`, or None if no firewall is on."""
     kind = firewall_kind()
     if kind is None:
-        return True, "No firewall is blocking it."
+        return None
     ip = lan_ip()
     subnet = ".".join(ip.split(".")[:3]) + ".0/24" if ip.count(".") == 3 else None
     if kind == "ufw":
-        cmd = ["pkexec", "ufw", "allow", "from", subnet, "to", "any", "port", str(port), "proto", "tcp"] if subnet \
-            else ["pkexec", "ufw", "allow", f"{port}/tcp"]
-    else:
-        cmd = ["pkexec", "sh", "-c", f"firewall-cmd --permanent --add-port={port}/tcp && firewall-cmd --reload"]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    return r.returncode == 0, (r.stderr or r.stdout).strip()[-200:]
+        return ["ufw", "allow", "from", subnet, "to", "any", "port", str(port), "proto", "tcp"] if subnet \
+            else ["ufw", "allow", f"{port}/tcp"]
+    return ["sh", "-c", f"firewall-cmd --permanent --add-port={port}/tcp && firewall-cmd --reload"]
 
 
 def write_headphones_conf(sink):
@@ -2773,6 +2949,51 @@ def find_update():
             if not best or version_tuple(m.group(1)) > version_tuple(best[1]):
                 best = (p, m.group(1))
     return best
+
+
+class UpdateCheck(QtCore.QThread):
+    """Asks GitHub for the latest release (only when the person turned checking on)."""
+    found = QtCore.Signal(str, str)        # version, page url  ("" when nothing newer)
+
+    def run(self):
+        try:
+            req = urllib.request.Request(f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest",
+                                         headers={"User-Agent": f"MboxControl/{VERSION}",
+                                                  "Accept": "application/vnd.github+json"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                data = json.loads(r.read().decode())
+            ver = str(data.get("tag_name", "")).lstrip("v")
+            if re.fullmatch(r"[\d.]+", ver) and version_tuple(ver) > version_tuple(VERSION):
+                self.found.emit(ver, data.get("html_url", ""))
+                return
+        except Exception:  # noqa: BLE001
+            pass
+        self.found.emit("", "")
+
+
+class UpdateDownload(QtCore.QThread):
+    """Fetches mbox_control.py for a release tag and checks it before anything is replaced."""
+    done = QtCore.Signal(str, str)         # path, error
+
+    def __init__(self, ver):
+        super().__init__()
+        self.ver = ver
+
+    def run(self):
+        url = f"https://raw.githubusercontent.com/{UPDATE_REPO}/v{self.ver}/mbox_control.py"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": f"MboxControl/{VERSION}"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                text = r.read().decode()
+            if f'VERSION = "{self.ver}"' not in text[:5000]:
+                raise ValueError("the download isn't the version it should be")
+            compile(text, "mbox_control.py", "exec")          # never install something that won't start
+            CONF_DIR.mkdir(parents=True, exist_ok=True)
+            out = CONF_DIR / f"mbox_control-{self.ver}.py"
+            out.write_text(text)
+            self.done.emit(str(out), "")
+        except Exception as e:  # noqa: BLE001
+            self.done.emit("", str(e))
 
 
 def cli_install():
@@ -3859,9 +4080,8 @@ def airplay_status():
             "speakers": speakers}
 
 
-def enable_airplay():
-    """Avahi on, firewall open for speakers on the home network, PipeWire looking for speakers.
-    Asks for the password once. → (ok, message)"""
+def airplay_root_cmd():
+    """The one root command AirPlay needs (Avahi, firewall), or None if nothing needs root."""
     st = airplay_status()
     root = []
     if not st["avahi_installed"]:
@@ -3880,10 +4100,11 @@ def enable_airplay():
     elif kind == "firewalld":
         root.append("firewall-cmd --permanent --add-service=mdns && firewall-cmd --permanent "
                     f"--add-port={AIRPLAY_UDP.replace(':', '-')}/udp && firewall-cmd --reload")
-    if root:
-        r = subprocess.run(["pkexec", "sh", "-c", " && ".join(root)], capture_output=True, text=True)
-        if r.returncode != 0:
-            return False, (r.stderr or r.stdout).strip()[-200:] or "Cancelled."
+    return ["sh", "-c", " && ".join(root)] if root else None
+
+
+def finish_airplay():
+    """The no-root part: tell PipeWire to look for speakers, now and at every login."""
     AIRPLAY_CONF.parent.mkdir(parents=True, exist_ok=True)
     AIRPLAY_CONF.write_text("""# Written by Mbox Control: find AirPlay speakers on the home network
 context.modules = [
@@ -3895,7 +4116,6 @@ context.modules = [
     # load it now too, so nothing has to restart (the file covers the next login)
     if "raop-discover" not in (run_quiet("pactl", "list", "short", "modules") or ""):
         run_quiet("pactl", "load-module", "module-raop-discover")
-    return True, ""
 
 
 def disable_airplay():
@@ -4185,6 +4405,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.app_state["setup"]["main_name"] = old
         if not self.first_run:
             self.app_state.setdefault("setup_done", True)        # existing users already set things up
+            self.app_state.setdefault("tester_updates", True)    # they've been updating from Downloads
         self.sniff_since, self.hinted = {}, {}
         self.analyzer = None
         self.meters_frozen_since, self.last_meter_revive = 0.0, 0.0
@@ -4321,6 +4542,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---------------------------------------------------------------- live / reliability
     def start_live(self):
+        self.backend.direct_tried = False
+        if self.backend.direct:
+            self.backend.direct.close()
+            self.backend.direct = None
+        self.backend.enable_direct()
         meter_ids = [self.ctrl(n).numid for n in METER_CTRLS if self.ctrl(n)]
         fast_ids = [self.ctrl(n).numid for n in FAST_CTRLS if self.ctrl(n)]
         self.poller = Poller(self.backend, meter_ids, fast_ids)
@@ -4482,9 +4708,9 @@ class MainWindow(QtWidgets.QMainWindow):
             items.append(("warn", f"{muted_on} is turned down in the speaker mix, so it's silent.",
                           "Turn it back up", self.restore_always_on_now))
         if self.update_offer:
-            path, ver = self.update_offer
-            items.insert(0, ("tip", f"Mbox Control {ver} is in your Downloads folder.", "Update now",
-                             lambda: self.apply_update(path)))
+            o = self.update_offer
+            where = "is in your Downloads folder" if o["kind"] == "file" else "is out"
+            items.insert(0, ("tip", f"Mbox Control {o['ver']} {where}.", "Update now", self.install_offer))
         if not self.app_state.get("startup_scene"):
             items.append(("tip", "Pick a startup scene so your setup comes back automatically after the "
                                  "Mbox is switched off or used in Windows.", "Choose…", self.choose_startup))
@@ -4557,6 +4783,7 @@ class MainWindow(QtWidgets.QMainWindow):
             old.deleteLater()
         self.rebuild_scene_grid()
         self.run_refreshers()
+        self.shorten_blurbs()
 
     def item_db(self, item):
         """Live level of an Mbox input, from the mixer meter or, failing that, the capture meter."""
@@ -4806,19 +5033,20 @@ class MainWindow(QtWidgets.QMainWindow):
         return w
 
     def shorten_blurbs(self):
-        """Long explanations under card titles: keep the first sentence, the rest goes in a tooltip."""
-        for f in self.findChildren(QtWidgets.QFrame, "card"):
-            lab = f.findChild(QtWidgets.QLabel, "muted")
-            if not lab or lab.parent() is not f:
-                continue
+        """Clean pages: every long explanation keeps its first sentence; the rest is one hover away (ⓘ)."""
+        for lab in self.findChildren(QtWidgets.QLabel, "muted"):
             txt = lab.text()
-            if len(txt) <= 120 or "<" in txt:
+            if len(txt) <= 95 or "<" in txt or txt.endswith("ⓘ") or lab.property("keep_long"):
                 continue
-            m = re.match(r"(.{30,}?[.!?])\s", txt)
-            if m and len(m.group(1)) < len(txt) - 10:
-                lab.setText(m.group(1) + "  ⓘ")
-                lab.setToolTip(txt)
+            m = re.match(r"(.{25,}?[.!?—])\s", txt)
+            short = m.group(1).rstrip(" —") if m and len(m.group(1)) <= 110 else \
+                txt[:90].rsplit(" ", 1)[0].rstrip(" ·,:;—") + "…"
+            if len(short) < len(txt) - 10:
+                lab.setText(short + "  ⓘ")
+                lab.setToolTip(f"<p style='max-width:420px'>{html_escape(txt)}</p>")
                 lab.setCursor(Qt.WhatsThisCursor)
+        for t in self.findChildren(QtWidgets.QTabWidget):
+            icon_tabs(t)
 
     # ---------------------------------------------------------------- tray quick panel
     def build_quick_panel(self):
@@ -5568,6 +5796,33 @@ class MainWindow(QtWidgets.QMainWindow):
             lambda _: QtCore.QTimer.singleShot(50, self.refresh_apps)))
         return scroll(w)
 
+    def run_root(self, argv, label, done):
+        """Run argv as root (pkexec) in the background. The window stays usable; done(ok, message)."""
+        if not shutil.which("pkexec"):
+            done(False, "pkexec (polkit) isn't installed.")
+            return
+        dlg = QtWidgets.QProgressDialog(label + "\n\nEnter your password if asked — the prompt can open "
+                                        "behind this window.", None, 0, 0, self)
+        dlg.setWindowTitle(APP_NAME)
+        dlg.setWindowModality(Qt.NonModal)
+        dlg.setMinimumDuration(0)
+        dlg.setCancelButton(None)
+        dlg.show()
+        proc = QtCore.QProcess(self)
+        self.root_jobs = getattr(self, "root_jobs", [])
+        self.root_jobs.append(proc)
+
+        def finished(code=-1, _status=None):
+            if proc not in self.root_jobs:
+                return
+            self.root_jobs.remove(proc)
+            dlg.close()
+            err = bytes(proc.readAllStandardError()).decode(errors="ignore").strip()[-300:]
+            done(code == 0, err if code != 0 else "")
+        proc.finished.connect(finished)
+        proc.errorOccurred.connect(lambda e: e == QtCore.QProcess.FailedToStart and finished(-1))
+        proc.start("pkexec", list(argv))
+
     def toggle_airplay(self):
         if airplay_status()["enabled"]:
             for k in list(self.mirrors):
@@ -5577,13 +5832,22 @@ class MainWindow(QtWidgets.QMainWindow):
             self.save_app_state()
             self.toast("AirPlay turned off.", 5000)
         else:
+            def done(ok, msg):
+                if not ok:
+                    QtWidgets.QMessageBox.warning(self, APP_NAME, "Couldn't turn on AirPlay." +
+                                                  (f"\n\n{msg}" if msg else ""))
+                else:
+                    finish_airplay()
+                    self.toast("AirPlay is on — speakers appear within a few seconds.", 8000)
+                self.airplay_sig = None
+                self.refresh_airplay()
             self.airplay_note.setText("Setting up…")
-            QtWidgets.QApplication.processEvents()
-            ok, msg = enable_airplay()
-            if not ok:
-                QtWidgets.QMessageBox.warning(self, APP_NAME, "Couldn't turn on AirPlay." + (f"\n\n{msg}" if msg else ""))
+            cmd = airplay_root_cmd()
+            if cmd:
+                self.run_root(cmd, "Setting up AirPlay (speaker discovery and firewall)…", done)
             else:
-                self.toast("AirPlay is on — speakers appear within a few seconds.", 8000)
+                done(True, "")
+            return
         self.airplay_sig = None
         self.refresh_airplay()
 
@@ -6077,15 +6341,49 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---------------------------------------------------------------- 4.2: updater
     def check_update(self):
-        try:
-            offer = find_update()
-        except Exception:  # noqa: BLE001
-            offer = None
+        offer = None
+        if self.app_state.get("tester_updates"):
+            try:
+                found = find_update()
+                if found:
+                    offer = {"kind": "file", "ver": found[1], "path": str(found[0])}
+            except Exception:  # noqa: BLE001
+                pass
+        if offer is None and getattr(self, "web_offer", None):
+            offer = self.web_offer
+        if UPDATE_REPO and self.app_state.get("update_check") and \
+                time.time() - self.app_state.get("update_checked_at", 0) > 86400 and \
+                not (getattr(self, "upd_job", None) and self.upd_job.isRunning()):
+            self.app_state["update_checked_at"] = time.time()
+            self.save_app_state()
+            self.upd_job = UpdateCheck()
+            self.upd_job.found.connect(self.web_update_found)
+            self.upd_job.start()
         if offer != self.update_offer:
             self.update_offer = offer
             self.refresh_health()
             if offer and self.tray:
-                self.tray.showMessage(APP_NAME, f"Version {offer[1]} is ready to install.", app_icon(), 5000)
+                self.tray.showMessage(APP_NAME, f"Version {offer['ver']} is ready to install.", app_icon(), 5000)
+
+    def web_update_found(self, ver, page):
+        self.web_offer = {"kind": "github", "ver": ver, "page": page} if ver else None
+        self.check_update()
+
+    def install_offer(self):
+        o = self.update_offer or {}
+        if o.get("kind") == "file":
+            self.apply_update(o["path"])
+            return
+        if not os.access(Path(__file__).resolve(), os.W_OK):
+            QtWidgets.QMessageBox.information(self, APP_NAME, f"Mbox Control {o.get('ver')} is out. You installed "
+                                              "it as a package, so update with your package manager "
+                                              "(for example: paru -Syu).")
+            return
+        self.toast(f"Downloading Mbox Control {o.get('ver')}…", 0)
+        self.dl_job = UpdateDownload(o["ver"])
+        self.dl_job.done.connect(lambda path, err: self.apply_update(path) if path else
+                                 QtWidgets.QMessageBox.warning(self, APP_NAME, f"The update didn't download: {err}"))
+        self.dl_job.start()
 
     def install_nosuspend(self):
         write_nosuspend_conf()
@@ -6488,7 +6786,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ol.addLayout(og)
         two.addWidget(oc, 1)
 
-        ic, il = card("Inputs", "Tag jacks on the Hardware page.")
+        ic, il = card("Inputs", "Name them in Settings → Your setup.")
         ig = QtWidgets.QGridLayout()
         ig.setHorizontalSpacing(14)
         for r, (name, item) in enumerate([("Input 1", "Analog-A-1"), ("Input 2", "Analog-A-2"),
@@ -6653,10 +6951,15 @@ class MainWindow(QtWidgets.QMainWindow):
             if not shutil.which("pkexec") or not install_argv("audacity"):
                 QtWidgets.QMessageBox.information(self, APP_NAME, "Install Audacity with your package manager.")
                 return
-            if not install_feature("audacity") or not shutil.which("audacity"):
-                QtWidgets.QMessageBox.warning(self, APP_NAME, "The install didn't finish. Try:  "
-                                              + install_hint("audacity"))
-                return
+
+            def done(ok, _msg):
+                if ok and shutil.which("audacity"):
+                    self.open_audacity(path)
+                else:
+                    QtWidgets.QMessageBox.warning(self, APP_NAME, "The install didn't finish. Try:  "
+                                                  + install_hint("audacity"))
+            self.run_root(install_argv("audacity"), "Installing Audacity…", done)
+            return
         env = dict(os.environ)
         if pw_node_exists("mbox_tape_in"):
             self.route_rip_input()
@@ -8324,10 +8627,13 @@ class MainWindow(QtWidgets.QMainWindow):
             if QtWidgets.QMessageBox.question(self, APP_NAME, "This needs Chromaprint (fpcalc). Install it now?"
                                               ) != QtWidgets.QMessageBox.Yes:
                 return
-            install_feature("chromaprint")
-            if not shutil.which("fpcalc"):
-                self.split_status.setText("Couldn't install chromaprint. Try:  " + install_hint("chromaprint"))
+            if not install_argv("chromaprint"):
+                self.split_status.setText("Install Chromaprint (fpcalc) with your package manager.")
                 return
+            self.run_root(install_argv("chromaprint"), "Installing Chromaprint…", lambda ok, _m: (
+                self.identify_songs() if shutil.which("fpcalc") else
+                self.split_status.setText("Couldn't install Chromaprint. Try:  " + install_hint("chromaprint"))))
+            return
         src = self.split_src.text().strip()
         rows = [(r, a, b) for r, (a, b, t) in enumerate(self._tracks()) if b > a]
         if not src or not rows:
@@ -8680,7 +8986,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.fw_btn.setVisible(False)
         l.addWidget(self.fw_btn, 0, Qt.AlignLeft)
         l.addWidget(muted("Scan with your phone's camera on the same Wi-Fi, then “Add to Home screen”. "
-                          "Anyone on your home network can use it while it's on; +48V is never exposed."))
+                          "Only phones that scanned this code can use it; +48V is never exposed."))
+        unpair = QtWidgets.QPushButton("Unpair all phones")
+        unpair.setToolTip("Makes a new code. Every phone has to scan again — use it if a phone is lost or "
+                          "you shared the code by mistake.")
+        unpair.clicked.connect(self.unpair_phones)
+        l.addWidget(unpair, 0, Qt.AlignLeft)
         self.remote_auto = QtWidgets.QCheckBox("Start the remote whenever Mbox Control opens")
         self.remote_auto.setChecked(bool(self.app_state.get("remote_on")))
         self.remote_auto.toggled.connect(lambda on: (self.app_state.__setitem__("remote_on", on),
@@ -8698,6 +9009,11 @@ class MainWindow(QtWidgets.QMainWindow):
                                  "/sw.js": (REMOTE_SW.encode(), "text/javascript"),
                                  "/icon-192.png": (remote_icon_png(192), "image/png"),
                                  "/icon-512.png": (remote_icon_png(512), "image/png")}
+        if not self.app_state.get("remote_token"):
+            import secrets
+            self.app_state["remote_token"] = secrets.token_urlsafe(9)
+            self.save_app_state()
+        self.remote.token = self.app_state["remote_token"]
         try:
             self.remote.start()
         except OSError as e:
@@ -8714,8 +9030,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.remote_btn.setChecked(True)
         self.remote_btn.setText("Stop phone remote")
         self.remote_btn.blockSignals(False)
-        url = f"http://{lan_ip()}:{REMOTE_PORT}"
-        self.remote_url.setText(url)
+        url = f"http://{lan_ip()}:{REMOTE_PORT}/?k={self.remote.token}"
+        self.remote_url.setText(f"http://{lan_ip()}:{REMOTE_PORT} — scan the code; it has the key in it")
         if not self.app_state.get("fw_open") and firewall_kind():
             self.fw_btn.setVisible(True)
             if not quiet:
@@ -8726,20 +9042,35 @@ class MainWindow(QtWidgets.QMainWindow):
         except ValueError:
             self.remote_qr.setVisible(False)
 
+    def unpair_phones(self):
+        import secrets
+        self.app_state["remote_token"] = secrets.token_urlsafe(9)
+        self.save_app_state()
+        if self.remote.running():
+            self.stop_remote()
+            self.start_remote(quiet=True)
+        self.toast("New code made — phones need to scan it again.", 6000)
+
     def allow_remote_firewall(self, ask=True):
         if ask and QtWidgets.QMessageBox.question(
                 self, APP_NAME, "Your computer's firewall will block your phone from reaching the remote.\n\n"
                 "Allow it for devices on your home network? (Asks for your password once.)") \
                 != QtWidgets.QMessageBox.Yes:
             return
-        ok, msg = open_firewall(REMOTE_PORT)
-        if ok:
-            self.app_state["fw_open"] = True
-            self.save_app_state()
-            self.fw_btn.setVisible(False)
-            self.toast("Phones on your home network can now reach the remote.", 8000)
+        def done(ok, msg):
+            if ok:
+                self.app_state["fw_open"] = True
+                self.save_app_state()
+                self.fw_btn.setVisible(False)
+                self.toast("Phones on your home network can now reach the remote.", 8000)
+            else:
+                QtWidgets.QMessageBox.warning(self, APP_NAME, "Couldn't change the firewall." +
+                                              (f"\n\n{msg}" if msg else ""))
+        cmd = firewall_open_cmd(REMOTE_PORT)
+        if cmd:
+            self.run_root(cmd, "Opening the firewall for the phone remote…", done)
         else:
-            QtWidgets.QMessageBox.warning(self, APP_NAME, "Couldn't change the firewall." + (f"\n\n{msg}" if msg else ""))
+            done(True, "")
 
     def stop_remote(self):
         if getattr(self, "remote_timer", None):
@@ -9290,6 +9621,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refreshers.append(lambda: self.events_lbl.setText("connected ✓" if self.events_alive
                                                                else "not available — polling instead"))
         f.addRow("App version", QtWidgets.QLabel(VERSION))
+        uc = QtWidgets.QCheckBox("Check for new versions once a day")
+        uc.setChecked(bool(self.app_state.get("update_check")) and bool(UPDATE_REPO))
+        uc.setEnabled(bool(UPDATE_REPO))
+        uc.setToolTip("Asks GitHub whether there's a newer release. Nothing else is sent." if UPDATE_REPO else
+                      "Available once Mbox Control is published on GitHub.")
+        uc.toggled.connect(lambda on: (self.app_state.__setitem__("update_check", on),
+                                       self.app_state.__setitem__("update_checked_at", 0),
+                                       self.save_app_state(), self.check_update()))
+        f.addRow("Updates", uc)
+        tu = QtWidgets.QCheckBox("Tester mode: offer new versions I save to Downloads")
+        tu.setChecked(bool(self.app_state.get("tester_updates")))
+        tu.setToolTip("For trying test builds: a newer mbox_control.py in ~/Downloads shows up as an update.")
+        tu.toggled.connect(lambda on: (self.app_state.__setitem__("tester_updates", on), self.save_app_state(),
+                                       self.check_update()))
+        f.addRow("", tu)
         diag = QtWidgets.QPushButton("Copy diagnostics")
         diag.setToolTip("Copies your system details (no personal info) — paste them into a bug report.")
         diag.clicked.connect(lambda: (QtWidgets.QApplication.clipboard().setText(diagnostics()),
@@ -9458,6 +9804,8 @@ def diagnostics():
             ("Control service", str(SERVICE_PATH).replace(str(HOME), "~") + (" (found)" if SERVICE_PATH.exists()
                                                                              else " (MISSING)")),
             ("Service running", "yes" if service_running() else "no"),
+            ("Meter reading", ("direct (fast)" if card is not None and Backend(card).enable_direct()
+                               else "amixer (slow)") if card is not None else "n/a"),
             ("snd-dice module", "loaded" if Path("/sys/module/snd_dice").exists() else "not loaded"),
             ("Firewall", firewall_kind() or "none active"),
             ("ffmpeg", "yes" if shutil.which("ffmpeg") else "no"), ("pw-jack", "yes" if shutil.which("pw-jack") else "no")]
@@ -9489,6 +9837,7 @@ def main():
     app.setDesktopFileName("mbox-control")
     st = load_json(STATE_FILE, {})
     set_theme(st.get("theme", "system"), st.get("accent", "system"))
+    ensure_icon_theme()
     apply_theme(app)
     card_no = os.environ.get("MBOX_CARD") or find_mbox_card()
     if card_no is None:

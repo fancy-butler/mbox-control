@@ -1,5 +1,19 @@
 # Changelog
 
+## 4.13
+- **Phone remote is paired.** Only phones that scanned the QR code can control the Mbox. **Unpair
+  all phones** makes a new code.
+- **Much lighter on the CPU.** Meters are read straight from the sound card instead of starting
+  `amixer` about 40 times a second. The app checks this against `amixer` first and falls back if
+  anything differs.
+- **Installs don't freeze the window.** Audacity, Chromaprint, AirPlay and firewall changes run in the
+  background with a progress box.
+- **Updates:** an opt-in daily check for new releases on GitHub. Each download is verified before it
+  replaces anything. Picking up new versions from ~/Downloads is now a "Tester mode" setting.
+- **Cleaner look:** icons on cards and tabs, and long explanations shortened to one line with the
+  rest in a hover (ⓘ).
+- Fix: icons were missing when PySide6 came from pip (Ubuntu/Debian).
+
 ## 4.12.1
 - `mbox-control --version` and `mbox-control --diagnostics`, plus **Settings → App → Copy diagnostics**
   for bug reports.

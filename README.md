@@ -103,8 +103,8 @@ input. Everything is optional, and you can change it any time in **Settings → 
 - Only tested on the Mbox Pro 3. Other DICE-based interfaces won't work without changes.
 - Above 96 kHz the box only has two stereo mixes and no reverb. This is a hardware limit.
 - AirPlay plays about 1.5 seconds behind, so use it for other rooms.
-- The phone remote works over plain HTTP on your home network. It can go on your home screen but
-  opens in a browser tab.
+- The phone remote works over plain HTTP on your home network, paired by the code in its QR link.
+  It can go on your home screen but opens in a browser tab.
 
 ## License
 
