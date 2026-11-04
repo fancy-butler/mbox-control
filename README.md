@@ -106,6 +106,18 @@ input. Everything is optional, and you can change it any time in **Settings → 
 - The phone remote works over plain HTTP on your home network, paired by the code in its QR link.
   It can go on your home screen but opens in a browser tab.
 
+## Development
+
+The tests run against a simulated Mbox, built from a real Mbox Pro 3's control list. You don't
+need the hardware, PipeWire or a screen:
+
+```
+pip install PySide6 numpy pytest
+pytest -q
+```
+
+GitHub runs the same tests, plus a lint check, on every push.
+
 ## License
 
 GPL-3.0-or-later; see [LICENSE](LICENSE). You can use, share and change it, and anything

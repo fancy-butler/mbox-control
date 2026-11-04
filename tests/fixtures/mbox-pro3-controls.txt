@@ -1,0 +1,293 @@
+numid=1,iface=CARD,name='clock-rate'
+  ; type=ENUMERATED,access=rw----W-,values=1,items=6
+  ; Item #0 '44100'
+  ; Item #1 '48000'
+  ; Item #2 '88200'
+  ; Item #3 '96000'
+  ; Item #4 '176400'
+  ; Item #5 '192000'
+  : values=1
+numid=2,iface=CARD,name='clock-source'
+  ; type=ENUMERATED,access=rw----W-,values=1,items=3
+  ; Item #0 'SPDIF'
+  ; Item #1 'Word Clock'
+  ; Item #2 'Internal'
+  : values=2
+numid=40,iface=CARD,name='dim-led'
+  ; type=BOOLEAN,access=rw----W-,values=1
+  : values=on
+numid=41,iface=CARD,name='hold-duration'
+  ; type=INTEGER,access=rw----W-,values=1,min=0,max=1000,step=1
+  : values=50
+numid=43,iface=CARD,name='input-hp-filter'
+  ; type=BOOLEAN,access=rw----W-,values=4
+  : values=off,off,off,off
+numid=3,iface=CARD,name='locked-clock-source'
+  ; type=BOOLEAN,access=rw----W-,values=4
+  : values=off,on,off,off
+numid=36,iface=CARD,name='master-knob-assign'
+  ; type=BOOLEAN,access=rw----W-,values=6
+  : values=on,on,off,off,off,off
+numid=35,iface=CARD,name='master-knob-value'
+  ; type=INTEGER,access=rw----W-,values=1,min=0,max=255,step=1
+  : values=255
+numid=38,iface=CARD,name='mono-button'
+  ; type=ENUMERATED,access=rw----W-,values=1,items=2
+  ; Item #0 'Off'
+  ; Item #1 'On'
+  : values=0
+numid=37,iface=CARD,name='mute-button'
+  ; type=ENUMERATED,access=rw----W-,values=1,items=3
+  ; Item #0 'Off'
+  ; Item #1 'Blink'
+  ; Item #2 'On'
+  : values=0
+numid=50,iface=CARD,name='nickname'
+  ; type=BYTES,access=rw------,values=64
+  : values=0x4d,0x62,0x6f,0x78,0x20,0x50,0x72,0x6f,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00
+numid=44,iface=CARD,name='output-trim'
+  ; type=INTEGER,access=rw----W-,values=6,min=0,max=255,step=1
+  : values=255,255,255,255,255,255
+numid=42,iface=CARD,name='phantom-powering'
+  ; type=BOOLEAN,access=rw----W-,values=1
+  : values=off
+numid=4,iface=CARD,name='slipped-clock-source'
+  ; type=BOOLEAN,access=rw----W-,values=4
+  : values=off,off,off,off
+numid=39,iface=CARD,name='spkr-button'
+  ; type=ENUMERATED,access=rw----W-,values=1,items=7
+  ; Item #0 'Off'
+  ; Item #1 'Green'
+  ; Item #2 'Green-Blink'
+  ; Item #3 'Red'
+  ; Item #4 'Red-Blink'
+  ; Item #5 'Orange'
+  ; Item #6 'Orange-Blink'
+  : values=1
+numid=5,iface=CARD,name='standalone-clock-source'
+  ; type=ENUMERATED,access=rw----W-,values=1,items=3
+  ; Item #0 'SPDIF'
+  ; Item #1 'Word Clock'
+  ; Item #2 'Internal'
+  : values=2
+numid=10,iface=CARD,name='standalone-internal-clock-rate'
+  ; type=ENUMERATED,access=rw----W-,values=1,items=6
+  ; Item #0 '44100'
+  ; Item #1 '48000'
+  ; Item #2 '88200'
+  ; Item #3 '96000'
+  ; Item #4 '176400'
+  ; Item #5 '192000'
+  : values=5
+numid=6,iface=CARD,name='standalone-spdif-high-rate'
+  ; type=BOOLEAN,access=rw----W-,values=1
+  : values=off
+numid=34,iface=CARD,name='standalone-usecase'
+  ; type=ENUMERATED,access=rw----W-,values=1,items=4
+  ; Item #0 'Mixer'
+  ; Item #1 'AD/DA'
+  ; Item #2 'Preamp'
+  ; Item #3 'Undefined'
+  : values=1
+numid=7,iface=CARD,name='standalone-word-clock-mode'
+  ; type=ENUMERATED,access=rw----W-,values=1,items=4
+  ; Item #0 'Normal'
+  ; Item #1 'Low'
+  ; Item #2 'Middle'
+  ; Item #3 'High'
+  : values=0
+numid=9,iface=CARD,name='standalone-word-clock-rate-denominator'
+  ; type=INTEGER,access=rw----W-,values=1,min=1,max=65535,step=1
+  : values=1
+numid=8,iface=CARD,name='standalone-word-clock-rate-numerator'
+  ; type=INTEGER,access=rw----W-,values=1,min=1,max=4095,step=1
+  : values=1
+numid=49,iface=MIXER,name='metering'
+  ; type=BOOLEAN,access=rw----W-,values=1
+  : values=off
+numid=33,iface=MIXER,name='mixer-out-saturation'
+  ; type=BOOLEAN,access=rw----W-,values=18
+  : values=off,off,off,off,off,off,off,off,off,off,off,off,off,off,off,off,off,off
+numid=29,iface=MIXER,name='mixer-source'
+  ; type=ENUMERATED,access=rw----W-,values=18,items=19
+  ; Item #0 'None'
+  ; Item #1 'Analog-A-1'
+  ; Item #2 'Analog-A-2'
+  ; Item #3 'Analog-A-3'
+  ; Item #4 'Analog-A-4'
+  ; Item #5 'Analog-A-5'
+  ; Item #6 'Analog-A-6'
+  ; Item #7 'Reverb-1'
+  ; Item #8 'Reverb-2'
+  ; Item #9 'S/PDIF-1'
+  ; Item #10 'S/PDIF-2'
+  ; Item #11 'Stream-1'
+  ; Item #12 'Stream-2'
+  ; Item #13 'Stream-3'
+  ; Item #14 'Stream-4'
+  ; Item #15 'Stream-5'
+  ; Item #16 'Stream-6'
+  ; Item #17 'Stream-7'
+  ; Item #18 'Stream-8'
+  : values=1,2,3,4,5,6,9,10,11,12,13,14,15,16,17,18,7,8
+numid=11,iface=MIXER,name='mixer-source-gain'
+  ; type=INTEGER,access=rw---RW-,values=18,min=0,max=65535,step=1
+  : values=16384,3660,0,11585,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+  | dBminmax-min=-60.00dB,max=4.00dB
+numid=12,iface=MIXER,name='mixer-source-gain',index=1
+  ; type=INTEGER,access=rw---RW-,values=18,min=0,max=65535,step=1
+  : values=0,3660,1625,11585,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+  | dBminmax-min=-60.00dB,max=4.00dB
+numid=13,iface=MIXER,name='mixer-source-gain',index=2
+  ; type=INTEGER,access=rw---RW-,values=18,min=0,max=65535,step=1
+  : values=0,0,0,0,0,0,0,0,0,0,16384,0,0,0,0,0,0,0
+  | dBminmax-min=-60.00dB,max=4.00dB
+numid=14,iface=MIXER,name='mixer-source-gain',index=3
+  ; type=INTEGER,access=rw---RW-,values=18,min=0,max=65535,step=1
+  : values=0,0,0,0,0,0,0,0,0,0,0,16384,0,0,0,0,0,0
+  | dBminmax-min=-60.00dB,max=4.00dB
+numid=15,iface=MIXER,name='mixer-source-gain',index=4
+  ; type=INTEGER,access=rw---RW-,values=18,min=0,max=65535,step=1
+  : values=0,0,0,0,0,0,0,0,0,0,0,0,16384,0,0,0,0,0
+  | dBminmax-min=-60.00dB,max=4.00dB
+numid=16,iface=MIXER,name='mixer-source-gain',index=5
+  ; type=INTEGER,access=rw---RW-,values=18,min=0,max=65535,step=1
+  : values=0,0,0,0,0,0,0,0,0,0,0,0,0,16384,0,0,0,0
+  | dBminmax-min=-60.00dB,max=4.00dB
+numid=17,iface=MIXER,name='mixer-source-gain',index=6
+  ; type=INTEGER,access=rw---RW-,values=18,min=0,max=65535,step=1
+  : values=0,0,0,0,0,0,0,0,0,0,0,0,0,0,16384,0,0,0
+  | dBminmax-min=-60.00dB,max=4.00dB
+numid=18,iface=MIXER,name='mixer-source-gain',index=7
+  ; type=INTEGER,access=rw---RW-,values=18,min=0,max=65535,step=1
+  : values=0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,16384,0,0
+  | dBminmax-min=-60.00dB,max=4.00dB
+numid=19,iface=MIXER,name='mixer-source-gain',index=8
+  ; type=INTEGER,access=rw---RW-,values=18,min=0,max=65535,step=1
+  : values=0,0,0,0,0,0,0,0,16384,0,0,0,0,0,0,0,0,0
+  | dBminmax-min=-60.00dB,max=4.00dB
+numid=20,iface=MIXER,name='mixer-source-gain',index=9
+  ; type=INTEGER,access=rw---RW-,values=18,min=0,max=65535,step=1
+  : values=0,0,0,0,0,0,0,0,0,16384,0,0,0,0,0,0,0,0
+  | dBminmax-min=-60.00dB,max=4.00dB
+numid=21,iface=MIXER,name='mixer-source-gain',index=10
+  ; type=INTEGER,access=rw---RW-,values=18,min=0,max=65535,step=1
+  : values=0,0,0,0,0,0,0,0,0,0,16384,0,0,0,0,0,0,0
+  | dBminmax-min=-60.00dB,max=4.00dB
+numid=22,iface=MIXER,name='mixer-source-gain',index=11
+  ; type=INTEGER,access=rw---RW-,values=18,min=0,max=65535,step=1
+  : values=0,0,0,0,0,0,0,0,0,0,0,16384,0,0,0,0,0,0
+  | dBminmax-min=-60.00dB,max=4.00dB
+numid=23,iface=MIXER,name='mixer-source-gain',index=12
+  ; type=INTEGER,access=rw---RW-,values=18,min=0,max=65535,step=1
+  : values=0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+  | dBminmax-min=-60.00dB,max=4.00dB
+numid=24,iface=MIXER,name='mixer-source-gain',index=13
+  ; type=INTEGER,access=rw---RW-,values=18,min=0,max=65535,step=1
+  : values=0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+  | dBminmax-min=-60.00dB,max=4.00dB
+numid=25,iface=MIXER,name='mixer-source-gain',index=14
+  ; type=INTEGER,access=rw---RW-,values=18,min=0,max=65535,step=1
+  : values=0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+  | dBminmax-min=-60.00dB,max=4.00dB
+numid=26,iface=MIXER,name='mixer-source-gain',index=15
+  ; type=INTEGER,access=rw---RW-,values=18,min=0,max=65535,step=1
+  : values=0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+  | dBminmax-min=-60.00dB,max=4.00dB
+numid=32,iface=MIXER,name='mixer-source-meter'
+  ; type=INTEGER,access=rw----W-,values=18,min=0,max=4095,step=1
+  : values=0,0,0,0,0,0,144,177,0,0,0,0,5,4,0,0,0,0
+numid=27,iface=MIXER,name='output-source'
+  ; type=ENUMERATED,access=rw----W-,values=16,items=35
+  ; Item #0 'None'
+  ; Item #1 'Analog-A-1'
+  ; Item #2 'Analog-A-2'
+  ; Item #3 'Analog-A-3'
+  ; Item #4 'Analog-A-4'
+  ; Item #5 'Analog-A-5'
+  ; Item #6 'Analog-A-6'
+  ; Item #7 'Reverb-1'
+  ; Item #8 'Reverb-2'
+  ; Item #9 'S/PDIF-1'
+  ; Item #10 'S/PDIF-2'
+  ; Item #11 'Stream-1'
+  ; Item #12 'Stream-2'
+  ; Item #13 'Stream-3'
+  ; Item #14 'Stream-4'
+  ; Item #15 'Stream-5'
+  ; Item #16 'Stream-6'
+  ; Item #17 'Stream-7'
+  ; Item #18 'Stream-8'
+  ; Item #19 'Mixer-1'
+  ; Item #20 'Mixer-2'
+  ; Item #21 'Mixer-3'
+  ; Item #22 'Mixer-4'
+  ; Item #23 'Mixer-5'
+  ; Item #24 'Mixer-6'
+  ; Item #25 'Mixer-7'
+  ; Item #26 'Mixer-8'
+  ; Item #27 'Mixer-9'
+  ; Item #28 'Mixer-10'
+  ; Item #29 'Mixer-11'
+  ; Item #30 'Mixer-12'
+  ; Item #31 'Mixer-13'
+  ; Item #32 'Mixer-14'
+  ; Item #33 'Mixer-15'
+  ; Item #34 'Mixer-16'
+  : values=19,20,21,22,23,24,27,28,5,6,31,32,13,14,0,0
+numid=30,iface=MIXER,name='output-source-meter'
+  ; type=INTEGER,access=rw----W-,values=16,min=0,max=4095,step=1
+  : values=144,177,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+numid=47,iface=MIXER,name='reverb-duration'
+  ; type=INTEGER,access=rw----W-,values=1,min=0,max=255,step=1
+  : values=63
+numid=48,iface=MIXER,name='reverb-feedback'
+  ; type=INTEGER,access=rw----W-,values=1,min=0,max=255,step=1
+  : values=63
+numid=46,iface=MIXER,name='reverb-output-volume'
+  ; type=INTEGER,access=rw----W-,values=1,min=0,max=255,step=1
+  : values=63
+numid=45,iface=MIXER,name='reverb-type'
+  ; type=ENUMERATED,access=rw----W-,values=1,items=8
+  ; Item #0 'Room-1'
+  ; Item #1 'Room-2'
+  ; Item #2 'Room-3'
+  ; Item #3 'Hall-1'
+  ; Item #4 'Hall-2'
+  ; Item #5 'Plate'
+  ; Item #6 'Echo'
+  ; Item #7 'Delay'
+  : values=1
+numid=28,iface=MIXER,name='stream-source'
+  ; type=ENUMERATED,access=rw----W-,values=8,items=27
+  ; Item #0 'None'
+  ; Item #1 'Analog-A-1'
+  ; Item #2 'Analog-A-2'
+  ; Item #3 'Analog-A-3'
+  ; Item #4 'Analog-A-4'
+  ; Item #5 'Analog-A-5'
+  ; Item #6 'Analog-A-6'
+  ; Item #7 'Reverb-1'
+  ; Item #8 'Reverb-2'
+  ; Item #9 'S/PDIF-1'
+  ; Item #10 'S/PDIF-2'
+  ; Item #11 'Mixer-1'
+  ; Item #12 'Mixer-2'
+  ; Item #13 'Mixer-3'
+  ; Item #14 'Mixer-4'
+  ; Item #15 'Mixer-5'
+  ; Item #16 'Mixer-6'
+  ; Item #17 'Mixer-7'
+  ; Item #18 'Mixer-8'
+  ; Item #19 'Mixer-9'
+  ; Item #20 'Mixer-10'
+  ; Item #21 'Mixer-11'
+  ; Item #22 'Mixer-12'
+  ; Item #23 'Mixer-13'
+  ; Item #24 'Mixer-14'
+  ; Item #25 'Mixer-15'
+  ; Item #26 'Mixer-16'
+  : values=1,2,3,4,5,6,9,10
+numid=31,iface=MIXER,name='stream-source-meter'
+  ; type=INTEGER,access=rw----W-,values=8,min=0,max=4095,step=1
+  : values=4095,4095,4095,3487,5,4,0,0

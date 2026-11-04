@@ -117,6 +117,11 @@ build_lib() {   # build_lib <pkg-config name> <github repo>
     fi
 }
 
+local_pc_path() {   # /usr/local pkg-config dirs (they differ per distro), then whatever was set before
+    local d; d="$(ls -d /usr/local/lib*/pkgconfig /usr/local/lib/*/pkgconfig 2>/dev/null | paste -sd: || true)"
+    echo "${d}${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+}
+
 cargo_ok() {   # recent crates need a recent Rust (1.78+)
     command -v cargo >/dev/null || return 1
     local v; v="$(cargo --version | awk '{print $2}')"
@@ -132,11 +137,11 @@ else
     if ask "Build it now?"; then
         install_pkgs "${BUILD[@]}"
         mkdir -p "$WORK"
-        export PKG_CONFIG_PATH="$(ls -d /usr/local/lib*/pkgconfig /usr/local/lib/*/pkgconfig 2>/dev/null | paste -sd:)${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+        PKG_CONFIG_PATH="$(local_pc_path)"; export PKG_CONFIG_PATH
         build_lib hinawa libhinawa
         build_lib hitaki libhitaki
         build_lib alsactl alsa-gobject
-        export PKG_CONFIG_PATH="$(ls -d /usr/local/lib*/pkgconfig /usr/local/lib/*/pkgconfig 2>/dev/null | paste -sd:)${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+        PKG_CONFIG_PATH="$(local_pc_path)"; export PKG_CONFIG_PATH
         [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
         if ! cargo_ok; then
             echo "This system's Rust is missing or too old; installing the official one (rustup) in your home folder."
@@ -188,4 +193,4 @@ if ("$PY" "$DEST/mbox_control.py" --cmd quit) >/dev/null 2>&1; then
     nohup "$PY" "$DEST/mbox_control.py" >/dev/null 2>&1 &
     echo "Restarted Mbox Control."
 fi
-say "Done — open “Mbox Control” from your app launcher"
+say "Done — open Mbox Control from your app launcher"
