@@ -1,5 +1,17 @@
 # Changelog
 
+## 4.14
+- **Loopback.** Record exactly what any output plays (mic and computer mixed by the Mbox itself) as
+  "Loopback (Mbox)". **Make it a stream mix** sets up mic + computer on a spare output in one click.
+- **Volume pop-up** when you turn the big knob or press Spkr. On KDE it uses Plasma's own OSD.
+- **App rules:** pin 📌 an app to an output and it goes there every time it starts.
+- **Export / import settings** (File menu or Settings → App). Your phone-remote key is never
+  exported, and other keys only if you say so.
+- **Crash and freeze log:** errors, crashes and any time the window stops responding for 5 seconds
+  are written to `~/.config/mbox-control/crash.log`, and **Copy diagnostics** includes them.
+- Settings → App → Meters: switch off fast meter reading if it ever misbehaves.
+- Fix: speaker-set names now show on the tray panel and the phone remote.
+
 ## 4.13
 - **Phone remote is paired.** Only phones that scanned the QR code can control the Mbox. **Unpair
   all phones** makes a new code.

@@ -46,7 +46,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QPointF, QRectF
 
 APP_NAME = "Mbox Control"
-VERSION = "4.13"
+VERSION = "4.14"
 UPDATE_REPO = ""          # "owner/mbox-control" once the project is on GitHub; empty = no online checks
 HOME = Path.home()
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -320,7 +320,8 @@ class Backend:
 
     def enable_direct(self):
         """Try the fast path once; keep it only if it matches amixer exactly on unchanging controls."""
-        if self.direct_tried or os.environ.get("MBOX_AMIXER"):
+        if self.direct_tried or os.environ.get("MBOX_AMIXER") or os.environ.get("MBOX_NO_DIRECT") or \
+                load_json(STATE_FILE, {}).get("direct_meters") is False:
             return self.direct is not None
         self.direct_tried = True
         try:
@@ -544,6 +545,7 @@ NAMED_INPUTS = [
     ("mbox_in2", "Mbox Input 2", ["AUX1"], ["MONO"]),
     ("mbox_in3", "Mbox Input 3", ["AUX2"], ["MONO"]),
     ("mbox_in4", "Mbox Input 4", ["AUX3"], ["MONO"]),
+    ("mbox_loopback", "Loopback (Mbox)", ["AUX6", "AUX7"], ["FL", "FR"]),
 ]
 
 
@@ -686,6 +688,7 @@ CARD_ICONS = {   # card title → icon names (KDE Breeze first, then freedesktop
     "Suggestions": ["help-hint", "dialog-information"], "Tuner": ["view-media-visualization", "audio-x-generic"],
     "What each output feeds": ["audio-speakers", "audio-speakers-symbolic", "speaker", "audio-volume-high"], "What's plugged into each input": ["audio-input-line", "audio-card"],
     "Where sound goes": ["view-media-visualization", "audio-speakers"], "Wiring": ["insert-link", "network-connect"],
+    "Loopback": ["media-repeat-all", "media-playlist-repeat", "view-refresh"],
 }
 TAB_ICONS = {
     "Rip": ["media-record"], "Quick take": ["audio-input-microphone"], "Split & tag": ["edit-cut"],
@@ -4039,6 +4042,10 @@ class SignalMap(QtWidgets.QWidget):
             box(pos[("mix", k)], f"Stereo Mix {k}", "→ " + ", ".join(users), ACCENT)
         names = [self.win.label(f"in{[j for j, _ in INPUT_JACKS].index(c)}", "") or dict(INPUT_JACKS)[c]
                  for c in caps if c in dict(INPUT_JACKS)]
+        lb = self.win.app_state.get("loopback", -1)
+        if lb >= 0:
+            names.append("loopback of " + (self.win.label(f"out{lb}", "") or
+                                           next(n for n, f, _ in OUTPUT_PAIRS if f == lb)))
         box(pos[("cap", "cap")], "To the computer", "apps can record: " + (", ".join(names) or "nothing"),
             ACCENT)
         for first, name, lbl in outs:
@@ -4367,6 +4374,148 @@ class HintBar(QtWidgets.QFrame):
             self.btns.addWidget(nb)
         self.show()
 
+# ================================================================== 4.14: loopback, OSD, app rules, backup
+
+LOOP_AUX = (6, 7)                       # capture channels 7/8 carry the loopback
+
+
+def mix_items(k):
+    """Stereo Mix k as the router names it."""
+    return f"Mixer-{2 * k - 1}", f"Mixer-{2 * k}"
+
+
+class Osd:
+    """The volume/speaker pop-up. Uses Plasma's own OSD when it's there, otherwise a small window."""
+
+    def __init__(self):
+        self.win = None
+        self.timer = None
+        self.kde = None
+
+    def _kde(self):
+        if self.kde is None:
+            try:
+                from PySide6 import QtDBus
+                iface = QtDBus.QDBusInterface("org.kde.plasmashell", "/org/kde/osdService", "org.kde.osdService",
+                                              QtDBus.QDBusConnection.sessionBus())
+                self.kde = iface if iface.isValid() else False
+            except Exception:  # noqa: BLE001
+                self.kde = False
+        return self.kde
+
+    def volume(self, percent, title):
+        kde = self._kde()
+        if kde:
+            kde.call("mediaPlayerVolumeChanged", int(percent), title, "audio-card")
+            return
+        self._show(f"{title}   {int(percent)}%", percent)
+
+    def text(self, icon, text):
+        kde = self._kde()
+        if kde:
+            kde.call("showText", icon, text)
+            return
+        self._show(text, None)
+
+    def _show(self, text, percent):
+        if self.win is None:
+            w = QtWidgets.QFrame(None, Qt.ToolTip | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+            w.setAttribute(Qt.WA_ShowWithoutActivating)
+            w.setStyleSheet(f"QFrame {{ background:{BG1}; border:1px solid {ACCENT}; border-radius:14px; }}"
+                            f"QLabel {{ border:none; font-size:12pt; color:{TEXT}; }}")
+            v = QtWidgets.QVBoxLayout(w)
+            v.setContentsMargins(22, 14, 22, 14)
+            w.label = QtWidgets.QLabel()
+            v.addWidget(w.label)
+            w.bar = QtWidgets.QProgressBar()
+            w.bar.setTextVisible(False)
+            w.bar.setFixedHeight(8)
+            v.addWidget(w.bar)
+            self.win = w
+            self.timer = QtCore.QTimer()
+            self.timer.setSingleShot(True)
+            self.timer.timeout.connect(w.hide)
+        self.win.label.setText(text)
+        self.win.bar.setVisible(percent is not None)
+        if percent is not None:
+            self.win.bar.setValue(int(percent))
+        self.win.adjustSize()
+        scr = QtGui.QGuiApplication.primaryScreen().availableGeometry()
+        self.win.move(scr.center().x() - self.win.width() // 2, scr.bottom() - self.win.height() - 80)
+        self.win.show()
+        self.timer.start(1600)
+
+
+BACKUP_FILES = ["app-state.json", "labels.json"]
+SECRET_KEYS = ("discogs_token", "acoustid_key")
+
+
+def export_settings(dest, include_keys=False):
+    """Everything you set up, in one file: names, scenes, speaker sets, rules, and the PipeWire bits
+    the app wrote. The phone-remote key is never included."""
+    import zipfile
+    with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as z:
+        for name in BACKUP_FILES:
+            p = CONF_DIR / name
+            if not p.exists():
+                continue
+            if name == "app-state.json":
+                st = load_json(p, {})
+                st.pop("remote_token", None)
+                if not include_keys:
+                    for k in SECRET_KEYS:
+                        st.pop(k, None)
+                z.writestr(name, json.dumps(st, indent=1))
+            else:
+                z.write(p, name)
+        for p in sorted(SCENES_DIR.glob("*.json")) if SCENES_DIR.exists() else []:
+            z.write(p, f"scenes/{p.name}")
+        for p in sorted(PW_CONF_DIR.glob("*mbox*.conf")) if PW_CONF_DIR.exists() else []:
+            z.write(p, f"pipewire/{p.name}")
+        nos = NOSUSPEND_CONF
+        if nos.exists():
+            z.write(nos, f"wireplumber/{nos.name}")
+        z.writestr("mbox-control-backup.json", json.dumps({"version": VERSION, "made": datetime.now().isoformat()}))
+
+
+def import_settings(src):
+    """→ (ok, message, touched_pipewire). Keeps your own keys if the backup didn't include them."""
+    import zipfile
+    try:
+        z = zipfile.ZipFile(src)
+    except (OSError, zipfile.BadZipFile):
+        return False, "That isn't a Mbox Control backup.", False
+    names = z.namelist()
+    if "mbox-control-backup.json" not in names:
+        return False, "That isn't a Mbox Control backup.", False
+    CONF_DIR.mkdir(parents=True, exist_ok=True)
+    pw = False
+    for n in names:
+        if n.endswith("/") or ".." in n or n.startswith("/"):
+            continue
+        data = z.read(n)
+        if n == "app-state.json":
+            new = json.loads(data.decode())
+            old = load_json(STATE_FILE, {})
+            for k in SECRET_KEYS + ("remote_token",):
+                if k in old and not new.get(k):
+                    new[k] = old[k]
+            save_json(STATE_FILE, new)
+        elif n == "labels.json":
+            (CONF_DIR / n).write_bytes(data)
+        elif n.startswith("scenes/") and n.endswith(".json"):
+            SCENES_DIR.mkdir(parents=True, exist_ok=True)
+            (SCENES_DIR / Path(n).name).write_bytes(data)
+        elif n.startswith("pipewire/") and n.endswith(".conf"):
+            PW_CONF_DIR.mkdir(parents=True, exist_ok=True)
+            (PW_CONF_DIR / Path(n).name).write_bytes(data)
+            pw = True
+        elif n.startswith("wireplumber/") and n.endswith(".conf"):
+            NOSUSPEND_CONF.parent.mkdir(parents=True, exist_ok=True)
+            NOSUSPEND_CONF.write_bytes(data)
+            pw = True
+    return True, "", pw
+
 # ================================================================== main window
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -4512,6 +4661,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.update_timer.start(60000)
         QtCore.QTimer.singleShot(2000, self.check_update)
         QtCore.QTimer.singleShot(900, self.refresh_health)
+        self.osd = Osd()
+        QtCore.QTimer.singleShot(1200, self.start_rules_watch)
         self.sniff_timer = QtCore.QTimer(self)
         self.sniff_timer.timeout.connect(self.sniff_inputs)
         self.sniff_timer.start(1000)
@@ -5069,7 +5220,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for L in "ABC":
             b = QtWidgets.QPushButton(f"Speakers {L}")
             b.setCheckable(True)
-            b.setToolTip(self.label(f"cr_name{L}", "") or f"Switch to speaker set {L}")
+            b.setToolTip((self.label(f"spk{L}", "") or self.label(f"cr_name{L}", "")) or f"Switch to speaker set {L}")
             b.clicked.connect(lambda _=False, L=L: (self.switch_speakers(L), self.refresh_quick_panel()))
             row.addWidget(b)
             self.q_spk[L] = b
@@ -5954,10 +6105,20 @@ class MainWindow(QtWidgets.QMainWindow):
                 cb.addItem(k["desc"], k["name"])
                 if k["id"] == s["sink"]:
                     cb.setCurrentIndex(cb.count() - 1)
-            cb.activated.connect(lambda _, sid=s["id"], cb=cb: (
+            rules = self.app_state.get("app_rules", {})
+            cb.activated.connect(lambda _, sid=s["id"], cb=cb, app=s["app"]: (
                 run_quiet("pactl", "move-sink-input", str(sid), cb.currentData()),
+                app in self.app_state.get("app_rules", {}) and self.set_app_rule(app, cb.currentData()),
                 setattr(self, "apps_sig", None)))
             self.apps_box.addWidget(cb, r, 2)
+            pin = QtWidgets.QToolButton()
+            pin.setCheckable(True)
+            pin.setChecked(s["app"] in rules)
+            pin.setText("📌")
+            pin.setStyleSheet(f"QToolButton:checked {{ background:{ACCENT}; border-radius:6px; }}")
+            pin.setToolTip(f"Always send {s['app']} here, every time it starts.")
+            pin.toggled.connect(lambda on, app=s["app"], cb=cb: self.set_app_rule(app, cb.currentData() if on else ""))
+            self.apps_box.addWidget(pin, r, 3)
         self.apps_empty.setVisible(not streams)
         cur = (run_quiet("pactl", "get-default-sink") or "").strip()
         self.default_sink.blockSignals(True)
@@ -6505,6 +6666,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if not changed:
             return
+        if c.name in ("master-knob-value", "spkr-button"):
+            self.osd_value(c.name, values)
         if c.name == "spkr-button":
             it = self.ctrl_item("spkr-button")
             if self.skip_unused_set(it):
@@ -8074,6 +8237,7 @@ class MainWindow(QtWidgets.QMainWindow):
         lay.addWidget(nc)
         self.refreshers.append(lambda: self.named_status.setText(
             "Installed ✓" if (PW_CONF_DIR / "mbox-inputs.conf").exists() else "Not installed yet."))
+        self.build_loopback_card(lay)
 
         gc, gl = card("Mic & instrument guide", "Pick what you're recording for placement tips and the "
                                                 "right settings.")
@@ -8163,7 +8327,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                              "Live analysis"]),
                                     ("Quick take", ["Quick take"]),
                                     ("Split && tag", ["Split & tag"]),
-                                    ("Tools", ["Make a tape", "Tuner", "Named inputs for your apps"])])
+                                    ("Tools", ["Loopback", "Make a tape", "Tuner", "Named inputs for your apps"])])
 
     def pick_rip_dir(self):
         d = QtWidgets.QFileDialog.getExistingDirectory(self, "Save rips to", self.rip_dir.text())
@@ -8892,6 +9056,197 @@ class MainWindow(QtWidgets.QMainWindow):
             self.dmark.done.connect(lambda m: self.toast(m, 8000))
             self.dmark.start()
 
+    # ---------------------------------------------------------------- 4.14: loopback
+    def build_loopback_card(self, lay):
+        c, l = card("Loopback", "Record exactly what one of the outputs plays — mic and computer together, "
+                                "mixed by the Mbox itself. Apps see it as “Loopback (Mbox)”.")
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("Record what this plays:"))
+        self.loop_box = QtWidgets.QComboBox()
+        self.loop_box.addItem("Off", -1)
+        for name, first, _ in OUTPUT_PAIRS:
+            self.loop_box.addItem(name, first)
+        self.loop_box.setToolTip("Pick the output whose mix you want to record or stream. Tip: build a "
+                                 "separate mix on a spare output (e.g. Outputs 5/6) for streaming, so your "
+                                 "own speakers' mix stays as it is.")
+        self.loop_box.activated.connect(lambda _: self.set_loopback(self.loop_box.currentData()))
+        row.addWidget(self.loop_box, 1)
+        self.loop_mix_btn = QtWidgets.QPushButton("Make it a stream mix…")
+        self.loop_mix_btn.setToolTip("Turns the chosen output's mix into: your mic (centred) + computer sound. "
+                                     "Fine-tune it on the Mixer page.")
+        self.loop_mix_btn.clicked.connect(self.make_stream_mix)
+        row.addWidget(self.loop_mix_btn)
+        l.addLayout(row)
+        self.loop_note = muted("")
+        l.addWidget(self.loop_note)
+        self.loop_install = QtWidgets.QPushButton("Add “Loopback (Mbox)” to your sound settings")
+        self.loop_install.clicked.connect(self.install_named_inputs)
+        l.addWidget(self.loop_install, 0, Qt.AlignLeft)
+        lay.addWidget(c)
+        self.refreshers.append(self.refresh_loopback)
+
+    def refresh_loopback(self):
+        first = self.app_state.get("loopback", -1)
+        self.loop_box.blockSignals(True)
+        self.loop_box.setCurrentIndex(max(0, self.loop_box.findData(first)))
+        self.loop_box.blockSignals(False)
+        self.loop_mix_btn.setEnabled(first >= 0)
+        have = pw_node_exists("mbox_loopback")
+        self.loop_install.setVisible(first >= 0 and not have and not os.environ.get("MBOX_AMIXER"))
+        if first < 0:
+            self.loop_note.setText("Off.")
+            return
+        want = self.loopback_items(first)
+        if want is None:
+            self.loop_note.setText("That output plays the computer directly — pick one that plays a mix.")
+            return
+        ss = self.ctrl("stream-source")
+        cur = [ss.items[ss.values[a]] for a in LOOP_AUX] if ss else []
+        if cur != list(want):                     # the output's routing changed: follow it
+            for a, item in zip(LOOP_AUX, want):
+                self.set_stream(a, item)
+        name = next(n for n, f, _ in OUTPUT_PAIRS if f == first)
+        own = self.label(f"out{first}", "")
+        self.loop_note.setText(f"“Loopback (Mbox)” = what {own or name} plays ({self.pair_text(first)})."
+                               + ("" if have else " Add it to your sound settings below."))
+
+    def loopback_items(self, first):
+        c = self.ctrl("output-source")
+        ss = self.ctrl("stream-source")
+        if not c or not ss:
+            return None
+        items = (c.items[c.values[first]], c.items[c.values[first + 1]])
+        return items if all(i in ss.items for i in items) else None
+
+    def set_loopback(self, first):
+        ss = self.ctrl("stream-source")
+        if first >= 0 and self.app_state.get("loopback", -1) < 0 and ss:
+            self.app_state["loopback_prev"] = [ss.items[ss.values[a]] for a in LOOP_AUX]
+        self.app_state["loopback"] = first
+        if first < 0:
+            for a, item in zip(LOOP_AUX, self.app_state.pop("loopback_prev", ["S/PDIF-1", "S/PDIF-2"])):
+                self.set_stream(a, item)
+        self.save_app_state()
+        self.reload_state()
+        self.refresh_loopback()
+
+    def make_stream_mix(self):
+        first = self.app_state.get("loopback", -1)
+        if first < 0:
+            return
+        name = next(n for n, f, _ in OUTPUT_PAIRS if f == first)
+        own = self.label(f"out{first}", "")
+        if own and QtWidgets.QMessageBox.question(
+                self, APP_NAME, f"{name} feeds “{own}”. Turning it into a stream mix changes what that "
+                "plays too. Go ahead?") != QtWidgets.QMessageBox.Yes:
+            return
+        kind, k, _ = self.pair_source(first)
+        if kind != "mix":
+            used = {self.pair_source(f)[1] for _, f, _ in OUTPUT_PAIRS if self.pair_source(f)[0] == "mix"}
+            free = [m for m in STEREO_MIX if m not in used and (self.rate() <= 96000 or m <= 2)]
+            if not free:
+                QtWidgets.QMessageBox.information(self, APP_NAME, "Every Stereo Mix is already in use — pick an "
+                                                  "output that already plays one.")
+                return
+            k = free[0]
+            self.route_pair_to_mix(first, k)
+        self.mix_clear(k)
+        g = int(UNITY * 0.7071)
+        mics = self.guitar_inputs() if self.app_state.get("guitar_inputs") else ["Analog-A-1"]
+        for m in mics:
+            self.mix_put(k, m, g, g)
+        self.mix_put(k, PC_LEFT, UNITY, 0)
+        self.mix_put(k, PC_RIGHT, 0, UNITY)
+        self.reload_state()
+        self.run_refreshers()
+        self.toast(f"Stream mix ready on {name}: mic + computer. Balance it on the Mixer page.", 8000)
+
+    # ---------------------------------------------------------------- 4.14: pop-up, app rules, backup
+    def osd_value(self, name, values):
+        if not self.app_state.get("osd", True) or not values:
+            return
+        if name == "master-knob-value":
+            spk = (self.ctrl_item("spkr-button") or "").split("-")[0]
+            L = SPEAKERS.get(spk, ("",))[0]
+            title = "Mbox" + (f" — Speakers {L}" if L else "")
+            self.osd.volume(round(int(values[0]) * 100 / 255), title)
+        elif name == "spkr-button":
+            it = self.ctrl_item("spkr-button") or "Off"
+            sc = SPEAKERS.get(it.split("-")[0])
+            if sc:
+                own = self.label(f"spk{sc[0]}", "") or self.label(f"cr_name{sc[0]}", "")
+                self.osd.text("audio-speakers", f"Speakers {sc[0]}" + (f" — {own}" if own else ""))
+            else:
+                self.osd.text("audio-volume-muted", "Speakers off")
+
+    def start_rules_watch(self):
+        if not shutil.which("pactl") or getattr(self, "rules_proc", None):
+            return
+        self.rules_proc = QtCore.QProcess(self)
+        self.rules_proc.setProgram("pactl")
+        self.rules_proc.setArguments(["subscribe"])
+        self.rules_proc.readyReadStandardOutput.connect(self.rules_event)
+        self.rules_proc.start()
+        QtCore.QTimer.singleShot(1500, self.apply_app_rules)
+
+    def rules_event(self):
+        data = bytes(self.rules_proc.readAllStandardOutput()).decode(errors="ignore")
+        if "'new' on sink-input" in data and self.app_state.get("app_rules"):
+            QtCore.QTimer.singleShot(250, self.apply_app_rules)
+
+    def apply_app_rules(self):
+        rules = self.app_state.get("app_rules", {})
+        if not rules:
+            return
+        sinks = {k["name"]: k["id"] for k in list_sinks()}
+        for st in list_app_streams():
+            want = rules.get(st["app"])
+            if want and want in sinks and st["sink"] != sinks[want]:
+                run_quiet("pactl", "move-sink-input", str(st["id"]), want)
+
+    def set_app_rule(self, app, sink):
+        rules = self.app_state.setdefault("app_rules", {})
+        if sink:
+            rules[app] = sink
+        else:
+            rules.pop(app, None)
+        self.save_app_state()
+        self.apps_sig = None
+        self.refresh_apps()
+
+    def export_settings_dialog(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export settings",
+                                                        str(HOME / f"mbox-control-{date.today()}.mboxbackup"),
+                                                        "Mbox Control backup (*.mboxbackup)")
+        if not path:
+            return
+        keys = QtWidgets.QMessageBox.question(
+            self, APP_NAME, "Include your Discogs and AcoustID keys?\n\nSay No if you'll share this file.",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No) == QtWidgets.QMessageBox.Yes
+        self.save_app_state()
+        try:
+            export_settings(path, keys)
+            self.toast(f"Settings saved to {path}", 8000)
+        except OSError as e:
+            QtWidgets.QMessageBox.warning(self, APP_NAME, f"Couldn't save: {e}")
+
+    def import_settings_dialog(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Import settings", str(HOME),
+                                                        "Mbox Control backup (*.mboxbackup);;All files (*)")
+        if not path:
+            return
+        if QtWidgets.QMessageBox.question(self, APP_NAME, "Replace your current names, scenes and settings with "
+                                          "the ones in this backup? The app restarts afterwards.") \
+                != QtWidgets.QMessageBox.Yes:
+            return
+        ok, msg, pw = import_settings(path)
+        if not ok:
+            QtWidgets.QMessageBox.warning(self, APP_NAME, msg)
+            return
+        if pw:
+            restart_pipewire()
+        self.restart_app()
+
     def install_named_inputs(self, ask=True):
         src = mbox_pw_node("source")
         if not src:
@@ -9126,7 +9481,7 @@ class MainWindow(QtWidgets.QMainWindow):
                    "queue": qtxt, "saving": saving}
         self.remote.set_state({
             "mute": bool(self.app_state.get("spk_mute")), "rec": rec,
-            "spk_names": {L: self.label(f"cr_name{L}", "") for L in "ABC"},
+            "spk_names": {L: (self.label(f"spk{L}", "") or self.label(f"cr_name{L}", "")) for L in "ABC"},
             "speaker": sc[0] if sc else "", "speaker_colour": sc[1] if sc else "",
             "dim": {"On": "Dimmed", "Blink": "Muted"}.get(mute, "Dim off"), "rate": f"{self.rate() / 1000:g} kHz",
             "knob": int(knob.values[0]) if knob else 0,
@@ -9636,6 +9991,24 @@ class MainWindow(QtWidgets.QMainWindow):
         tu.toggled.connect(lambda on: (self.app_state.__setitem__("tester_updates", on), self.save_app_state(),
                                        self.check_update()))
         f.addRow("", tu)
+        dm = QtWidgets.QCheckBox("Fast meter reading (reads the Mbox directly)")
+        dm.setChecked(self.app_state.get("direct_meters", True) is not False)
+        dm.setToolTip("Much lighter on the CPU. If meters misbehave or the app stalls, switch it off — "
+                      "the app goes back to the slower amixer way after a restart.")
+        dm.toggled.connect(lambda on: (self.app_state.__setitem__("direct_meters", on), self.save_app_state(),
+                                       self.toast("Takes effect after restarting the app.", 5000)))
+        f.addRow("Meters", dm)
+        osd = QtWidgets.QCheckBox("Show a pop-up when the big knob or Spkr button changes")
+        osd.setChecked(bool(self.app_state.get("osd", True)))
+        osd.toggled.connect(lambda on: (self.app_state.__setitem__("osd", on), self.save_app_state()))
+        f.addRow("Pop-ups", osd)
+        brow = QtWidgets.QHBoxLayout()
+        for text, fn in (("Export settings…", self.export_settings_dialog), ("Import settings…", self.import_settings_dialog)):
+            b = QtWidgets.QPushButton(text)
+            b.clicked.connect(fn)
+            brow.addWidget(b)
+        brow.addStretch(1)
+        f.addRow("Backup", brow)
         diag = QtWidgets.QPushButton("Copy diagnostics")
         diag.setToolTip("Copies your system details (no personal info) — paste them into a bug report.")
         diag.clicked.connect(lambda: (QtWidgets.QApplication.clipboard().setText(diagnostics()),
@@ -9651,6 +10024,9 @@ class MainWindow(QtWidgets.QMainWindow):
         m = self.menuBar().addMenu("&File")
         m.addAction("Save snapshot…").triggered.connect(self.save_snapshot_dialog)
         m.addAction("Load snapshot…").triggered.connect(self.load_snapshot_dialog)
+        m.addSeparator()
+        m.addAction("Export settings…").triggered.connect(self.export_settings_dialog)
+        m.addAction("Import settings…").triggered.connect(self.import_settings_dialog)
         m.addSeparator()
         m.addAction("Re-read from Mbox").triggered.connect(lambda: self.reload_state() and self.run_refreshers())
         m.addSeparator()
@@ -9719,6 +10095,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.remote.stop()
         for k in list(getattr(self, "mirrors", {})):
             self.stop_mirror(k)
+        if getattr(self, "rules_proc", None):
+            self.rules_proc.kill()
+            self.rules_proc.waitForFinished(500)
         for t in (getattr(self, "poller", None), getattr(self, "events", None), self.tuner):
             if t:
                 t.wait(1500)
@@ -9781,6 +10160,57 @@ def service_ready(backend):
         return False
 
 
+CRASH_LOG = CONF_DIR / "crash.log"
+
+
+class FreezeWatch:
+    """If the window stops responding for 5 s, write where every thread is stuck to crash.log.
+    Errors and hard crashes go there too — so "it stalled" turns into a line number."""
+
+    def __init__(self):
+        import faulthandler
+        CONF_DIR.mkdir(parents=True, exist_ok=True)
+        if CRASH_LOG.exists() and CRASH_LOG.stat().st_size > 400_000:
+            CRASH_LOG.replace(CRASH_LOG.with_suffix(".old.log"))
+        self.f = open(CRASH_LOG, "a", buffering=1)
+        self.f.write(f"\n=== Mbox Control {VERSION} started {datetime.now():%Y-%m-%d %H:%M:%S} ===\n")
+        faulthandler.enable(file=self.f, all_threads=True)
+        self.beat = time.time()
+        self.reported = False
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self._tick)
+        self.timer.start(500)
+        threading.Thread(target=self._watch, daemon=True).start()
+        old = sys.excepthook
+
+        def hook(t, v, tb):
+            import traceback
+            self.f.write(f"--- error {datetime.now():%H:%M:%S} ---\n" + "".join(traceback.format_exception(t, v, tb)))
+            old(t, v, tb)
+        sys.excepthook = hook
+
+    def _tick(self):
+        self.beat = time.time()
+        self.reported = False
+
+    def _watch(self):
+        import faulthandler
+        while True:
+            time.sleep(1)
+            stuck = time.time() - self.beat
+            if stuck > 5 and not self.reported:
+                self.reported = True
+                self.f.write(f"--- window not responding for {stuck:.0f} s at {datetime.now():%H:%M:%S} ---\n")
+                faulthandler.dump_traceback(file=self.f, all_threads=True)
+
+
+def crash_log_tail(lines=60):
+    try:
+        return "\n".join(CRASH_LOG.read_text(errors="replace").splitlines()[-lines:])
+    except OSError:
+        return ""
+
+
 def diagnostics():
     """Plain-text facts for a bug report. Nothing personal: no names, paths in home are shortened."""
     def first(*cmd):
@@ -9809,7 +10239,11 @@ def diagnostics():
             ("snd-dice module", "loaded" if Path("/sys/module/snd_dice").exists() else "not loaded"),
             ("Firewall", firewall_kind() or "none active"),
             ("ffmpeg", "yes" if shutil.which("ffmpeg") else "no"), ("pw-jack", "yes" if shutil.which("pw-jack") else "no")]
-    return "\n".join(f"{k}: {v}" for k, v in rows)
+    out = "\n".join(f"{k}: {v}" for k, v in rows)
+    tail = crash_log_tail()
+    if "---" in tail:
+        out += "\n\nRecent problems (crash.log):\n" + tail.replace(str(HOME), "~")
+    return out
 
 
 def main():
@@ -9858,6 +10292,8 @@ def main():
     install_icon_files()
     refresh_launcher_if_old()
     fixed = fix_default_sink()
+    if not os.environ.get("MBOX_AMIXER"):
+        main.freeze = FreezeWatch()
     win = MainWindow(backend)
     if fixed:
         win.toast(f"Default output was the raw Mbox — switched it back to {win.main_output_name()}.", 10000)
