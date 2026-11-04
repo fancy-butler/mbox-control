@@ -115,3 +115,73 @@ def test_fast_meters_can_be_switched_off(monkeypatch):
     monkeypatch.setenv("MBOX_NO_DIRECT", "1")
     b = mc.Backend(2)
     assert b.enable_direct() is False
+
+
+def test_write_storm_is_blocked_and_logged(win, tmp_path, monkeypatch):
+    monkeypatch.setattr(mc, "CRASH_LOG", tmp_path / "crash.log")
+    c = win.ctrl("metering")
+    win.backend._hist = []                           # forget the app's own start-up writes
+    sent = []
+    monkeypatch.setattr(win.backend, "_run", lambda *a: sent.append(a) or "")
+    for _ in range(mc.Backend.REPEAT_LIMIT):
+        win.backend.write(c, [True])
+    import pytest
+    with pytest.raises(RuntimeError, match="write loop"):
+        win.backend.write(c, [True])
+    assert len(sent) == mc.Backend.REPEAT_LIMIT
+    assert "write storm blocked" in (tmp_path / "crash.log").read_text()
+    win.backend.write(c, [False])                    # a different value still goes through
+
+
+def test_scenes_never_trip_the_brake(win):
+    for sid in ("listen", "rip", "tape", "record", "guitar", "listen"):
+        win.apply_scene(sid)
+    assert "Write failed" not in win.statusBar().currentMessage()
+
+
+def test_loopback_retries_only_once(win, monkeypatch):
+    win.set_loopback(0)
+    win.refresh_loopback()                           # settled: what we asked for is what the Mbox has
+    calls = []
+    monkeypatch.setattr(win, "set_stream", lambda a, item: calls.append((a, item)))
+    ss = win.ctrl("stream-source")
+    ss.values[6] = 0                                # the Mbox "refused" the change
+    for _ in range(5):
+        win.refresh_loopback()
+    assert len(calls) == 2                           # one attempt (two channels), not a loop
+
+
+def test_a_hung_helper_is_not_waited_on_again(monkeypatch):
+    import subprocess
+    import time
+    calls = []
+
+    def slow(cmd, **k):
+        calls.append(cmd)
+        raise subprocess.TimeoutExpired(cmd, k.get("timeout", 1))
+    monkeypatch.setattr(mc.subprocess, "run", slow)
+    monkeypatch.setattr(mc.shutil, "which", lambda x: "/usr/bin/" + x)
+    monkeypatch.setattr(mc, "HUNG", {})
+    assert mc.run_quiet("pactl", "info") is None
+    t = time.time()
+    assert mc.run_quiet("pactl", "list") is None
+    assert len(calls) == 1 and time.time() - t < 0.1
+    assert mc.mbox_playing() is False                # doesn't wait either
+
+
+def test_amixer_timeout_fails_fast_afterwards(monkeypatch):
+    import subprocess
+    import pytest
+    monkeypatch.setattr(mc, "HUNG", {})
+    monkeypatch.setattr(mc.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(subprocess.TimeoutExpired(a, 3)))
+    b = mc.Backend(2)
+    with pytest.raises(mc.MboxNotAnswering):
+        b.read_all()
+    assert mc.is_hung(mc.AMIXER)
+
+
+def test_not_answering_banner(win, tmp_path, monkeypatch):
+    monkeypatch.setattr(mc, "CRASH_LOG", tmp_path / "crash.log")
+    win.show_not_answering()
+    assert win.hint.isVisible() and "stopped answering" in win.hint.text.text()
+    assert "not answering" in (tmp_path / "crash.log").read_text()

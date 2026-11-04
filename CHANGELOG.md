@@ -1,5 +1,14 @@
 # Changelog
 
+## 4.14.1
+- **The window no longer freezes when the Mbox locks up.** Any helper that stops answering (PipeWire
+  or the Mbox's control service) is skipped for 30 seconds instead of being waited on over and over.
+  The app says "The Mbox has stopped answering — switch it off and on", then reconnects by itself.
+- **Write-loop brake.** The app refuses to send the same command to the Mbox more than 4 times in
+  10 seconds, or 200 commands in 3 seconds, and logs where the loop came from. Nothing a person or a
+  scene does comes close to that.
+- Fix: loopback could keep retrying a change the Mbox refused.
+
 ## 4.14
 - **Loopback.** Record exactly what any output plays (mic and computer mixed by the Mbox itself) as
   "Loopback (Mbox)". **Make it a stream mix** sets up mic + computer on a spare output in one click.

@@ -46,7 +46,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QPointF, QRectF
 
 APP_NAME = "Mbox Control"
-VERSION = "4.14"
+VERSION = "4.14.1"
 UPDATE_REPO = ""          # "owner/mbox-control" once the project is on GitHub; empty = no online checks
 HOME = Path.home()
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -275,6 +275,10 @@ def find_mbox_card():
     return None
 
 
+class MboxNotAnswering(RuntimeError):
+    """amixer timed out: the Mbox (or its control service) has wedged."""
+
+
 class DirectReader:
     """Reads ALSA controls straight from /dev/snd/controlC<n> (one ioctl, no process).
     Only switched on after it has proven it gets exactly what amixer gets."""
@@ -341,7 +345,13 @@ class Backend:
         return self.direct is not None
 
     def _run(self, *args):
-        r = subprocess.run([AMIXER, "-c", self.card, *args], capture_output=True, text=True, timeout=5)
+        if is_hung(AMIXER):
+            raise MboxNotAnswering("The Mbox isn't answering")
+        try:
+            r = subprocess.run([AMIXER, "-c", self.card, *args], capture_output=True, text=True, timeout=3)
+        except subprocess.TimeoutExpired:
+            mark_hung(AMIXER)
+            raise MboxNotAnswering("The Mbox isn't answering") from None
         if r.returncode != 0:
             raise RuntimeError((r.stderr or r.stdout).strip() or "amixer failed")
         return r.stdout
@@ -365,11 +375,40 @@ class Backend:
                 pass                                    # card gone or renumbered: amixer will say what's up
         return parse_amixer(self._run("cget", f"numid={numid}")).get(numid)
 
+    # A runaway loop that keeps sending the same command can lock the Mbox up until it's power-cycled.
+    # These limits are far above anything a person or a scene does, and they log where the loop came from.
+    REPEAT_LIMIT, REPEAT_WINDOW = 4, 10.0      # same control + same value, 4× in 10 s → refuse
+    BURST_LIMIT, BURST_WINDOW = 200, 3.0       # any 200 writes in 3 s → refuse for a moment
+
+    def _guard(self, ctrl, s):
+        now = time.time()
+        hist = self.__dict__.setdefault("_hist", [])
+        hist[:] = [h for h in hist if now - h[0] < max(self.REPEAT_WINDOW, self.BURST_WINDOW)]
+        same = sum(1 for t, n, v in hist if n == ctrl.numid and v == s and now - t < self.REPEAT_WINDOW)
+        burst = sum(1 for t, _, _ in hist if now - t < self.BURST_WINDOW)
+        if same >= self.REPEAT_LIMIT or burst >= self.BURST_LIMIT:
+            why = (f"{ctrl.name} set to the same value {same + 1}× in {self.REPEAT_WINDOW:.0f} s"
+                   if same >= self.REPEAT_LIMIT else f"{burst + 1} writes in {self.BURST_WINDOW:.0f} s")
+            key = (ctrl.numid, s)
+            if self.__dict__.get("_last_storm") != key:      # log each storm once, with where it came from
+                self._last_storm = key
+                import traceback
+                try:
+                    CONF_DIR.mkdir(parents=True, exist_ok=True)
+                    with open(CRASH_LOG, "a") as f:
+                        f.write(f"--- write storm blocked {datetime.now():%H:%M:%S}: {why} ---\n"
+                                + "".join(traceback.format_stack(limit=12)))
+                except OSError:
+                    pass
+            raise RuntimeError(f"blocked a write loop ({why}) to protect the Mbox")
+        hist.append((now, ctrl.numid, s))
+
     def write(self, ctrl, values):
         if ctrl.type == "BOOLEAN":
             s = ",".join("on" if v else "off" for v in values)
         else:
             s = ",".join(str(int(v)) for v in values)
+        self._guard(ctrl, s)
         self._run("cset", f"numid={ctrl.numid}", s)
         ctrl.values = list(values)
 
@@ -498,12 +537,29 @@ def install_feature(feature):
 
 
 
-def run_quiet(*cmd, timeout=6):
-    if not shutil.which(cmd[0]):
+HUNG = {}            # program → time until which we don't wait on it again (it just timed out)
+HUNG_PAUSE = 30.0
+
+
+def is_hung(prog):
+    return HUNG.get(Path(prog).name, 0) > time.time()
+
+
+def mark_hung(prog):
+    HUNG[Path(prog).name] = time.time() + HUNG_PAUSE
+
+
+def run_quiet(*cmd, timeout=4):
+    """Run a helper and return its output, or None. A helper that stops answering (PipeWire or the Mbox
+    wedged) is skipped for 30 s instead of freezing the window again and again."""
+    if not shutil.which(cmd[0]) or is_hung(cmd[0]):
         return None
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return r.stdout if r.returncode == 0 else None
+    except subprocess.TimeoutExpired:
+        mark_hung(cmd[0])
+        return None
     except (OSError, subprocess.SubprocessError):
         return None
 
@@ -4727,6 +4783,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.toast("The Mbox isn't connected — waiting for it to come back…", 0)
                 self.refresh_health()
             return
+        # Something stopped answering (amixer = the Mbox's control service, pactl = PipeWire talking to
+        # the Mbox). Don't keep waiting on it — say what to do, and pick things up again once it answers.
+        if is_hung(AMIXER) or is_hung("pactl"):
+            self.show_not_answering()
+            return
+        if getattr(self, "not_answering", False):
+            self.not_answering = False
+            self.hint.hide()
+            self.toast("The Mbox is answering again.", 6000)
+            self.reconnect(card)
+            return
         if self.disconnected or str(card) != self.backend.card or not service_running():
             self.reconnect(card)
             return
@@ -4768,6 +4835,25 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.write(m, [False])
                 self.write(m, [True])
             self.reconnect(card)
+
+    def show_not_answering(self):
+        if getattr(self, "not_answering", False):
+            return
+        self.not_answering = True
+        if self.poller:
+            self.poller.interval = 0.5                  # go easy on it until it's back
+        text = ("<b>The Mbox has stopped answering.</b> Switch it off at the back, wait 5 seconds and switch it "
+                "back on — the app picks it up again by itself.")
+        self.hint.offer(text, [])
+        if not self.isVisible() and self.tray:
+            self.tray.showMessage(APP_NAME, "The Mbox has stopped answering — switch it off and on again.",
+                                  app_icon(), 15000)
+        try:
+            with open(CRASH_LOG, "a") as f:
+                f.write(f"--- Mbox not answering at {datetime.now():%H:%M:%S} "
+                        f"(amixer hung: {is_hung(AMIXER)}, pactl hung: {is_hung('pactl')}) ---\n")
+        except OSError:
+            pass
 
     def kick_metering(self):
         """Metering off and on again — what brings dead meters back without touching the sound."""
@@ -9102,9 +9188,12 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         ss = self.ctrl("stream-source")
         cur = [ss.items[ss.values[a]] for a in LOOP_AUX] if ss else []
-        if cur != list(want):                     # the output's routing changed: follow it
+        if cur != list(want) and getattr(self, "loop_tried", None) != (first, tuple(want)):
+            self.loop_tried = (first, tuple(want))   # one try per routing change — never a retry loop
             for a, item in zip(LOOP_AUX, want):
                 self.set_stream(a, item)
+        elif cur == list(want):
+            self.loop_tried = None
         name = next(n for n, f, _ in OUTPUT_PAIRS if f == first)
         own = self.label(f"out{first}", "")
         self.loop_note.setText(f"“Loopback (Mbox)” = what {own or name} plays ({self.pair_text(first)})."
@@ -9119,6 +9208,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return items if all(i in ss.items for i in items) else None
 
     def set_loopback(self, first):
+        self.loop_tried = None
         ss = self.ctrl("stream-source")
         if first >= 0 and self.app_state.get("loopback", -1) < 0 and ss:
             self.app_state["loopback_prev"] = [ss.items[ss.values[a]] for a in LOOP_AUX]
@@ -10117,11 +10207,7 @@ def start_service(card_no):
 
 def mbox_playing():
     """True when PipeWire is actively sending sound to one of the Mbox's outputs."""
-    try:
-        out = subprocess.run(["pactl", "list", "short", "sinks"], capture_output=True, text=True,
-                             timeout=3).stdout
-    except Exception:  # noqa: BLE001
-        return False
+    out = run_quiet("pactl", "list", "short", "sinks", timeout=3) or ""
     for line in out.splitlines():
         f = line.split("\t")
         if len(f) >= 5 and f[4].strip().upper() == "RUNNING" and \
