@@ -46,7 +46,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QPointF, QRectF
 
 APP_NAME = "Mbox Control"
-VERSION = "4.18.3"
+VERSION = "4.18.4"
 UPDATE_REPO = ""          # "owner/mbox-control" once the project is on GitHub; empty = no online checks
 HOME = Path.home()
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -4477,6 +4477,228 @@ def mix_items(k):
     return f"Mixer-{2 * k - 1}", f"Mixer-{2 * k}"
 
 
+class SpectrumHub(QtCore.QObject):
+    """One live analyser per watched input, shared by every strip showing it; stops when nobody looks."""
+
+    def __init__(self, win):
+        super().__init__(win)
+        self.win, self.feeds = win, {}          # key → [Analyzer, set(strips)]
+
+    def channels_for(self, key):
+        """Which capture channels (AUX n) carry these inputs right now."""
+        ss = self.win.ctrl("stream-source")
+        if not ss:
+            return None
+        idx = []
+        for item in key:
+            hit = next((a for a, v in enumerate(ss.values) if 0 <= v < len(ss.items) and ss.items[v] == item), None)
+            if hit is None:
+                return None
+            idx.append(hit)
+        return idx
+
+    def subscribe(self, strip, key):
+        if key in self.feeds:
+            self.feeds[key][1].add(strip)
+            return
+        idx = self.channels_for(key)
+        src = mbox_pw_node("source")
+        if idx is None or not src or not shutil.which("parec"):
+            return
+        li, ri = idx[0], idx[-1]
+        an = Analyzer(src, (8, li, ri, ",".join(f"aux{i}" for i in range(8))), self.win.rate())
+        feed = [an, {strip}]
+        an.frame.connect(lambda d, feed=feed: [s.set_bands(d["bands"]) for s in list(feed[1])])
+        an.failed.connect(lambda _m, key=key: self.drop(key))
+        self.feeds[key] = feed
+        an.start()
+
+    def unsubscribe(self, strip):
+        for key, (an, strips) in list(self.feeds.items()):
+            strips.discard(strip)
+            if not strips:
+                self.drop(key)
+
+    def drop(self, key):
+        feed = self.feeds.pop(key, None)
+        if feed:
+            feed[0].stop()
+            feed[0].wait(1500)
+
+    def stop_all(self):
+        for key in list(self.feeds):
+            self.drop(key)
+
+
+class LevelStrip(QtWidgets.QWidget):
+    """The last minute of an input, scrolling, plus a live meter with clip warning. `items()` returns the
+    Mbox inputs to watch; `marked()` returns how many seconds to shade (what a save would grab), or 0."""
+    SPAN, STEP = 60.0, 0.05
+
+    def __init__(self, win, items, marked=lambda: 0):
+        super().__init__()
+        self.win, self.items, self.marked = win, items, marked
+        self.hist = collections.deque(maxlen=int(self.SPAN / self.STEP))
+        self.now, self.peak, self.peak_t, self.clip_t = -60.0, -60.0, 0.0, 0.0
+        self.setMinimumHeight(64)
+        self.setMaximumHeight(72)
+        self.setToolTip("The last minute of this input. Aim for peaks around the dashed −6 dB line; "
+                        "red means turn the gain knob down.")
+        self.timer = QtCore.QTimer(self)
+        self.timer.timeout.connect(self.tick)
+        self.timer.start(int(self.STEP * 1000))
+        self.bands, self.band_peaks, self.sub_key = None, None, None
+
+    SPEC_W = 230
+
+    def set_bands(self, bands):
+        if self.band_peaks is None or len(self.band_peaks) != len(bands):
+            self.band_peaks = list(bands)
+        self.band_peaks = [max(b, pk - 1.5) for b, pk in zip(bands, self.band_peaks)]   # slow fall
+        self.bands = bands
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self.resubscribe()
+
+    def hideEvent(self, e):
+        super().hideEvent(e)
+        self.win.spectrum_hub.unsubscribe(self)
+        self.sub_key, self.bands = None, None
+
+    def resubscribe(self):
+        key = tuple(i for i in self.items() if i)
+        if key != self.sub_key:
+            self.win.spectrum_hub.unsubscribe(self)
+            self.bands, self.band_peaks = None, None
+            self.sub_key = key
+            if key:
+                self.win.spectrum_hub.subscribe(self, key)
+
+    def tick(self):
+        if not self.isVisible():
+            return
+        its = [i for i in self.items() if i]
+        if tuple(its) != self.sub_key:
+            self.resubscribe()
+        db = max((self.win.item_db(i) for i in its), default=-60.0)
+        t = time.time()
+        self.now = db
+        self.hist.append(db)
+        if db >= self.peak or t - self.peak_t > 2:
+            self.peak, self.peak_t = db, t
+        if db > -1:
+            self.clip_t = t
+        self.update()
+
+    @staticmethod
+    def colour(db):
+        return QtGui.QColor("#f85149" if db > -3 else "#d29922" if db > -12 else "#3fb950")
+
+    @staticmethod
+    def y_of(db, top, h):
+        return top + h * (1 - max(0.0, min(1.0, (db + 60) / 60)))
+
+    def paintEvent(self, _):
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        meter_w = 118
+        spec_w = self.SPEC_W if w > 620 else 0
+        gw = w - meter_w - 10 - (spec_w + 10 if spec_w else 0)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QtGui.QColor(BG2))
+        p.drawRoundedRect(QRectF(0, 0, gw, h), 8, 8)
+        n = self.hist.maxlen
+        mark = self.marked()
+        if mark:                                          # what “Save last 30 s” would catch
+            x0 = gw * (1 - min(mark, self.SPAN) / self.SPAN)
+            c = QtGui.QColor(ACCENT)
+            c.setAlpha(40)
+            p.setBrush(c)
+            p.drawRoundedRect(QRectF(x0, 0, gw - x0, h), 8, 8)
+            p.setPen(QtGui.QColor(ACCENT))
+            f = p.font()
+            f.setPointSizeF(7.5)
+            p.setFont(f)
+            p.drawText(QRectF(x0 + 6, 2, gw - x0 - 8, 14), Qt.AlignLeft | Qt.AlignTop, f"last {int(mark)} s")
+            p.setPen(Qt.NoPen)
+        vals = list(self.hist)
+        cols = max(1, int(gw) - 8)
+        per = n / cols
+        base = h - 4
+        for x in range(cols):                              # newest on the right
+            a = int(len(vals) - (cols - x) * per)
+            b = int(len(vals) - (cols - x - 1) * per)
+            if b <= 0:
+                continue
+            db = max(vals[max(0, a):b], default=-60.0)
+            if db <= -59:
+                continue
+            y = self.y_of(db, 4, h - 8)
+            p.setBrush(self.colour(db))
+            p.drawRect(QRectF(4 + x, y, 1.0, base - y))
+        pen = QtGui.QPen(ink(70), 1, Qt.DashLine)          # target: peaks around −6 dB
+        p.setPen(pen)
+        y6 = self.y_of(-6, 4, h - 8)
+        p.drawLine(QPointF(4, y6), QPointF(gw - 4, y6))
+        if spec_w:                                        # spectrum: low notes left, high notes right
+            sx = gw + 10
+            p.setPen(Qt.NoPen)
+            p.setBrush(QtGui.QColor(BG2))
+            p.drawRoundedRect(QRectF(sx, 0, spec_w, h), 8, 8)
+            if self.bands:
+                nb = len(self.bands)
+                bw = (spec_w - 10) / nb
+                for i, (b, pk) in enumerate(zip(self.bands, self.band_peaks)):
+                    lvl = max(0.0, min(1.0, (b + 80) / 80))
+                    x = sx + 5 + i * bw
+                    bh = (h - 18) * lvl
+                    c = QtGui.QColor(ACCENT)
+                    c.setAlpha(110 + int(140 * lvl))
+                    p.setBrush(c)
+                    p.drawRect(QRectF(x, h - 14 - bh, max(1.0, bw - 1), bh))
+                    py = h - 14 - (h - 18) * max(0.0, min(1.0, (pk + 80) / 80))
+                    p.setBrush(ink(160))
+                    p.drawRect(QRectF(x, py, max(1.0, bw - 1), 1.5))
+            f = p.font()
+            f.setPointSizeF(7)
+            p.setFont(f)
+            p.setPen(QtGui.QColor(SUBTLE))
+            for txt, frac in (("100", 0.22), ("1k", 0.56), ("10k", 0.9)):
+                p.drawText(QRectF(sx + 5 + (spec_w - 10) * frac - 15, h - 13, 30, 12), Qt.AlignCenter, txt)
+            if not self.bands:
+                p.drawText(QRectF(sx, 0, spec_w, h - 12), Qt.AlignCenter, "spectrum")
+            mx = sx + spec_w + 10
+        else:
+            mx = gw + 10
+        # live meter
+        p.setPen(Qt.NoPen)
+        p.setBrush(QtGui.QColor(BG2))
+        p.drawRoundedRect(QRectF(mx, 0, 16, h), 4, 4)
+        y = self.y_of(self.now, 3, h - 6)
+        p.setBrush(self.colour(self.now))
+        p.drawRoundedRect(QRectF(mx + 3, y, 10, h - 3 - y), 2, 2)
+        yp = self.y_of(self.peak, 3, h - 6)
+        p.setBrush(QtGui.QColor(TEXT))
+        p.drawRect(QRectF(mx + 3, yp, 10, 2))
+        f = p.font()
+        f.setPointSizeF(10)
+        f.setBold(True)
+        p.setFont(f)
+        clipped = time.time() - self.clip_t < 3
+        p.setPen(QtGui.QColor("#f85149") if clipped else QtGui.QColor(TEXT))
+        txt = "—" if self.peak <= -59 else f"{self.peak:+.0f} dB".replace("+", "") if self.peak < 0 else "0 dB"
+        p.drawText(QRectF(mx + 24, 4, meter_w - 26, 22), Qt.AlignLeft | Qt.AlignVCenter, txt)
+        f.setBold(False)
+        f.setPointSizeF(8)
+        p.setFont(f)
+        p.setPen(QtGui.QColor("#f85149") if clipped else QtGui.QColor(SUBTLE))
+        hint = ("CLIPPING — gain down" if clipped else "silent" if self.peak <= -59 else
+                "quiet — gain up" if self.peak < -24 else "good" if self.peak < -3 else "hot")
+        p.drawText(QRectF(mx + 24, 28, meter_w - 26, h - 30), Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, hint)
+
+
 class Osd:
     """The volume/speaker pop-up. Uses Plasma's own OSD when it's there, otherwise a small window."""
 
@@ -5508,6 +5730,7 @@ class MainWindow(QtWidgets.QMainWindow):
                      ("theme", "system"), ("accent", "system")):
             self.app_state.setdefault(k, v)
         self.migrate_input_names()
+        self.spectrum_hub = SpectrumHub(self)
         self.tuner = None
         self.last_spk = None
         self.events_alive = False
@@ -6382,6 +6605,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.activateWindow()
 
     def quit_app(self):
+        self.spectrum_hub.stop_all()
         self.quitting = True
         self.close()
         QtWidgets.QApplication.quit()
@@ -10080,6 +10304,17 @@ class MainWindow(QtWidgets.QMainWindow):
         box.currentIndexChanged.connect(lambda _: (self.app_state.__setitem__(key, box.currentData()),
                                                    self.save_app_state()))
 
+    def source_items(self, choice):
+        """'mono:Analog-A-2' / 'pair:Analog-A-5' / 'rip' → the Mbox inputs to show levels for."""
+        choice = choice or ""
+        if choice == "rip":
+            left = self.app_state["setup"].get("rip", "Analog-A-5")
+            return [left, pair_right(left)]
+        if choice.startswith("pair:"):
+            left = choice[5:]
+            return [left, pair_right(left)]
+        return [choice[5:]] if choice.startswith("mono:") else []
+
     def capture_for(self, choice):
         """'mono:Analog-A-2' → (pipewire source, ['AUX1'], label), making sure the Mbox sends it."""
         src = mbox_pw_node("source")
@@ -10111,6 +10346,9 @@ class MainWindow(QtWidgets.QMainWindow):
                                    "no delay. Put back the way it was when you stop listening.")
         self.retro_hear.toggled.connect(self.retro_hear_toggled)
         l.addWidget(self.retro_hear)
+        self.retro_strip = LevelStrip(self, lambda: self.source_items(self.retro_src.currentData()),
+                                      lambda: min(30, self.retro.held()) if self.retro else 0)
+        l.addWidget(self.retro_strip)
         srow = QtWidgets.QHBoxLayout()
         for secs, text in ((30, "Save last 30 s"), (60, "Save last minute"), (300, "Save last 5 min")):
             b = QtWidgets.QPushButton(text)
@@ -10675,8 +10913,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.take_src_box = QtWidgets.QComboBox()
         for left, _, name in INPUT_PAIRS:
             self.take_src_box.addItem(f"Stereo: {name}", f"pair:{left}")
-        for item, jack in INPUT_JACKS[:4]:
-            self.take_src_box.addItem(f"Mono: {jack}", f"mono:{item}")
+        for n, (item, jack) in enumerate(INPUT_JACKS[:4]):
+            own = self.label(f"in{n}", "")
+            self.take_src_box.addItem(f"Mono: {jack}" + (f" ({own})" if own else ""), f"mono:{item}")
         self.take_src_box.setCurrentIndex(max(0, self.take_src_box.findData(
             self.app_state.get("take_src", "mono:Analog-A-1"))))
         self.take_src_box.currentIndexChanged.connect(lambda _: (
@@ -10684,6 +10923,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.take_src_box.setToolTip("One mic or guitar = Mono (plays back in the middle).")
         row.addWidget(self.take_src_box, 1)
         l.addLayout(row)
+        self.take_strip = LevelStrip(self, lambda: self.source_items(self.take_src_box.currentData()))
+        l.addWidget(self.take_strip)
         self.take_level = muted("")
         l.addWidget(self.take_level)
         last = QtWidgets.QHBoxLayout()

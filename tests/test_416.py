@@ -154,3 +154,30 @@ def test_metronome_keeps_time(tmp_path):
             i += 1
     gaps = np.diff(peaks)
     assert len(gaps) >= 3 and np.allclose(gaps, 0.5, atol=0.01)
+
+
+@PW
+def test_level_strip_spectrum_follows_the_input(win, two_tones, spinner, monkeypatch):
+    """4.18.4: the strip's spectrum comes from the live input (440 Hz on AUX0 → a peak near 440)."""
+    import math
+    monkeypatch.setattr(mc, "mbox_pw_node", lambda kind: "fake_mbox_in")
+    monkeypatch.setattr(win, "rate", lambda: 48000)
+    ss = win.ctrl("stream-source")
+    ss.values[0] = ss.items.index("Analog-A-1")
+    strip = win.take_strip
+    win.spectrum_hub.subscribe(strip, ("Analog-A-1",))
+    spinner(0.6)
+    feeder = _feed(two_tones)
+    deadline = time.time() + 2.5
+    best = None
+    while time.time() < deadline:
+        spinner(0.1)
+        if strip.bands:
+            best = strip.bands
+    feeder.wait()
+    win.spectrum_hub.unsubscribe(strip)
+    assert best is not None and not win.spectrum_hub.feeds
+    edges = [30 * (min(20000, 24000 - 1) / 30) ** (i / 40) for i in range(41)]
+    top = max(range(40), key=lambda i: best[i])
+    assert edges[top] <= 440 * 1.2 and edges[top + 1] >= 440 / 1.2, (top, edges[top], edges[top + 1])
+    assert math.isfinite(best[top])

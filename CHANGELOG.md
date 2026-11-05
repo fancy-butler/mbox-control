@@ -1,5 +1,16 @@
 # Changelog
 
+## 4.18.4
+- **Live level and spectrum** in Quick take and "Capture what I just played":
+  - The last minute of playing scrolls by, coloured green, amber or red, with a dashed line at the
+    −6 dB target.
+  - A live meter with peak hold and a plain-words verdict ("quiet — gain up", "good",
+    "CLIPPING — gain down").
+  - A spectrum, so you can see lows and highs as you play.
+  - In Capture, a shaded area shows what "Save last 30 s" would grab.
+- The spectrum shares one audio stream per input and only runs while it's on screen.
+- Quick take's input list now shows your names for inputs (e.g. "Mono: Input 1 (Jazz Bass)").
+
 ## 4.18.3
 - **Fixed: "Capture what I just played" saved loud, distorted noise on newer PipeWire.** When it writes
   to a pipe, newer `pw-record` wraps the audio in an AU container (byte-swapped samples behind a
