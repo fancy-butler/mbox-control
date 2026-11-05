@@ -1,5 +1,10 @@
 # Changelog
 
+## 4.19.2
+- **Quick take: hear it while recording** (on by default). Plays the input through Outputs 1/2 straight
+  from the Mbox's mixer, with no delay, and puts it back when the take stops. Quick take and Capture
+  can both listen to the same input without undoing each other.
+
 ## 4.19.1
 - **Fixed: "Capture what I just played" could listen to the wrong input after a quick take.** Its
   "Stereo: …" entry meant "whatever the Rip page records from", which Quick take borrows while it

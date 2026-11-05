@@ -46,7 +46,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QPointF, QRectF
 
 APP_NAME = "Mbox Control"
-VERSION = "4.19.1"
+VERSION = "4.19.2"
 UPDATE_REPO = ""          # "owner/mbox-control" once the project is on GitHub; empty = no online checks
 HOME = Path.home()
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -10521,17 +10521,20 @@ class MainWindow(QtWidgets.QMainWindow):
             self.retro_monitor(on)
 
     def retro_monitor(self, on):
-        """While listening, play the input through Stereo Mix 1 (Outputs 1/2); put it back afterwards."""
-        prev = getattr(self, "retro_mon", None)
+        self.input_monitor("retro", getattr(self, "retro_choice", ""), on)
+
+    def input_monitor(self, owner, choice, on):
+        """While `owner` records, play the input through Stereo Mix 1 (Outputs 1/2); put it back afterwards."""
+        mons = self.__dict__.setdefault("monitors", {})
+        prev = mons.get(owner)
         if not on:
             for k, slot, l_, r_ in reversed(prev or []):
                 self.mix_set_lr(k, slot, l_, r_)
-            self.retro_mon = None
+            mons.pop(owner, None)
             return
         if prev:
             return
-        choice = getattr(self, "retro_choice", "") or ""
-        items = self.source_items(choice)
+        items = self.source_items(choice or "")
         if len(items) == 1:
             want = [(items[0], UNITY, UNITY)]           # one instrument: centred, both speakers
         else:
@@ -10542,9 +10545,9 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if all(max(self.mix_lr(1, sl)) >= UNITY // 2 for _, sl, _, _ in slots):
             return                                      # already audible: leave it alone
-        self.retro_mon = []
+        mons[owner] = []
         for item, sl, l, r in slots:
-            self.retro_mon.append((1, sl, *self.mix_lr(1, sl)))
+            mons[owner].append((1, sl, *self.mix_lr(1, sl)))
             self.mix_set_lr(1, sl, l, r)
 
     def retro_failed(self, msg):
@@ -11056,6 +11059,12 @@ class MainWindow(QtWidgets.QMainWindow):
         l.addWidget(self.take_strip)
         self.take_level = muted("")
         l.addWidget(self.take_level)
+        self.take_hear = QtWidgets.QCheckBox("Hear it through the speakers while recording")
+        self.take_hear.setChecked(self.app_state.get("take_hear", True))
+        self.take_hear.setToolTip("Plays the input through Outputs 1/2 from the Mbox's own mixer — no delay. "
+                                  "Put back the way it was when the take stops.")
+        self.take_hear.toggled.connect(self.take_hear_toggled)
+        l.addWidget(self.take_hear)
         frow = QtWidgets.QHBoxLayout()
         frow.addWidget(QtWidgets.QLabel("Save takes as"))
         self.save_fmt = QtWidgets.QComboBox()
@@ -11086,6 +11095,12 @@ class MainWindow(QtWidgets.QMainWindow):
         lay.addWidget(c)
         self.take_mode, self.take_proc = False, None
         self.show_last_take()
+
+    def take_hear_toggled(self, on):
+        self.app_state["take_hear"] = on
+        self.save_app_state()
+        if getattr(self, "take_mode", False):
+            self.input_monitor("take", self.app_state.get("take_src", "mono:Analog-A-1"), on)
 
     def finish_format(self, path):
         """Takes are recorded as FLAC; turn them into the chosen format (and drop the FLAC)."""
@@ -11304,6 +11319,8 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, APP_NAME, str(e))
             return
         self.take_mode, self.auto_state, self.clips = True, None, 0
+        if self.take_hear.isChecked():
+            self.input_monitor("take", self.app_state.get("take_src", "mono:Analog-A-1"), True)
         self.rec_live, self.rec_offset = False, 0.0
         self.take_btn.setText("■  Stop take")
         self.take_btn.setStyleSheet("background:#f85149; color:white;")
@@ -11322,6 +11339,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def take_finished(self, path, ok):
         self.take_mode = False
+        self.input_monitor("take", "", False)
         self.app_state["rec_src"] = self.take_prev
         self.app_state.pop("take_restore", None)
         self.route_rip_input()

@@ -115,3 +115,16 @@ def test_a_crash_during_a_quick_take_is_undone_at_start(app, tmp_path, monkeypat
         w.quitting = True
         w.close()
         w.deleteLater()
+
+
+def test_quick_take_and_capture_can_both_hear_the_same_input(win):
+    slot = win.slot_of("Analog-A-1")
+    win.mix_set_lr(1, slot, 0, 0)
+    win.input_monitor("take", "mono:Analog-A-1", True)
+    assert win.mix_lr(1, slot) == (mc.UNITY, mc.UNITY)
+    win.input_monitor("retro", "mono:Analog-A-1", True)       # already audible: nothing to undo later
+    win.input_monitor("retro", "", False)
+    assert win.mix_lr(1, slot) == (mc.UNITY, mc.UNITY)        # still on while the take runs
+    win.input_monitor("take", "", False)
+    assert win.mix_lr(1, slot) == (0, 0)
+    assert win.take_hear.isChecked()
