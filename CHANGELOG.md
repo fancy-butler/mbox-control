@@ -1,5 +1,16 @@
 # Changelog
 
+## 4.19
+- **Save takes as:** pick FLAC (default), WAV 24/16-bit, AIFF, ALAC, MP3 (V0/320/192), AAC (.m4a), Opus or
+  Ogg Vorbis for quick takes, "Capture what I just played" and multitrack. Rips stay FLAC.
+- **Convert audio** (Record → Tools): add files, whole folders (subfolders included), or drop them on
+  the list, then pick a format and convert.
+  - Tags and cover art come along, wherever the format can hold them.
+  - 96 kHz audio is resampled to 48 kHz for MP3, AAC, Opus and Vorbis.
+  - WAV 16-bit is dithered.
+  - Copies go into a "Converted (FORMAT)" folder beside each file, or a folder you pick. The originals
+    are never touched, and half-finished files never get left behind.
+
 ## 4.18.4
 - **Live level and spectrum** in Quick take and "Capture what I just played":
   - The last minute of playing scrolls by, coloured green, amber or red, with a dashed line at the

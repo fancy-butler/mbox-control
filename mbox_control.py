@@ -46,7 +46,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QPointF, QRectF
 
 APP_NAME = "Mbox Control"
-VERSION = "4.18.4"
+VERSION = "4.19"
 UPDATE_REPO = ""          # "owner/mbox-control" once the project is on GitHub; empty = no online checks
 HOME = Path.home()
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -746,6 +746,7 @@ CARD_ICONS = {   # card title → icon names (KDE Breeze first, then freedesktop
     "Suggestions": ["help-hint", "dialog-information"], "Tuner": ["view-media-visualization", "audio-x-generic"],
     "What each output feeds": ["audio-speakers", "audio-speakers-symbolic", "speaker", "audio-volume-high"], "What's plugged into each input": ["audio-input-line", "audio-card"],
     "Where sound goes": ["view-media-visualization", "audio-speakers"], "Wiring": ["insert-link", "network-connect"],
+    "Convert audio": ["document-export", "document-save-as"],
     "Loopback": ["media-repeat-all", "media-playlist-repeat", "view-refresh"],
     "EQ for each speaker set": ["view-media-equalizer"], "Tone": ["view-media-equalizer", "audio-volume-high"],
     "Clean mic (voice chain)": ["audio-input-microphone", "view-media-equalizer"],
@@ -4475,6 +4476,116 @@ LOOP_AUX = (6, 7)                       # capture channels 7/8 carry the loopbac
 def mix_items(k):
     """Stereo Mix k as the router names it."""
     return f"Mixer-{2 * k - 1}", f"Mixer-{2 * k}"
+
+
+# ============================================================ 4.19: formats & converting
+AUDIO_FORMATS = [   # key, label, extension, ffmpeg audio args, keeps cover art
+    ("flac", "FLAC — lossless (default)", "flac", ["-c:a", "flac", "-compression_level", "8"], True),
+    ("wav24", "WAV 24-bit — lossless, big", "wav", ["-c:a", "pcm_s24le"], False),
+    ("wav16", "WAV 16-bit — CD quality", "wav", ["-c:a", "pcm_s16le"], False),
+    ("aiff", "AIFF 24-bit — lossless (Apple)", "aiff", ["-c:a", "pcm_s24be", "-write_id3v2", "1"], False),
+    ("alac", "ALAC — lossless (Apple, .m4a)", "m4a", ["-c:a", "alac"], True),
+    ("mp3_v0", "MP3 — best quality (V0)", "mp3", ["-c:a", "libmp3lame", "-q:a", "0", "-id3v2_version", "3"], True),
+    ("mp3_320", "MP3 320 kbps", "mp3", ["-c:a", "libmp3lame", "-b:a", "320k", "-id3v2_version", "3"], True),
+    ("mp3_192", "MP3 192 kbps — small, for sharing", "mp3",
+     ["-c:a", "libmp3lame", "-b:a", "192k", "-id3v2_version", "3"], True),
+    ("aac", "AAC 256 kbps (.m4a) — phones", "m4a", ["-c:a", "aac", "-b:a", "256k"], True),
+    ("opus", "Opus 160 kbps — smallest for the quality", "opus", ["-c:a", "libopus", "-b:a", "160k"], False),
+    ("ogg", "Ogg Vorbis (q6)", "ogg", ["-c:a", "libvorbis", "-q:a", "6"], False),
+]
+AUDIO_EXTS = {".flac", ".wav", ".aiff", ".aif", ".mp3", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".wma", ".ape",
+              ".wv", ".mka", ".alac", ".caf", ".mp2", ".ac3"}
+
+
+def audio_format(key):
+    return next((f for f in AUDIO_FORMATS if f[0] == key), AUDIO_FORMATS[0])
+
+
+def transcode(src, dst, key):
+    """Convert one file; tags (and cover art where the format holds it) come along."""
+    _, _, ext, args, art = audio_format(key)
+    src, dst = Path(src), Path(dst)
+    probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
+                            "stream=sample_rate", "-of", "csv=p=0", str(src)], capture_output=True, text=True)
+    try:
+        rate = int((probe.stdout or "0").strip().splitlines()[0])
+    except (ValueError, IndexError):
+        rate = 0
+    extra = []
+    # MP3/Vorbis/AAC top out at 48 kHz and Opus *is* 48 kHz: resample 96 kHz takes 
+    if (key in ("aac",) or ext in ("mp3", "ogg")) and rate > 48000 or ext == "opus" and rate not in (0, 48000):
+        extra = ["-ar", "48000"]
+    if key == "wav16":
+        extra = ["-af", "aresample=osf=s16:dither_method=triangular"]
+    maps = ["-map", "0:a:0"] + (["-map", "0:v?", "-c:v", "copy", "-disposition:v", "attached_pic"] if art else [])
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(dst.stem + ".part." + dst.suffix.lstrip("."))
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src), *maps,
+                        "-map_metadata", "0", *args, *extra, str(tmp)], capture_output=True, text=True)
+    if r.returncode != 0 and art:                       # odd cover art: try again without it
+        r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src), "-map", "0:a:0",
+                            "-map_metadata", "0", *args, *extra, str(tmp)], capture_output=True, text=True)
+    if r.returncode != 0:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError((r.stderr or "ffmpeg failed").strip().splitlines()[-1][:200])
+    tmp.replace(dst)
+    return dst
+
+
+def convert_target(src, key, out_dir=None):
+    """Where a converted copy goes: a “Converted (FORMAT)” folder beside the original, or out_dir."""
+    _, label, ext, _, _ = audio_format(key)
+    src = Path(src)
+    folder = Path(out_dir) if out_dir else src.parent / f"Converted ({label.split(' —')[0].split(' (')[0]})"
+    dst = folder / f"{src.stem}.{ext}"
+    if dst.resolve() == src.resolve():
+        dst = folder / f"{src.stem} (converted).{ext}"
+    return dst
+
+
+class ConvertJob(QtCore.QThread):
+    progress = QtCore.Signal(int, int, str)
+    done = QtCore.Signal(int, list)
+
+    def __init__(self, files, key, out_dir=None):
+        super().__init__()
+        self.files, self.key, self.out_dir = list(files), key, out_dir
+        self.cancelled = False
+
+    def run(self):
+        ok, errors = 0, []
+        for i, f in enumerate(self.files):
+            if self.cancelled:
+                break
+            self.progress.emit(i, len(self.files), Path(f).name)
+            try:
+                transcode(f, convert_target(f, self.key, self.out_dir), self.key)
+                ok += 1
+            except (RuntimeError, OSError) as e:
+                errors.append(f"{Path(f).name}: {e}")
+        self.done.emit(ok, errors)
+
+
+class DropList(QtWidgets.QListWidget):
+    """A file list you can drop audio files or folders onto."""
+    dropped = QtCore.Signal(list)
+
+    def __init__(self):
+        super().__init__()
+        self.setAcceptDrops(True)
+        self.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+
+    def dragMoveEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+
+    def dropEvent(self, e):
+        self.dropped.emit([u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()])
+        e.acceptProposedAction()
 
 
 class SpectrumHub(QtCore.QObject):
@@ -10114,6 +10225,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refreshers.append(lambda: self.named_status.setText(
             "Installed ✓" if (PW_CONF_DIR / "mbox-inputs.conf").exists() else "Not installed yet."))
         self.build_metronome_card(lay)
+        self.build_convert_card(lay)
         self.build_loopback_card(lay)
         self.build_voice_card(lay)
 
@@ -10207,7 +10319,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                                     "Level check"]),
                                     ("Practice", ["Practice player"]),
                                     ("Split && tag", ["Split & tag"]),
-                                    ("Tools", ["Metronome", "Loopback", "Clean mic (voice chain)", "Make a tape", "Tuner",
+                                    ("Tools", ["Metronome", "Convert audio", "Loopback", "Clean mic (voice chain)", "Make a tape", "Tuner",
                                                "Named inputs for your apps"])])
 
     def pick_rip_dir(self):
@@ -10460,6 +10572,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except RuntimeError as e:
             QtWidgets.QMessageBox.warning(self, APP_NAME, f"Couldn't save it: {e}")
             return
+        path = self.finish_format(path)
         self.app_state["last_take"] = str(path)
         self.save_app_state()
         self.show_last_take()
@@ -10501,6 +10614,7 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 outs = split_multitrack(self.mt_file, self.mt_names, self.mt_folder)
                 self.mt_file.unlink()
+                outs = [self.finish_format(o) for o in outs]
                 self.mt_note.setText(f"Saved {len(outs)} tracks in {self.mt_folder.name}.")
                 self.toast(f"Saved {len(outs)} tracks — {self.mt_folder}", 8000)
             except (RuntimeError, OSError) as e:
@@ -10927,6 +11041,19 @@ class MainWindow(QtWidgets.QMainWindow):
         l.addWidget(self.take_strip)
         self.take_level = muted("")
         l.addWidget(self.take_level)
+        frow = QtWidgets.QHBoxLayout()
+        frow.addWidget(QtWidgets.QLabel("Save takes as"))
+        self.save_fmt = QtWidgets.QComboBox()
+        for key, label, *_ in AUDIO_FORMATS:
+            self.save_fmt.addItem(label, key)
+        self.save_fmt.setCurrentIndex(max(0, self.save_fmt.findData(self.app_state.get("save_fmt", "flac"))))
+        self.save_fmt.setToolTip("For quick takes, “Capture what I just played” and multitrack. Rips stay FLAC. "
+                                 "Anything already saved can be converted in Record → Tools → Convert audio.")
+        self.save_fmt.currentIndexChanged.connect(lambda _: (self.app_state.__setitem__(
+            "save_fmt", self.save_fmt.currentData()), self.save_app_state()))
+        frow.addWidget(self.save_fmt)
+        frow.addStretch(1)
+        l.addLayout(frow)
         last = QtWidgets.QHBoxLayout()
         self.take_last = muted("No takes yet.")
         last.addWidget(self.take_last, 1)
@@ -10944,6 +11071,163 @@ class MainWindow(QtWidgets.QMainWindow):
         lay.addWidget(c)
         self.take_mode, self.take_proc = False, None
         self.show_last_take()
+
+    def finish_format(self, path):
+        """Takes are recorded as FLAC; turn them into the chosen format (and drop the FLAC)."""
+        key = self.app_state.get("save_fmt", "flac")
+        path = Path(path)
+        if key == "flac" or not path.exists():
+            return path
+        dst = path.with_suffix("." + audio_format(key)[2])
+        try:
+            transcode(path, dst, key)
+        except (RuntimeError, OSError) as e:
+            self.toast(f"Kept the FLAC — couldn't convert it: {e}", 8000)
+            return path
+        path.unlink(missing_ok=True)
+        return dst
+
+    def build_convert_card(self, lay):
+        c, l = card("Convert audio", "Turn audio files into another format. Tags and cover art come along; "
+                                     "the originals are never touched. Drop files or folders on the list.")
+        brow = QtWidgets.QHBoxLayout()
+        for text, fn in (("Add files…", self.convert_add_files), ("Add folder…", self.convert_add_folder),
+                         ("Remove", self.convert_remove), ("Clear", lambda: (self.conv_list.clear(),
+                                                                             self.convert_refresh()))):
+            b = QtWidgets.QPushButton(text)
+            b.clicked.connect(fn)
+            brow.addWidget(b)
+        brow.addStretch(1)
+        l.addLayout(brow)
+        self.conv_list = DropList()
+        self.conv_list.setMaximumHeight(150)
+        self.conv_list.dropped.connect(self.convert_add)
+        l.addWidget(self.conv_list)
+        f = QtWidgets.QFormLayout()
+        self.conv_fmt = QtWidgets.QComboBox()
+        for key, label, *_ in AUDIO_FORMATS:
+            self.conv_fmt.addItem(label, key)
+        self.conv_fmt.setCurrentIndex(max(0, self.conv_fmt.findData(self.app_state.get("conv_fmt", "mp3_v0"))))
+        self.conv_fmt.currentIndexChanged.connect(lambda _: (self.app_state.__setitem__(
+            "conv_fmt", self.conv_fmt.currentData()), self.save_app_state(), self.convert_refresh()))
+        f.addRow("Convert to", self.conv_fmt)
+        orow = QtWidgets.QHBoxLayout()
+        self.conv_where = QtWidgets.QComboBox()
+        self.conv_where.addItem("A “Converted” folder beside each file", "")
+        self.conv_where.addItem("Choose a folder…", "pick")
+        out = self.app_state.get("conv_dir", "")
+        if out:
+            self.conv_where.insertItem(1, out, out)
+            self.conv_where.setCurrentIndex(1)
+        self.conv_where.activated.connect(self.convert_where_changed)
+        orow.addWidget(self.conv_where, 1)
+        f.addRow("Save to", orow)
+        l.addLayout(f)
+        grow = QtWidgets.QHBoxLayout()
+        self.conv_btn = QtWidgets.QPushButton("Convert")
+        self.conv_btn.setObjectName("primary")
+        self.conv_btn.clicked.connect(self.convert_start)
+        grow.addWidget(self.conv_btn)
+        self.conv_bar = QtWidgets.QProgressBar()
+        self.conv_bar.setVisible(False)
+        grow.addWidget(self.conv_bar, 1)
+        self.conv_note = muted("")
+        grow.addWidget(self.conv_note, 2)
+        l.addLayout(grow)
+        lay.addWidget(c)
+        self.conv_job = None
+        self.convert_refresh()
+
+    def convert_add(self, paths):
+        have = {self.conv_list.item(i).data(Qt.UserRole) for i in range(self.conv_list.count())}
+        added = 0
+        for p in paths:
+            p = Path(p)
+            files = sorted(x for x in p.rglob("*") if x.suffix.lower() in AUDIO_EXTS) if p.is_dir() else \
+                ([p] if p.suffix.lower() in AUDIO_EXTS else [])
+            for x in files:
+                if "Converted (" in str(x.parent) or str(x) in have:
+                    continue
+                it = QtWidgets.QListWidgetItem(x.name)
+                it.setToolTip(str(x))
+                it.setData(Qt.UserRole, str(x))
+                self.conv_list.addItem(it)
+                have.add(str(x))
+                added += 1
+        if paths and not added:
+            self.conv_note.setText("No audio files there.")
+        else:
+            self.convert_refresh()
+
+    def convert_add_files(self):
+        files, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self, "Audio files to convert", str(self.takes_dir()),
+            "Audio (" + " ".join(f"*{e}" for e in sorted(AUDIO_EXTS)) + ")")
+        self.convert_add(files)
+
+    def convert_add_folder(self):
+        d = QtWidgets.QFileDialog.getExistingDirectory(self, "Folder to convert (includes subfolders)",
+                                                       str(self.takes_dir()))
+        if d:
+            self.convert_add([d])
+
+    def convert_remove(self):
+        for it in self.conv_list.selectedItems():
+            self.conv_list.takeItem(self.conv_list.row(it))
+        self.convert_refresh()
+
+    def convert_where_changed(self, i):
+        if self.conv_where.itemData(i) == "pick":
+            d = QtWidgets.QFileDialog.getExistingDirectory(self, "Save converted files in",
+                                                           self.app_state.get("conv_dir") or str(HOME))
+            if not d:
+                self.conv_where.setCurrentIndex(0)
+                return
+            if self.conv_where.findData(d) < 0:
+                self.conv_where.insertItem(1, d, d)
+            self.conv_where.setCurrentIndex(self.conv_where.findData(d))
+        self.app_state["conv_dir"] = self.conv_where.currentData() or ""
+        self.save_app_state()
+
+    def convert_refresh(self):
+        n = self.conv_list.count()
+        busy = self.conv_job is not None
+        self.conv_btn.setText("Stop" if busy else f"Convert {n} file{'s' if n != 1 else ''}" if n else "Convert")
+        self.conv_btn.setEnabled(busy or n > 0)
+        if not busy and not self.conv_note.text().startswith(("Done", "No audio")):
+            self.conv_note.setText("" if n else "Add files or drop them here.")
+
+    def convert_start(self):
+        if self.conv_job:
+            self.conv_job.cancelled = True
+            self.conv_note.setText("Stopping after this file…")
+            return
+        files = [self.conv_list.item(i).data(Qt.UserRole) for i in range(self.conv_list.count())]
+        if not files:
+            return
+        self.conv_job = ConvertJob(files, self.conv_fmt.currentData(), self.conv_where.currentData() or None)
+        self.conv_bar.setRange(0, len(files))
+        self.conv_bar.setValue(0)
+        self.conv_bar.setVisible(True)
+        self.conv_job.progress.connect(lambda i, n, name: (self.conv_bar.setValue(i),
+                                                           self.conv_note.setText(f"{i + 1}/{n}: {name}")))
+        self.conv_job.done.connect(self.convert_done)
+        self.conv_job.start()
+        self.convert_refresh()
+
+    def convert_done(self, ok, errors):
+        job, self.conv_job = self.conv_job, None
+        if job:
+            job.wait(2000)
+        self.conv_bar.setVisible(False)
+        where = self.conv_where.currentData() or "a “Converted” folder beside the originals"
+        msg = f"Done: {ok} converted into {where}."
+        if errors:
+            msg += f" {len(errors)} failed — hover for why."
+            self.conv_note.setToolTip("\n".join(errors[:20]))
+        self.conv_note.setText(msg)
+        self.toast(msg, 8000)
+        self.convert_refresh()
 
     def show_last_take(self):
         p = self.app_state.get("last_take")
@@ -11030,6 +11314,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.rec_btn.setText("●  Arm" if self.auto_rec.isChecked() else "●  Record")
         self.rec_info.setText("Source: " + self.rip_name())
         if ok and Path(path).exists():
+            path = self.finish_format(path)
             self.app_state["last_take"] = str(path)
             self.save_app_state()
             self.take_level.setText(f"Saved {Path(path).name}")
