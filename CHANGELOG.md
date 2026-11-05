@@ -1,5 +1,14 @@
 # Changelog
 
+## 4.17
+- **Practice player** (Record → Practice) for learning tunes by ear:
+  - Slow down to 40% or speed up to 125% without changing the pitch (Rubber Band when ffmpeg has it).
+  - Transpose ±12 semitones, or pick your instrument's key and it detects the song's key and moves it
+    there (a D whistle gets G-major tunes in D, and E-minor tunes in B minor).
+  - Drag across the waveform to loop a section, with an option to speed up 5% each time round.
+  - Play on any output, e.g. the headphones only.
+  - Save the slowed or transposed version (whole song or just the loop) as FLAC or MP3.
+
 ## 4.16
 - **Capture what I just played.** Keeps the last 5 minutes of an input in memory (never on disk until
   you save). Save the last 30 s, minute or 5 minutes, from the app, the tray panel, your phone or a

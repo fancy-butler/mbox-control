@@ -46,7 +46,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QPointF, QRectF
 
 APP_NAME = "Mbox Control"
-VERSION = "4.16"
+VERSION = "4.17"
 UPDATE_REPO = ""          # "owner/mbox-control" once the project is on GitHub; empty = no online checks
 HOME = Path.home()
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -750,10 +750,10 @@ CARD_ICONS = {   # card title → icon names (KDE Breeze first, then freedesktop
     "EQ for each speaker set": ["view-media-equalizer"], "Tone": ["view-media-equalizer", "audio-volume-high"],
     "Clean mic (voice chain)": ["audio-input-microphone", "view-media-equalizer"],
     "Capture what I just played": ["document-save", "media-record"], "Multitrack": ["view-split-left-right", "media-record"],
-    "Level check": ["audio-volume-high", "view-statistics"], "Metronome": ["chronometer", "clock", "media-playback-start"],
+    "Level check": ["audio-volume-high", "view-statistics"], "Practice player": ["media-repeat-all", "media-playback-start"], "Metronome": ["chronometer", "clock", "media-playback-start"],
 }
 TAB_ICONS = {
-    "Rip": ["media-record"], "Quick take": ["audio-input-microphone"], "Split & tag": ["edit-cut"],
+    "Rip": ["media-record"], "Quick take": ["audio-input-microphone"], "Practice": ["media-repeat-all", "view-refresh"], "Split & tag": ["edit-cut"],
     "Tools": ["applications-utilities", "tools"], "Your setup": ["document-properties", "user-identity"],
     "Sound": ["audio-card"], "Mbox": ["audio-card"], "Controls": ["input-keyboard"], "App": ["configure"],
     "Speaker sets": ["audio-speakers", "audio-speakers-symbolic", "speaker", "audio-volume-high"], "Apps": ["applications-multimedia", "audio-volume-high"],
@@ -3478,7 +3478,7 @@ class WaveformView(QtWidgets.QWidget):
         p.fillRect(r, QtGui.QColor(BG2))
         if self.env is None:
             p.setPen(QtGui.QColor(SUBTLE))
-            p.drawText(r, Qt.AlignCenter, "Find tracks to see the recording here")
+            p.drawText(r, Qt.AlignCenter, getattr(self, "empty_text", "Find tracks to see the recording here"))
             return
         w, h = self.width() - 16, self.height()
         mid = h / 2
@@ -4993,6 +4993,292 @@ def level_advice(peak_db, clips):
                        f"{'a quarter' if need < 12 else 'a third'} of a turn — and check again.")
     return "silent", ("Almost nothing is coming in. Check the cable, the Mic/DI button, +48V for condenser "
                       "mics, and that you're playing during the check.")
+
+# ================================================================== 4.17: practice player
+
+_RUBBERBAND = None
+
+
+def has_rubberband():
+    global _RUBBERBAND
+    if _RUBBERBAND is None:
+        out = run_quiet("ffmpeg", "-hide_banner", "-filters", timeout=6) or ""
+        _RUBBERBAND = " rubberband " in out
+    return _RUBBERBAND
+
+
+def practice_filter(speed, semitones, rate=48000):
+    """Slow down / speed up without changing pitch, and/or transpose without changing speed."""
+    ratio = 2 ** (semitones / 12)
+    if abs(speed - 1) < 1e-3 and not semitones:
+        return ""
+    if has_rubberband():
+        return f"rubberband=tempo={speed:.4f}:pitch={ratio:.6f}:transients=crisp:pitchq=quality"
+    parts = []
+    if semitones:                                       # pitch by resampling, then undo the speed change
+        parts.append(f"asetrate={rate * ratio:.2f},aresample={rate}")
+    tempo = speed / ratio if semitones else speed
+    while tempo < 0.5:                                  # atempo works in 0.5–2.0 steps
+        parts.append("atempo=0.5")
+        tempo /= 0.5
+    while tempo > 2.0:
+        parts.append("atempo=2.0")
+        tempo /= 2.0
+    parts.append(f"atempo={tempo:.5f}")
+    return ",".join(parts)
+
+
+NOTE_NAMES = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
+_MAJ = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88]     # Krumhansl–Kessler
+_MIN = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17]
+
+
+def detect_key(x, rate):
+    """→ (tonic 0–11, 'major'/'minor', confidence 0–1) from a mono recording."""
+    import numpy as np
+    n = 8192
+    if len(x) < n * 4:
+        return None
+    win = np.hanning(n).astype(np.float32)
+    freqs = np.fft.rfftfreq(n, 1 / rate)
+    ok = (freqs > 55) & (freqs < 2000)
+    pc = np.round(12 * np.log2(freqs[ok] / 440.0)).astype(int) % 12        # pitch class of each bin (A = 0)
+    chroma = np.zeros(12)
+    starts = np.arange(0, len(x) - n, n // 2)
+    if len(starts) > 1200:
+        starts = starts[np.linspace(0, len(starts) - 1, 1200).astype(int)]
+    for s in starts:
+        mag = np.abs(np.fft.rfft(x[s:s + n] * win))[ok]
+        np.add.at(chroma, pc, mag ** 2)
+    chroma = np.roll(chroma, 9)                        # A-based → C-based
+    best = None
+    for mode, prof in (("major", _MAJ), ("minor", _MIN)):
+        for t in range(12):
+            r = np.corrcoef(chroma, np.roll(prof, t))[0, 1]
+            if best is None or r > best[2]:
+                best = (t, mode, r)
+    return best[0], best[1], float(max(0.0, best[2]))
+
+
+def shift_to_key(tonic, mode, instrument_key):
+    """Semitones (−6…+5) that move a song into a key an instrument plays in.
+    Minor songs go to the instrument's relative minor (a D whistle plays B minor)."""
+    target = NOTE_NAMES.index(instrument_key)
+    if mode == "minor":
+        target = (target + 9) % 12
+    d = (target - tonic) % 12
+    return d - 12 if d > 6 else d
+
+
+class PracticeRender(QtCore.QThread):
+    """Renders the section you're practising (slowed / transposed) into memory, as fast as ffmpeg can."""
+    ready = QtCore.Signal(object, str)                 # bytes (s16 stereo), error
+
+    def __init__(self, path, start, end, speed, semitones, rate=48000):
+        super().__init__()
+        self.path, self.start_s, self.end_s = path, start, end
+        self.speed, self.semis, self.rate = speed, semitones, rate
+
+    def run(self):
+        af = practice_filter(self.speed, self.semis, self.rate)
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", f"{self.start_s:.3f}"]
+        if self.end_s:
+            cmd += ["-t", f"{max(0.05, self.end_s - self.start_s):.3f}"]
+        cmd += ["-i", str(self.path), *(["-af", af] if af else []), "-ac", "2", "-ar", str(self.rate),
+                "-f", "s16le", "-"]
+        r = subprocess.run(cmd, capture_output=True)
+        if r.returncode != 0 or not r.stdout:
+            self.ready.emit(None, r.stderr.decode(errors="ignore")[-200:] or "Couldn't read the file")
+            return
+        self.ready.emit(r.stdout, "")
+
+
+class PracticePlayer(QtCore.QThread):
+    """Plays rendered audio to an output, looping if asked. Reports where it is (in source seconds)."""
+    position = QtCore.Signal(float)
+    looped = QtCore.Signal()
+    finished_play = QtCore.Signal()
+
+    def __init__(self, data, rate, target, loop, src_start, speed):
+        super().__init__()
+        self.data, self.rate, self.target, self.loop = data, rate, target, loop
+        self.src_start, self.speed = src_start, speed
+        self.stopping = False
+        self.offset = 0
+        self.next_data = None                           # a faster version waiting for the next time round
+
+    def run(self):
+        cmd = ["pw-play", "--rate", str(self.rate), "--channels", "2", "--format", "s16", "-P",
+               "media.name=Practice", "-P", "media.role=Music"]
+        if self.target:
+            cmd += ["--target", self.target]
+        try:
+            proc = subprocess.Popen(cmd + ["-"], stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except OSError:
+            return
+        frame = 4
+        block = self.rate // 50 * frame                 # 20 ms
+        start = time.time()
+        sent = 0
+        while not self.stopping:
+            if self.offset >= len(self.data):
+                if not self.loop:
+                    break
+                if self.next_data is not None:
+                    self.data, self.next_data = self.next_data, None
+                self.offset = 0
+                self.looped.emit()
+            chunk = self.data[self.offset:self.offset + block]
+            try:
+                proc.stdin.write(chunk)
+                proc.stdin.flush()
+            except (BrokenPipeError, OSError, ValueError):
+                break
+            self.offset += len(chunk)
+            sent += len(chunk)
+            self.position.emit(self.src_start + (self.offset / frame / self.rate) * self.speed)
+            ahead = sent / frame / self.rate - (time.time() - start)
+            if ahead > 0.2:
+                time.sleep(ahead - 0.2)
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+        if self.stopping:
+            proc.terminate()
+        else:
+            proc.wait(3)
+            self.finished_play.emit()
+
+    def stop(self):
+        self.stopping = True
+        self.wait(1500)
+
+
+class PracticeStream(QtCore.QThread):
+    """Whole-song playback: ffmpeg streams processed audio straight into pw-play (starts instantly)."""
+    position = QtCore.Signal(float)
+    finished_play = QtCore.Signal()
+
+    def __init__(self, path, start, speed, semitones, rate, target):
+        super().__init__()
+        self.path, self.start_s, self.speed, self.semis = path, start, speed, semitones
+        self.rate, self.target = rate, target
+        self.stopping = False
+
+    def run(self):
+        af = practice_filter(self.speed, self.semis, self.rate)
+        try:
+            dec = subprocess.Popen(["ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", f"{self.start_s:.3f}",
+                                    "-i", str(self.path), *(["-af", af] if af else []), "-ac", "2", "-ar",
+                                    str(self.rate), "-f", "s16le", "-"], stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL)
+            cmd = ["pw-play", "--rate", str(self.rate), "--channels", "2", "--format", "s16", "-P",
+                   "media.name=Practice", "-P", "media.role=Music"] + (["--target", self.target] if self.target else [])
+            out = subprocess.Popen(cmd + ["-"], stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except OSError:
+            return
+        block = self.rate // 50 * 4
+        start, sent = time.time(), 0
+        while not self.stopping:
+            chunk = dec.stdout.read(block)
+            if not chunk:
+                break
+            try:
+                out.stdin.write(chunk)
+                out.stdin.flush()
+            except (BrokenPipeError, OSError, ValueError):
+                break
+            sent += len(chunk)
+            self.position.emit(self.start_s + sent / 4 / self.rate * self.speed)
+            ahead = sent / 4 / self.rate - (time.time() - start)
+            if ahead > 0.2:
+                time.sleep(ahead - 0.2)
+        dec.kill()
+        try:
+            out.stdin.close()
+        except OSError:
+            pass
+        if self.stopping:
+            out.terminate()
+        else:
+            out.wait(3)
+            self.finished_play.emit()
+
+    def stop(self):
+        self.stopping = True
+        self.wait(1500)
+
+
+class KeyJob(QtCore.QThread):
+    done = QtCore.Signal(object)
+
+    def __init__(self, path):
+        super().__init__()
+        self.path = path
+
+    def run(self):
+        try:
+            import numpy as np
+            r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(self.path), "-t", "240",
+                                "-ac", "1", "-ar", "22050", "-f", "f32le", "-"], capture_output=True)
+            self.done.emit(detect_key(np.frombuffer(r.stdout, np.float32), 22050))
+        except Exception:  # noqa: BLE001
+            self.done.emit(None)
+
+
+class PracticeWave(WaveformView):
+    """Waveform for practising: click to jump, drag to choose the bit to loop."""
+    seek = QtCore.Signal(float)
+    loopChosen = QtCore.Signal(float, float)
+
+    def __init__(self):
+        super().__init__()
+        self.empty_text = "Open a song to practise with"
+        self.loop_ab = None
+        self.play_t = None
+        self.press_x = None
+
+    def mousePressEvent(self, e):
+        if self.dur and e.button() == Qt.LeftButton:
+            self.press_x = e.position().x()
+
+    def mouseMoveEvent(self, e):
+        if self.press_x is not None and abs(e.position().x() - self.press_x) > 6:
+            a, b = sorted((self._t(self.press_x), self._t(e.position().x())))
+            self.loop_ab = (max(0.0, a), min(self.dur, b))
+            self.update()
+
+    def mouseDoubleClickEvent(self, e):
+        pass
+
+    def mouseReleaseEvent(self, e):
+        if self.press_x is None:
+            return
+        if abs(e.position().x() - self.press_x) > 6 and self.loop_ab:
+            self.loopChosen.emit(*self.loop_ab)
+        else:
+            self.seek.emit(self._t(e.position().x()))
+        self.press_x = None
+
+    def paintEvent(self, ev):
+        super().paintEvent(ev)
+        if not self.dur:
+            return
+        p = QtGui.QPainter(self)
+        if self.loop_ab:
+            x1, x2 = self._x(self.loop_ab[0]), self._x(self.loop_ab[1])
+            c = QtGui.QColor(ACCENT)
+            c.setAlpha(55)
+            p.fillRect(QRectF(x1, 0, x2 - x1, self.height()), c)
+            p.setPen(QtGui.QPen(QtGui.QColor(ACCENT), 2))
+            for x, t in ((x1, "A"), (x2, "B")):
+                p.drawLine(QPointF(x, 0), QPointF(x, self.height()))
+                p.drawText(QPointF(x + 4, 14), t)
+        if self.play_t is not None:
+            p.setPen(QtGui.QPen(QtGui.QColor("#3fb950"), 2))
+            x = self._x(self.play_t)
+            p.drawLine(QPointF(x, 0), QPointF(x, self.height()))
 
 # ================================================================== main window
 
@@ -8777,6 +9063,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.build_retro_card(lay)
         self.build_multitrack_card(lay)
         self.build_level_card(lay)
+        self.build_practice_card(lay)
         rc, rl = card("Rip tape / vinyl")
         top = QtWidgets.QHBoxLayout()
         self.rec_btn = QtWidgets.QPushButton("●  Record")
@@ -9159,6 +9446,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                              "Live analysis"]),
                                     ("Quick take", ["Quick take", "Capture what I just played", "Multitrack",
                                                     "Level check"]),
+                                    ("Practice", ["Practice player"]),
                                     ("Split && tag", ["Split & tag"]),
                                     ("Tools", ["Metronome", "Loopback", "Clean mic (voice chain)", "Make a tape", "Tuner",
                                                "Named inputs for your apps"])])
@@ -9523,6 +9811,266 @@ class MainWindow(QtWidgets.QMainWindow):
                                rate=self.rate())
         self.metro.start()
         self.met_btn.setText("■  Stop")
+
+    # ---------------------------------------------------------------- 4.17: practice player
+    def build_practice_card(self, lay):
+        c, l = card("Practice player", "Learn a tune by ear: slow it down without changing the pitch, loop the "
+                                       "tricky bit, or move it into your instrument's key.")
+        top = QtWidgets.QHBoxLayout()
+        ob = QtWidgets.QPushButton("Open a song…")
+        ob.clicked.connect(self.practice_open_dialog)
+        top.addWidget(ob)
+        self.pr_name = QtWidgets.QLabel("")
+        top.addWidget(self.pr_name, 1)
+        self.pr_key = muted("")
+        top.addWidget(self.pr_key)
+        l.addLayout(top)
+        self.pr_wave = PracticeWave()
+        self.pr_wave.setMinimumHeight(110)
+        self.pr_wave.setToolTip("Click to jump there. Drag across a bit to loop it.")
+        self.pr_wave.seek.connect(self.practice_seek)
+        self.pr_wave.loopChosen.connect(self.practice_set_loop)
+        l.addWidget(self.pr_wave)
+        row = QtWidgets.QHBoxLayout()
+        self.pr_play = QtWidgets.QPushButton("▶  Play")
+        self.pr_play.setObjectName("primary")
+        self.pr_play.clicked.connect(self.practice_toggle)
+        row.addWidget(self.pr_play)
+        self.pr_time = QtWidgets.QLabel("0:00")
+        self.pr_time.setStyleSheet("font: 600 14pt monospace;")
+        row.addWidget(self.pr_time)
+        self.pr_loop = QtWidgets.QCheckBox("Loop")
+        self.pr_loop.setToolTip("Drag across the waveform to choose what to loop.")
+        self.pr_loop.toggled.connect(lambda _: self.practice_restart())
+        row.addWidget(self.pr_loop)
+        self.pr_loop_lbl = muted("drag on the waveform to pick a section")
+        row.addWidget(self.pr_loop_lbl, 1)
+        clr = QtWidgets.QPushButton("Clear loop")
+        clr.clicked.connect(lambda: self.practice_set_loop(None, None))
+        row.addWidget(clr)
+        l.addLayout(row)
+        g = QtWidgets.QGridLayout()
+        g.addWidget(QtWidgets.QLabel("Speed"), 0, 0)
+        self.pr_speed = QtWidgets.QSlider(Qt.Horizontal)
+        self.pr_speed.setRange(40, 125)
+        self.pr_speed.setValue(100)
+        self.pr_speed.setToolTip("Slower or faster without changing the pitch.")
+        self.pr_speed_lbl = QtWidgets.QLabel("100%")
+        self.pr_speed.valueChanged.connect(lambda v: (self.pr_speed_lbl.setText(f"{v}%"), self.practice_debounce()))
+        g.addWidget(self.pr_speed, 0, 1)
+        g.addWidget(self.pr_speed_lbl, 0, 2)
+        g.addWidget(QtWidgets.QLabel("Transpose"), 1, 0)
+        trow = QtWidgets.QHBoxLayout()
+        self.pr_semi = QtWidgets.QSpinBox()
+        self.pr_semi.setRange(-12, 12)
+        self.pr_semi.setSuffix(" semitones")
+        self.pr_semi.valueChanged.connect(lambda _: self.practice_debounce())
+        trow.addWidget(self.pr_semi)
+        trow.addWidget(QtWidgets.QLabel("  or play it in my instrument's key:"))
+        self.pr_inst = QtWidgets.QComboBox()
+        self.pr_inst.addItem("—", "")
+        for n in ["D", "C", "Bb", "Eb", "F", "G", "A", "B", "E", "Ab", "C#", "F#"]:
+            self.pr_inst.addItem(n, n)
+        self.pr_inst.setToolTip("A D whistle → D. A C harmonica played normally → C; in 2nd position "
+                                "(cross harp) → G. Minor tunes go to the matching minor (D whistle → B minor).")
+        self.pr_inst.setCurrentIndex(max(0, self.pr_inst.findData(self.app_state.get("pr_inst", ""))))
+        self.pr_inst.activated.connect(lambda _: self.practice_match_key())
+        trow.addWidget(self.pr_inst)
+        trow.addStretch(1)
+        g.addLayout(trow, 1, 1, 1, 2)
+        g.setColumnStretch(1, 1)
+        l.addLayout(g)
+        brow = QtWidgets.QHBoxLayout()
+        self.pr_ramp = QtWidgets.QCheckBox("Speed up 5% each time round the loop (up to 100%)")
+        brow.addWidget(self.pr_ramp)
+        brow.addStretch(1)
+        brow.addWidget(QtWidgets.QLabel("Play on"))
+        self.pr_out = QtWidgets.QComboBox()
+        self.pr_out.addItem("Default output", "")
+        self.pr_out.addItem("Headphones (Mbox)", "mbox_headphones")
+        brow.addWidget(self.pr_out)
+        sv = QtWidgets.QPushButton("Save this version…")
+        sv.setToolTip("Saves the song (or just the loop) slowed / transposed as you hear it, e.g. for your phone.")
+        sv.clicked.connect(self.practice_save)
+        brow.addWidget(sv)
+        l.addLayout(brow)
+        lay.addWidget(c)
+        c.setAcceptDrops(True)
+        c.dragEnterEvent = lambda e: e.acceptProposedAction() if e.mimeData().hasUrls() else None
+        c.dropEvent = lambda e: self.practice_open(e.mimeData().urls()[0].toLocalFile())
+        self.pr_path, self.pr_pos, self.pr_ab, self.pr_job, self.pr_player = None, 0.0, None, None, None
+        self.pr_key_info = None
+        self.pr_timer = QtCore.QTimer(self)
+        self.pr_timer.setSingleShot(True)
+        self.pr_timer.timeout.connect(self.practice_restart)
+
+    def practice_open_dialog(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open a song", str(HOME / "Music"),
+                                                        "Audio (*.flac *.mp3 *.wav *.ogg *.opus *.m4a *.aac *.aiff "
+                                                        "*.wma *.mp4 *.mkv *.webm);;All files (*)")
+        if path:
+            self.practice_open(path)
+
+    def practice_open(self, path):
+        self.practice_stop()
+        self.pr_path, self.pr_pos, self.pr_ab = path, 0.0, None
+        self.pr_wave.loop_ab = None
+        self.pr_name.setText(f"<b>{html_escape(Path(path).name)}</b>")
+        self.pr_key.setText("Listening for the key…")
+        self.pr_loop_lbl.setText("drag on the waveform to pick a section")
+        self.pr_env_job = EnvelopeJob(path)
+        self.pr_env_job.done.connect(lambda env, dur, err: (
+            self.pr_wave.set_data(env[0], env[1], dur) if not err and env is not None else
+            self.pr_name.setText(f"Couldn't open it: {err}")))
+        self.pr_env_job.start()
+        self.pr_key_job = KeyJob(path)
+        self.pr_key_job.done.connect(self.practice_key_found)
+        self.pr_key_job.start()
+
+    def practice_key_found(self, k):
+        self.pr_key_info = k
+        if not k:
+            self.pr_key.setText("")
+            return
+        tonic, mode, conf = k
+        sure = "" if conf > 0.6 else " (not sure)"
+        self.pr_key.setText(f"Sounds like {NOTE_NAMES[tonic]} {mode}{sure}")
+        if self.pr_inst.currentData():
+            self.practice_match_key()
+
+    def practice_match_key(self):
+        inst = self.pr_inst.currentData()
+        self.app_state["pr_inst"] = inst
+        self.save_app_state()
+        if not inst or not self.pr_key_info:
+            return
+        tonic, mode, _ = self.pr_key_info
+        shift = shift_to_key(tonic, mode, inst)
+        self.pr_semi.setValue(shift)
+        target = NOTE_NAMES[(tonic + shift) % 12]
+        self.toast(f"Moved {shift:+d} semitones: now in {target} {mode}.", 6000)
+
+    def practice_set_loop(self, a, b):
+        if a is None:
+            self.pr_ab = None
+            self.pr_wave.loop_ab = None
+            self.pr_loop.setChecked(False)
+            self.pr_loop_lbl.setText("drag on the waveform to pick a section")
+        else:
+            self.pr_ab = (a, b)
+            self.pr_wave.loop_ab = (a, b)
+            self.pr_loop_lbl.setText(f"A {fmt_time(a)} – B {fmt_time(b)}  ({b - a:.1f} s)")
+            self.pr_loop.blockSignals(True)
+            self.pr_loop.setChecked(True)
+            self.pr_loop.blockSignals(False)
+            self.pr_pos = a
+        self.pr_wave.update()
+        self.practice_restart()
+
+    def practice_seek(self, t):
+        self.pr_pos = t
+        self.pr_wave.play_t = t
+        self.pr_wave.update()
+        self.practice_restart()
+
+    def practice_debounce(self):
+        if self.pr_player:
+            self.pr_timer.start(350)
+
+    def practice_toggle(self):
+        if self.pr_player:
+            self.practice_stop()
+        else:
+            self.practice_play()
+
+    def practice_stop(self):
+        if self.pr_player:
+            self.pr_player.stop()
+            self.pr_player = None
+        self.pr_play.setText("▶  Play")
+
+    def practice_restart(self):
+        if self.pr_player:
+            self.practice_stop()
+            self.practice_play()
+
+    def practice_play(self):
+        if not self.pr_path:
+            self.practice_open_dialog()
+            return
+        speed, semis, rate = self.pr_speed.value() / 100, self.pr_semi.value(), self.rate()
+        target = self.pr_out.currentData() or None
+        if target and not pw_node_exists(target, "sink"):
+            target = None
+        if self.pr_loop.isChecked() and self.pr_ab:
+            a, b = self.pr_ab
+            self.pr_play.setText("…")
+            job = PracticeRender(self.pr_path, a, b, speed, semis, rate)
+
+            def go(data, err):
+                if err or not data:
+                    self.pr_play.setText("▶  Play")
+                    self.toast(f"Couldn't play it: {err}", 6000)
+                    return
+                self.pr_player = PracticePlayer(data, rate, target, True, a, speed)
+                self.pr_player.position.connect(self.practice_pos)
+                self.pr_player.looped.connect(self.practice_looped)
+                self.pr_player.start()
+                self.pr_play.setText("❚❚  Pause")
+            job.ready.connect(go)
+            self.pr_job = job
+            job.start()
+        else:
+            self.pr_player = PracticeStream(self.pr_path, self.pr_pos, speed, semis, rate, target)
+            self.pr_player.position.connect(self.practice_pos)
+            self.pr_player.finished_play.connect(lambda: (self.practice_stop(), setattr(self, "pr_pos", 0.0)))
+            self.pr_player.start()
+            self.pr_play.setText("❚❚  Pause")
+
+    def practice_pos(self, t):
+        self.pr_pos = t
+        self.pr_time.setText(fmt_time(t))
+        self.pr_wave.play_t = t
+        self.pr_wave.update()
+
+    def practice_looped(self):
+        if not self.pr_ramp.isChecked() or self.pr_speed.value() >= 100 or not self.pr_player:
+            return
+        new = min(100, self.pr_speed.value() + 5)
+        self.pr_speed.blockSignals(True)
+        self.pr_speed.setValue(new)
+        self.pr_speed.blockSignals(False)
+        self.pr_speed_lbl.setText(f"{new}%")
+        a, b = self.pr_ab
+        job = PracticeRender(self.pr_path, a, b, new / 100, self.pr_semi.value(), self.rate())
+        player = self.pr_player
+        job.ready.connect(lambda data, err: (setattr(player, "next_data", data),
+                                             setattr(player, "speed", new / 100)) if data else None)
+        self.pr_ramp_job = job
+        job.start()
+
+    def practice_save(self):
+        if not self.pr_path:
+            return
+        speed, semis = self.pr_speed.value() / 100, self.pr_semi.value()
+        tag = (f" {int(speed * 100)}%" if speed != 1 else "") + (f" {semis:+d}st" if semis else "")
+        dest, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save this version",
+                                                        str(Path(self.pr_path).with_name(
+                                                            Path(self.pr_path).stem + (tag or " copy") + ".flac")),
+                                                        "FLAC (*.flac);;MP3 (*.mp3)")
+        if not dest:
+            return
+        af = practice_filter(speed, semis)
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+        if self.pr_loop.isChecked() and self.pr_ab:
+            cmd += ["-ss", f"{self.pr_ab[0]:.3f}", "-t", f"{self.pr_ab[1] - self.pr_ab[0]:.3f}"]
+        cmd += ["-i", self.pr_path, *(["-af", af] if af else []), "-map_metadata", "0", dest]
+        self.toast("Saving…", 0)
+        proc = QtCore.QProcess(self)
+        proc.finished.connect(lambda code, _s: self.toast(f"Saved {Path(dest).name}" if code == 0 else
+                                                          "Couldn't save it.", 6000))
+        proc.start(cmd[0], cmd[1:])
+        self.pr_save_proc = proc
 
     def takes_dir(self):
         return Path(self.app_state.get("takes_dir") or (Path.home() / "Music" / "Mbox takes"))
@@ -11214,7 +11762,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.remote.stop()
         for k in list(getattr(self, "mirrors", {})):
             self.stop_mirror(k)
-        for job in (getattr(self, "retro", None), getattr(self, "metro", None)):
+        for job in (getattr(self, "retro", None), getattr(self, "metro", None), getattr(self, "pr_player", None)):
             if job:
                 job.stop()
         if getattr(self, "mt_proc", None):
