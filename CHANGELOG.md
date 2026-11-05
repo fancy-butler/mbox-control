@@ -1,5 +1,13 @@
 # Changelog
 
+## 4.18.3
+- **Fixed: "Capture what I just played" saved loud, distorted noise on newer PipeWire.** When it writes
+  to a pipe, newer `pw-record` wraps the audio in an AU container (byte-swapped samples behind a
+  header) unless it's given `--raw`. The app now passes `--raw` when pw-record supports it.
+- **Hear it while listening** (on by default): plays the input through Outputs 1/2 from the Mbox's own
+  mixer, with no delay, while "Capture what I just played" is on. When you stop, it's put back the way
+  it was. Inputs you can already hear are left alone.
+
 ## 4.18.2
 - **Fixed: "Capture what I just played" did nothing on newer PipeWire (1.4+).** Newer `pw-record`
   reads a single channel name like `AUX0` as a layout and refuses it. One-channel captures are now

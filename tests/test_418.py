@@ -200,3 +200,34 @@ def test_retro_failure_stays_on_screen(win):
     win.refresh_retro()
     assert "incompatible" in win.retro_note.text()
     assert win.retro_btn.text() == "Start listening"
+
+
+def test_raw_flag_only_when_pw_record_knows_it(monkeypatch):
+    import subprocess as sp
+
+    class R:
+        def __init__(self, out):
+            self.stdout, self.stderr = out, ""
+    for help_text, want in (("  -a, --raw   RAW mode\n", ["--raw"]), ("  --format\n", [])):
+        monkeypatch.setattr(mc, "_PW_RAW", None)
+        monkeypatch.setattr(sp, "run", lambda *a, h=help_text, **k: R(h))
+        assert mc.pw_record_raw_flag() == want
+        cmd = mc.capture_cmd("src", ["AUX0"], 96000)
+        assert ("--raw" in cmd) == bool(want)
+        assert "--raw" not in mc.capture_cmd("src", ["AUX0"], 96000, out="/tmp/x.wav")   # files: own format
+    monkeypatch.setattr(mc, "_PW_RAW", None)
+
+
+def test_hear_it_while_listening_and_put_back(win):
+    slot = win.slot_of("Analog-A-1")
+    win.mix_set_lr(1, slot, 0, 0)
+    win.retro_choice = "mono:Analog-A-1"
+    win.retro_monitor(True)
+    l_, r_ = win.mix_lr(1, slot)
+    assert l_ > 0 and r_ > 0
+    win.retro_monitor(False)
+    assert win.mix_lr(1, slot) == (0, 0)
+    win.mix_set_lr(1, slot, mc.UNITY, mc.UNITY)       # already audible: left alone
+    win.retro_monitor(True)
+    win.retro_monitor(False)
+    assert win.mix_lr(1, slot) == (mc.UNITY, mc.UNITY)

@@ -46,7 +46,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QPointF, QRectF
 
 APP_NAME = "Mbox Control"
-VERSION = "4.18.2"
+VERSION = "4.18.3"
 UPDATE_REPO = ""          # "owner/mbox-control" once the project is on GitHub; empty = no online checks
 HOME = Path.home()
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -4857,10 +4857,26 @@ def capture_auxes(auxes):
     return auxes
 
 
+_PW_RAW = None
+
+
+def pw_record_raw_flag():
+    """Newer pw-record (1.4+) wraps stdout in an AU container (big-endian, with a header) unless asked
+    for --raw; older ones write raw already and don't know the flag."""
+    global _PW_RAW
+    if _PW_RAW is None:
+        try:
+            r = subprocess.run(["pw-record", "--help"], capture_output=True, text=True, timeout=5)
+            _PW_RAW = "--raw" in (r.stdout + r.stderr)
+        except (OSError, subprocess.SubprocessError):
+            _PW_RAW = False
+    return ["--raw"] if _PW_RAW else []
+
+
 def capture_cmd(source, auxes, rate, out="-", fmt="s16"):
     """pw-record taking exact Mbox capture channels (AUX0…) with no remixing."""
     auxes = capture_auxes(auxes)
-    return ["pw-record", "--target", source, "--rate", str(rate), "--channels", str(len(auxes)),
+    return ["pw-record", *(pw_record_raw_flag() if out == "-" else []), "--target", source, "--rate", str(rate), "--channels", str(len(auxes)),
             "--channel-map", ",".join(auxes), "-P", "stream.dont-remix=true", "-P", "node.dont-reconnect=true",
             "--format", fmt, out]
 
@@ -10089,6 +10105,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.input_choices(self.retro_src, "retro_src")
         row.addWidget(self.retro_src, 1)
         l.addLayout(row)
+        self.retro_hear = QtWidgets.QCheckBox("Hear it through the speakers while listening")
+        self.retro_hear.setChecked(self.app_state.get("retro_hear", True))
+        self.retro_hear.setToolTip("Plays the input through Outputs 1/2 straight from the Mbox's own mixer — "
+                                   "no delay. Put back the way it was when you stop listening.")
+        self.retro_hear.toggled.connect(self.retro_hear_toggled)
+        l.addWidget(self.retro_hear)
         srow = QtWidgets.QHBoxLayout()
         for secs, text in ((30, "Save last 30 s"), (60, "Save last minute"), (300, "Save last 5 min")):
             b = QtWidgets.QPushButton(text)
@@ -10118,12 +10140,47 @@ class MainWindow(QtWidgets.QMainWindow):
             self.retro.label = name
             self.retro.failed.connect(self.retro_failed)
             self.retro.start()
+            self.retro_choice = self.retro_src.currentData()
+            if self.retro_hear.isChecked():
+                self.retro_monitor(True)
         elif not on and self.retro:
             self.retro.stop()
             self.retro = None
+            self.retro_monitor(False)
         self.app_state["retro_on"] = on
         self.save_app_state()
         self.refresh_retro()
+
+    def retro_hear_toggled(self, on):
+        self.app_state["retro_hear"] = on
+        self.save_app_state()
+        if self.retro:
+            self.retro_monitor(on)
+
+    def retro_monitor(self, on):
+        """While listening, play the input through Stereo Mix 1 (Outputs 1/2); put it back afterwards."""
+        prev = getattr(self, "retro_mon", None)
+        if not on:
+            if prev:
+                k, slot, l_, r_ = prev
+                self.mix_set_lr(k, slot, l_, r_)
+                self.retro_mon = None
+            return
+        if prev:
+            return
+        choice = getattr(self, "retro_choice", "") or ""
+        if not choice.startswith("mono:"):              # the rip pair has its own monitor setting
+            return
+        for item in [choice.split(":", 1)[1]]:
+            slot = self.slot_of(item)
+            if slot is None:
+                self.toast("That input isn't in the Mbox mixer — can't play it through the speakers.", 6000)
+                return
+            l_, r_ = self.mix_lr(1, slot)
+            if max(l_, r_) >= UNITY // 2:                # already audible: leave it alone
+                return
+            self.retro_mon = (1, slot, l_, r_)
+            self.mix_set_lr(1, slot, UNITY, UNITY)     # one instrument: centred, both speakers
 
     def retro_failed(self, msg):
         self.retro_error = time.time()
