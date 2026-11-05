@@ -1,5 +1,17 @@
 # Changelog
 
+## 4.16
+- **Capture what I just played.** Keeps the last 5 minutes of an input in memory (never on disk until
+  you save). Save the last 30 s, minute or 5 minutes, from the app, the tray panel, your phone or a
+  keyboard shortcut. Silence at the start is trimmed off.
+- **Multitrack:** record several inputs at once, each to its own sample-aligned FLAC, named after what's
+  plugged in.
+- **Metronome:** tap tempo, beats per bar with an accented first beat, and volume. Clicks go to
+  "Headphones (Mbox)" so they stay out of speaker recordings. Tempo changes apply while it plays.
+- **Level check:** play your loudest part for 10 seconds and it tells you which way to turn the gain
+  knob, and roughly how far.
+- New shortcut commands: save-retro, quick-take, metronome.
+
 ## 4.15
 - **EQ that follows the Spkr button.** Speakers & apps → EQ: give each speaker set its own EQ, so your
   headphones get their correction and your speakers theirs. Switching is instant and silent, and

@@ -46,7 +46,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QPointF, QRectF
 
 APP_NAME = "Mbox Control"
-VERSION = "4.15"
+VERSION = "4.16"
 UPDATE_REPO = ""          # "owner/mbox-control" once the project is on GitHub; empty = no online checks
 HOME = Path.home()
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -749,6 +749,8 @@ CARD_ICONS = {   # card title → icon names (KDE Breeze first, then freedesktop
     "Loopback": ["media-repeat-all", "media-playlist-repeat", "view-refresh"],
     "EQ for each speaker set": ["view-media-equalizer"], "Tone": ["view-media-equalizer", "audio-volume-high"],
     "Clean mic (voice chain)": ["audio-input-microphone", "view-media-equalizer"],
+    "Capture what I just played": ["document-save", "media-record"], "Multitrack": ["view-split-left-right", "media-record"],
+    "Level check": ["audio-volume-high", "view-statistics"], "Metronome": ["chronometer", "clock", "media-playback-start"],
 }
 TAB_ICONS = {
     "Rip": ["media-record"], "Quick take": ["audio-input-microphone"], "Split & tag": ["edit-cut"],
@@ -1904,6 +1906,7 @@ h2{font-size:12px;color:var(--sub);font-weight:700;margin:16px 4px 8px;text-tran
  <div class="bar"><div id="m_rec"></div></div>
  <p class="sub" id="recinfo"></p>
  <div class="row"><button id="takebtn">🎙 Quick take</button><button id="recbtn">● Record</button></div>
+ <button id="retrobtn" style="margin-top:8px;display:none">💾 Save what I just played</button>
  <p class="sub" id="saving"></p>
 </div>
 
@@ -1920,7 +1923,7 @@ async function go(a,b){try{const r=await fetch('/do/'+a+'/'+encodeURIComponent(b
 function locked(){document.body.innerHTML='<div style="padding:40px 20px;text-align:center"><h1>🔒 Mbox</h1><p class="sub" style="font-size:16px">This phone isn\'t paired.<br><br>On the computer open <b>Mbox Control → Remote</b> and scan the QR code.</p></div>';clearTimeout(tick.t);tick.t=null;locked.on=1}
 document.querySelectorAll('#spkrow button').forEach(b=>b.onclick=()=>{go('speakers',b.dataset.l);if(navigator.vibrate)navigator.vibrate(15)});
 $('#mute').onclick=()=>go('mute',last.mute?'0':'1');
-$('#recbtn').onclick=()=>go('record','');$('#takebtn').onclick=()=>go('take','');
+$('#recbtn').onclick=()=>go('record','');$('#takebtn').onclick=()=>go('take','');$('#retrobtn').onclick=()=>{go('retro','');toast('Saved the last minute')};
 $('#vol').oninput=e=>{busy=Date.now();$('#volv').textContent=Math.round(e.target.value/2.55)+'%';clearTimeout(vt);vt=setTimeout(()=>go('volume',e.target.value),90)};
 function setBar(id,v){$(id).style.width=Math.max(0,Math.min(100,v))+'%'}
 function render(s){last=s;
@@ -1938,7 +1941,7 @@ function render(s){last=s;
  $('#rectime').textContent=r.time||'0:00';setBar('#m_rec',r.level||0);$('#recinfo').textContent=r.info||'';
  const b=$('#recbtn');b.classList.toggle('on',r.state=='rec'||r.state=='armed');
  b.textContent=r.state=='armed'?'■ Disarm':r.state=='rec'?'■ Stop':(r.auto?'● Arm':'● Record');
- $('#saving').textContent=r.saving||'';
+ $('#saving').textContent=r.saving||'';$('#retrobtn').style.display=r.retro?'':'none';
  const sc=$('#scenes'),key=JSON.stringify(s.scenes);if(sc.dataset.k!=key){sc.innerHTML='';s.scenes.forEach(x=>{const e=document.createElement('button');
   e.className='scene';e.innerHTML='';e.append(x.name);const sm=document.createElement('small');sm.textContent=x.short;e.append(sm);
   e.onclick=()=>{go('scene',x.id);toast(x.name)};sc.appendChild(e)});sc.dataset.k=key}}
@@ -2595,6 +2598,9 @@ class FlowGrid(QtWidgets.QWidget):
 SOCKET_NAME = f"mbox-control-{os.getuid()}"
 COMMANDS = {
     "show": "Open the window",
+    "save-retro": "Save what I just played (last minute)",
+    "quick-take": "Start / stop a quick take",
+    "metronome": "Metronome on / off",
     "toggle-mute": "Mute / unmute the speakers",
     "mute": "Mute the speakers",
     "unmute": "Unmute the speakers",
@@ -4818,6 +4824,176 @@ context.modules = [
 ]
 """, bool(rnn), bool(sc4)
 
+# ================================================================== 4.16: retro-record, multitrack, metronome, level
+import collections
+
+def capture_cmd(source, auxes, rate, out="-", fmt="s16"):
+    """pw-record taking exact Mbox capture channels (AUX0…) with no remixing."""
+    return ["pw-record", "--target", source, "--rate", str(rate), "--channels", str(len(auxes)),
+            "--channel-map", ",".join(auxes), "-P", "stream.dont-remix=true", "-P", "node.dont-reconnect=true",
+            "--format", fmt, out]
+
+
+class RetroBuffer(QtCore.QThread):
+    """Keeps the last N seconds of an input in memory — nothing touches the disk until you save."""
+    failed = QtCore.Signal(str)
+
+    def __init__(self, source, auxes, rate=48000, seconds=120):
+        super().__init__()
+        self.source, self.auxes, self.rate, self.seconds = source, list(auxes), rate, seconds
+        self.frame = 2 * len(self.auxes)                     # s16
+        self.limit = self.seconds * self.rate * self.frame
+        self.chunks, self.size = collections.deque(), 0
+        self.lock = threading.Lock()
+        self.proc = None
+        self.stopping = False
+
+    def run(self):
+        try:
+            self.proc = subprocess.Popen(capture_cmd(self.source, self.auxes, self.rate), stdout=subprocess.PIPE,
+                                         stderr=subprocess.DEVNULL)
+        except OSError as e:
+            self.failed.emit(str(e))
+            return
+        while not self.stopping:
+            data = self.proc.stdout.read(self.rate // 10 * self.frame)     # ~0.1 s
+            if not data:
+                break
+            with self.lock:
+                self.chunks.append(data)
+                self.size += len(data)
+                while self.size - len(self.chunks[0]) >= self.limit:
+                    self.size -= len(self.chunks.popleft())
+        if not self.stopping:
+            self.failed.emit("The input went away")
+
+    def stop(self):
+        self.stopping = True
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+        self.wait(2000)
+
+    def held(self):
+        return self.size / (self.rate * self.frame)
+
+    def snapshot(self, seconds):
+        """The last `seconds` of audio as raw s16 bytes (whole frames)."""
+        with self.lock:
+            data = b"".join(self.chunks)
+        want = int(seconds * self.rate) * self.frame
+        return data[-want:] if want < len(data) else data
+
+
+def save_raw(data, path, rate, channels, trim=True):
+    """Raw s16 → FLAC; trims silence off the start so the take begins when you started playing."""
+    af = ["-af", "silenceremove=start_periods=1:start_threshold=-50dB:start_silence=0.3"] if trim else []
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "s16le", "-ar", str(rate),
+                        "-ac", str(channels), "-i", "-", *af, "-c:a", "flac", str(path)], input=data,
+                       capture_output=True)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.decode(errors="ignore")[-200:] or "ffmpeg failed")
+
+
+def split_multitrack(src, names, folder):
+    """One multichannel recording → one mono FLAC per input, sample-aligned."""
+    folder.mkdir(parents=True, exist_ok=True)
+    outs = []
+    maps = []
+    for i, name in enumerate(names):
+        out = folder / f"{i + 1:02d} {safe_name(name)}.flac"
+        maps += ["-map_channel", f"0.0.{i}", "-c:a", "flac", str(out)]
+        outs.append(out)
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src), *maps],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        # newer ffmpeg dropped -map_channel: use the pan filter instead
+        for i, out in enumerate(outs):
+            r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src), "-af",
+                                f"pan=mono|c0=c{i}", "-c:a", "flac", str(out)], capture_output=True, text=True)
+            if r.returncode != 0:
+                raise RuntimeError(r.stderr[-200:])
+    return outs
+
+
+class Metronome(QtCore.QThread):
+    """Clicks streamed live to an output; tempo, beats per bar and volume change on the fly."""
+
+    def __init__(self, target, bpm=100, beats=4, volume=0.6, rate=48000):
+        super().__init__()
+        self.target, self.bpm, self.beats, self.volume, self.rate = target, bpm, beats, volume, rate
+        self.stopping = False
+        self.proc = None
+        self.beat_no = 0
+
+    def click(self, accent):
+        import numpy as np
+        n = int(self.rate * 0.03)
+        t = np.arange(n) / self.rate
+        f = 1760.0 if accent else 1175.0
+        return (np.sin(2 * np.pi * f * t) * np.exp(-t * 180) * (1.0 if accent else 0.7)).astype(np.float32)
+
+    def run(self):
+        import numpy as np
+        cmd = ["pw-play", "--rate", str(self.rate), "--channels", "1", "--format", "f32", "-P",
+               "media.role=Production", "-P", "media.name=Metronome"]
+        if self.target:
+            cmd += ["--target", self.target]
+        try:
+            self.proc = subprocess.Popen(cmd + ["-"], stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except OSError:
+            return
+        hi, lo = self.click(True), self.click(False)
+        block = int(self.rate * 0.02)                       # write 20 ms at a time: tempo changes land fast
+        pos, next_click = 0, 0
+        pending = np.zeros(0, np.float32)                   # the end of a click that crossed a block edge
+        start = time.time()
+        while not self.stopping and self.proc.poll() is None:
+            buf = np.zeros(block, np.float32)
+            k = min(len(pending), block)
+            buf[:k] += pending[:k]
+            pending = pending[k:]
+            period = max(1, int(self.rate * 60.0 / max(20, min(300, self.bpm))))
+            while next_click < pos + block:
+                c = hi if self.beats > 1 and self.beat_no % self.beats == 0 else lo
+                off = next_click - pos
+                seg = c[:block - off]
+                buf[off:off + len(seg)] += seg
+                pending = c[len(seg):]
+                self.beat_no += 1
+                next_click += period
+            try:
+                self.proc.stdin.write((buf * self.volume).tobytes())
+                self.proc.stdin.flush()
+            except (BrokenPipeError, OSError, ValueError):
+                break
+            pos += block
+            ahead = pos / self.rate - (time.time() - start)
+            if ahead > 0.15:                                # stay ~150 ms ahead of the speakers, no more
+                time.sleep(ahead - 0.15)
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+
+    def stop(self):
+        self.stopping = True
+        self.wait(1500)
+
+
+def level_advice(peak_db, clips):
+    """What to do with the gain knob, from the loudest moment of a 10-second check."""
+    if clips or peak_db > -1:
+        return "too_hot", ("Too loud — it clipped. Turn the gain knob down a good bit (about a third of a turn) "
+                           "and check again.")
+    if peak_db > -6:
+        return "hot", f"A little hot (loudest {peak_db:.0f} dB). Turn the gain down slightly — a small nudge."
+    if peak_db >= -18:
+        return "good", f"Good level (loudest {peak_db:.0f} dB). Leave the knob where it is."
+    if peak_db >= -30:
+        need = -12 - peak_db
+        return "low", (f"Quiet (loudest {peak_db:.0f} dB). Turn the gain up — roughly {need:.0f} dB, about "
+                       f"{'a quarter' if need < 12 else 'a third'} of a turn — and check again.")
+    return "silent", ("Almost nothing is coming in. Check the cable, the Mic/DI button, +48V for condenser "
+                      "mics, and that you're playing during the check.")
+
 # ================================================================== main window
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -5575,6 +5751,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.q_take.setToolTip("Record a quick take from your mic/instrument (Record → Quick take).")
         self.q_take.clicked.connect(lambda: (self.toggle_take(), self.refresh_quick_panel()))
         v.addWidget(self.q_take)
+        self.q_retro = QtWidgets.QPushButton("💾  Save what I just played")
+        self.q_retro.setToolTip("Saves the last minute from the always-listening buffer (Record → Quick take).")
+        self.q_retro.clicked.connect(lambda: self.save_retro(60))
+        v.addWidget(self.q_retro)
         v.addWidget(muted("Scenes"))
         self.q_scenes = FlowGrid(200)
         v.addWidget(self.q_scenes)
@@ -5603,6 +5783,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if c:
             self.q_vol.setValue(int(c.values[0]))
         self.q_take.setText("■  Stop take" if getattr(self, "take_mode", False) else "🎙  Quick take")
+        self.q_retro.setVisible(bool(getattr(self, "retro", None)))
         self.q_mute.blockSignals(True)
         self.q_mute.setChecked(bool(self.app_state.get("spk_mute")))
         self.q_mute.blockSignals(False)
@@ -6550,6 +6731,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 sc = next((x for x in SCENES if x["id"] == sid), None)
                 if sc:
                     self.run_scene(sc)
+        elif cmd == "save-retro":
+            self.save_retro(60)
+        elif cmd == "quick-take":
+            self.toggle_take()
+        elif cmd == "metronome":
+            self.toggle_metronome()
         elif cmd == "quit":
             self.quit_app()
 
@@ -8587,6 +8774,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.rec_file = None
 
         self.build_take_card(lay)
+        self.build_retro_card(lay)
+        self.build_multitrack_card(lay)
+        self.build_level_card(lay)
         rc, rl = card("Rip tape / vinyl")
         top = QtWidgets.QHBoxLayout()
         self.rec_btn = QtWidgets.QPushButton("●  Record")
@@ -8877,6 +9067,7 @@ class MainWindow(QtWidgets.QMainWindow):
         lay.addWidget(nc)
         self.refreshers.append(lambda: self.named_status.setText(
             "Installed ✓" if (PW_CONF_DIR / "mbox-inputs.conf").exists() else "Not installed yet."))
+        self.build_metronome_card(lay)
         self.build_loopback_card(lay)
         self.build_voice_card(lay)
 
@@ -8966,9 +9157,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.rec_page = w
         return self.tabify(w, lay, [("Rip", ["Rip tape / vinyl", "Mic & instrument guide", "Rip queue",
                                              "Live analysis"]),
-                                    ("Quick take", ["Quick take"]),
+                                    ("Quick take", ["Quick take", "Capture what I just played", "Multitrack",
+                                                    "Level check"]),
                                     ("Split && tag", ["Split & tag"]),
-                                    ("Tools", ["Loopback", "Clean mic (voice chain)", "Make a tape", "Tuner",
+                                    ("Tools", ["Metronome", "Loopback", "Clean mic (voice chain)", "Make a tape", "Tuner",
                                                "Named inputs for your apps"])])
 
     def pick_rip_dir(self):
@@ -9054,6 +9246,284 @@ class MainWindow(QtWidgets.QMainWindow):
             self.recorder.stop()
 
     # ---------------------------------------------------------------- 4.10: quick takes
+    # ---------------------------------------------------------------- 4.16: musician tools
+    def input_choices(self, box, key, default="mono:Analog-A-1", pairs=True):
+        for item, jack in INPUT_JACKS[:4]:
+            own = self.label(f"in{int(item[-1]) - 1}", "")
+            box.addItem(jack + (f" ({own})" if own else ""), f"mono:{item}")
+        if pairs:
+            box.addItem(f"Stereo: {self.rip_name()}", "rip")
+        box.setCurrentIndex(max(0, box.findData(self.app_state.get(key, default))))
+        box.currentIndexChanged.connect(lambda _: (self.app_state.__setitem__(key, box.currentData()),
+                                                   self.save_app_state()))
+
+    def capture_for(self, choice):
+        """'mono:Analog-A-2' → (pipewire source, ['AUX1'], label), making sure the Mbox sends it."""
+        src = mbox_pw_node("source")
+        if choice == "rip":
+            self.route_rip_input()
+            return src, ["AUX4", "AUX5"], self.rip_name()
+        item = choice.split(":", 1)[1]
+        n = int(item[-1])
+        self.set_stream(n - 1, item)                      # Input n → capture AUX(n-1)
+        own = self.label(f"in{n - 1}", "")
+        return src, [f"AUX{n - 1}"], own or dict(INPUT_JACKS).get(item, item)
+
+    def build_retro_card(self, lay):
+        c, l = card("Capture what I just played", "Keeps the last few minutes in memory while you noodle. "
+                                                 "Played something good? Save it — no need to have pressed record.")
+        row = QtWidgets.QHBoxLayout()
+        self.retro_btn = QtWidgets.QPushButton()
+        self.retro_btn.setCheckable(True)
+        self.retro_btn.toggled.connect(self.toggle_retro)
+        row.addWidget(self.retro_btn)
+        row.addWidget(QtWidgets.QLabel("from"))
+        self.retro_src = QtWidgets.QComboBox()
+        self.input_choices(self.retro_src, "retro_src")
+        row.addWidget(self.retro_src, 1)
+        l.addLayout(row)
+        srow = QtWidgets.QHBoxLayout()
+        for secs, text in ((30, "Save last 30 s"), (60, "Save last minute"), (300, "Save last 5 min")):
+            b = QtWidgets.QPushButton(text)
+            b.clicked.connect(lambda _=False, s=secs: self.save_retro(s))
+            srow.addWidget(b)
+            setattr(self, f"retro_save_{secs}", b)
+        srow.addStretch(1)
+        l.addLayout(srow)
+        self.retro_note = muted("")
+        l.addWidget(self.retro_note)
+        lay.addWidget(c)
+        self.retro = None
+        self.retro_timer = QtCore.QTimer(self)
+        self.retro_timer.timeout.connect(self.refresh_retro)
+        self.retro_timer.start(1000)
+        self.refresh_retro()
+        if self.app_state.get("retro_on"):
+            QtCore.QTimer.singleShot(4000, lambda: self.retro_btn.setChecked(True))
+
+    def toggle_retro(self, on):
+        if on and not self.retro:
+            src, auxes, name = self.capture_for(self.retro_src.currentData())
+            if not src:
+                self.retro_btn.setChecked(False)
+                self.toast("Couldn't find the Mbox input in PipeWire.", 6000)
+                return
+            self.retro = RetroBuffer(src, auxes, self.rate(), seconds=300)
+            self.retro.label = name
+            self.retro.failed.connect(lambda msg: (self.retro_btn.setChecked(False),
+                                                   self.toast(f"Stopped listening: {msg}", 6000)))
+            self.retro.start()
+        elif not on and self.retro:
+            self.retro.stop()
+            self.retro = None
+        self.app_state["retro_on"] = on
+        self.save_app_state()
+        self.refresh_retro()
+
+    def refresh_retro(self):
+        on = bool(self.retro)
+        self.retro_btn.blockSignals(True)
+        self.retro_btn.setChecked(on)
+        self.retro_btn.blockSignals(False)
+        self.retro_btn.setText("● Listening — stop" if on else "Start listening")
+        self.retro_btn.setStyleSheet("background:#f85149; color:white;" if on else "")
+        self.retro_src.setEnabled(not on)
+        held = self.retro.held() if on else 0
+        for secs in (30, 60, 300):
+            getattr(self, f"retro_save_{secs}").setEnabled(on and held > 1)
+        self.retro_note.setText(f"Holding the last {int(held // 60)}:{int(held % 60):02d} of {self.retro.label} — "
+                                "memory only; nothing is saved unless you press save." if on else
+                                "Off. When it's on, it never writes anything to disk until you save.")
+        if hasattr(self, "q_retro"):
+            self.q_retro.setVisible(on)
+
+    def save_retro(self, seconds):
+        if not self.retro:
+            self.toast("Turn on “Capture what I just played” first (Record → Quick take).", 6000)
+            return
+        data = self.retro.snapshot(seconds)
+        if not data:
+            return
+        folder = self.takes_dir()
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"caught-{datetime.now():%Y-%m-%d_%H%M%S}.flac"
+        try:
+            save_raw(data, path, self.retro.rate, len(self.retro.auxes))
+        except RuntimeError as e:
+            QtWidgets.QMessageBox.warning(self, APP_NAME, f"Couldn't save it: {e}")
+            return
+        self.app_state["last_take"] = str(path)
+        self.save_app_state()
+        self.show_last_take()
+        self.toast(f"Saved — {path.name}", 6000)
+
+    def build_multitrack_card(self, lay):
+        c, l = card("Multitrack", "Record several inputs at once, each to its own file — perfect for a jam, "
+                                  "or mic + instrument together. Files line up exactly in any editor.")
+        row = QtWidgets.QHBoxLayout()
+        self.mt_boxes = {}
+        for item, jack in INPUT_JACKS[:4]:
+            own = self.label(f"in{int(item[-1]) - 1}", "")
+            cb = QtWidgets.QCheckBox(jack + (f" ({own})" if own else ""))
+            cb.setChecked(item in self.app_state.get("mt_inputs", ["Analog-A-1", "Analog-A-2"]))
+            cb.toggled.connect(lambda _: (self.app_state.__setitem__(
+                "mt_inputs", [i for i, b in self.mt_boxes.items() if b.isChecked()]), self.save_app_state()))
+            row.addWidget(cb)
+            self.mt_boxes[item] = cb
+        row.addStretch(1)
+        l.addLayout(row)
+        brow = QtWidgets.QHBoxLayout()
+        self.mt_btn = QtWidgets.QPushButton("●  Record multitrack")
+        self.mt_btn.clicked.connect(self.toggle_multitrack)
+        brow.addWidget(self.mt_btn)
+        self.mt_note = muted("")
+        brow.addWidget(self.mt_note, 1)
+        l.addLayout(brow)
+        lay.addWidget(c)
+        self.mt_proc = None
+
+    def toggle_multitrack(self):
+        if self.mt_proc:
+            self.mt_proc.terminate()
+            self.mt_proc.wait(3000)
+            self.mt_proc = None
+            self.mt_timer.stop()
+            self.mt_btn.setText("●  Record multitrack")
+            self.mt_btn.setStyleSheet("")
+            try:
+                outs = split_multitrack(self.mt_file, self.mt_names, self.mt_folder)
+                self.mt_file.unlink()
+                self.mt_note.setText(f"Saved {len(outs)} tracks in {self.mt_folder.name}.")
+                self.toast(f"Saved {len(outs)} tracks — {self.mt_folder}", 8000)
+            except (RuntimeError, OSError) as e:
+                self.mt_note.setText(f"Couldn't split the tracks: {e}. The combined file is kept: {self.mt_file}")
+            return
+        items = [i for i, b in self.mt_boxes.items() if b.isChecked()]
+        if not items:
+            self.mt_note.setText("Tick at least one input.")
+            return
+        src = mbox_pw_node("source")
+        if not src:
+            self.mt_note.setText("Couldn't find the Mbox input in PipeWire.")
+            return
+        auxes, names = [], []
+        for item in items:
+            _, a, name = self.capture_for(f"mono:{item}")
+            auxes += a
+            names.append(name)
+        self.mt_folder = self.takes_dir() / f"session-{datetime.now():%Y-%m-%d_%H%M%S}"
+        self.mt_folder.mkdir(parents=True, exist_ok=True)
+        self.mt_file, self.mt_names = self.mt_folder / "all-inputs.wav", names
+        self.mt_proc = subprocess.Popen(capture_cmd(src, auxes, self.rate(), out=str(self.mt_file), fmt="s24"),
+                                        stderr=subprocess.DEVNULL)
+        self.mt_started = time.time()
+        self.mt_btn.setText("■  Stop")
+        self.mt_btn.setStyleSheet("background:#f85149; color:white;")
+        self.mt_timer = QtCore.QTimer(self)
+        self.mt_timer.timeout.connect(lambda: self.mt_note.setText(
+            f"● Recording {len(names)} tracks — {int((time.time() - self.mt_started) // 60)}:"
+            f"{int((time.time() - self.mt_started) % 60):02d}"))
+        self.mt_timer.start(500)
+
+    def build_level_card(self, lay):
+        c, l = card("Level check", "Play or sing your loudest part for 10 seconds and the app tells you which way "
+                                   "to turn the gain knob.")
+        row = QtWidgets.QHBoxLayout()
+        self.lv_src = QtWidgets.QComboBox()
+        self.input_choices(self.lv_src, "level_src", pairs=False)
+        row.addWidget(self.lv_src, 1)
+        self.lv_btn = QtWidgets.QPushButton("Check my level")
+        self.lv_btn.clicked.connect(self.start_level_check)
+        row.addWidget(self.lv_btn)
+        l.addLayout(row)
+        self.lv_note = QtWidgets.QLabel("")
+        self.lv_note.setWordWrap(True)
+        l.addWidget(self.lv_note)
+        lay.addWidget(c)
+
+    def start_level_check(self):
+        item = self.lv_src.currentData().split(":", 1)[1]
+        self.capture_for(self.lv_src.currentData())
+        self.lv_item, self.lv_peak, self.lv_clips, self.lv_end = item, METER_FLOOR_DB, 0, time.time() + 10
+        self.lv_btn.setEnabled(False)
+        self.lv_timer = QtCore.QTimer(self)
+        self.lv_timer.timeout.connect(self.level_tick)
+        self.lv_timer.start(50)
+
+    def level_tick(self):
+        db = self.item_db(self.lv_item)
+        self.lv_peak = max(self.lv_peak, db)
+        if db > -0.5:
+            self.lv_clips += 1
+        left = self.lv_end - time.time()
+        if left > 0:
+            self.lv_note.setText(f"Play now… {left:.0f} s   (loudest so far {self.lv_peak:.0f} dB)")
+            return
+        self.lv_timer.stop()
+        self.lv_btn.setEnabled(True)
+        kind, text = level_advice(self.lv_peak, self.lv_clips)
+        colour = {"good": "#3fb950", "hot": "#d29922", "low": "#d29922"}.get(kind, "#f85149")
+        self.lv_note.setText(f"<b style='color:{colour}'>●</b> {text}")
+
+    def build_metronome_card(self, lay):
+        c, l = card("Metronome", "Clicks in your headphones only (when “Headphones (Mbox)” is installed), so "
+                                 "they never end up on a recording from the speakers.")
+        row = QtWidgets.QHBoxLayout()
+        self.met_bpm = QtWidgets.QSpinBox()
+        self.met_bpm.setRange(20, 300)
+        self.met_bpm.setSuffix(" bpm")
+        self.met_bpm.setValue(int(self.app_state.get("met_bpm", 100)))
+        self.met_bpm.valueChanged.connect(self.metronome_changed)
+        row.addWidget(self.met_bpm)
+        tap = QtWidgets.QPushButton("Tap")
+        tap.setToolTip("Tap along a few times to set the tempo.")
+        tap.clicked.connect(self.tap_tempo)
+        row.addWidget(tap)
+        row.addWidget(QtWidgets.QLabel("Beats"))
+        self.met_beats = QtWidgets.QSpinBox()
+        self.met_beats.setRange(1, 12)
+        self.met_beats.setValue(int(self.app_state.get("met_beats", 4)))
+        self.met_beats.valueChanged.connect(self.metronome_changed)
+        row.addWidget(self.met_beats)
+        self.met_vol = QtWidgets.QSlider(Qt.Horizontal)
+        self.met_vol.setRange(5, 100)
+        self.met_vol.setValue(int(self.app_state.get("met_vol", 60)))
+        self.met_vol.valueChanged.connect(self.metronome_changed)
+        row.addWidget(self.met_vol, 1)
+        self.met_btn = QtWidgets.QPushButton("▶  Start")
+        self.met_btn.clicked.connect(self.toggle_metronome)
+        row.addWidget(self.met_btn)
+        l.addLayout(row)
+        lay.addWidget(c)
+        self.metro, self.taps = None, []
+
+    def tap_tempo(self):
+        now = time.time()
+        self.taps = [t for t in self.taps if now - t < 3] + [now]
+        if len(self.taps) >= 3:
+            gaps = [b - a for a, b in zip(self.taps, self.taps[1:])]
+            self.met_bpm.setValue(round(60 / (sum(gaps) / len(gaps))))
+
+    def metronome_changed(self):
+        self.app_state.update(met_bpm=self.met_bpm.value(), met_beats=self.met_beats.value(),
+                              met_vol=self.met_vol.value())
+        if self.metro:
+            self.metro.bpm, self.metro.beats = self.met_bpm.value(), self.met_beats.value()
+            self.metro.volume = self.met_vol.value() / 100
+
+    def toggle_metronome(self):
+        if self.metro:
+            self.metro.stop()
+            self.metro = None
+            self.met_btn.setText("▶  Start")
+            self.save_app_state()
+            return
+        target = "mbox_headphones" if pw_node_exists("mbox_headphones", "sink") else None
+        self.metro = Metronome(target, self.met_bpm.value(), self.met_beats.value(), self.met_vol.value() / 100,
+                               rate=self.rate())
+        self.metro.start()
+        self.met_btn.setText("■  Stop")
+
     def takes_dir(self):
         return Path(self.app_state.get("takes_dir") or (Path.home() / "Music" / "Mbox takes"))
 
@@ -10118,7 +10588,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 saving = self.split_status.text()
             if getattr(self, "take_mode", False):
                 state = "take"
-            rec = {"state": state, "auto": self.auto_rec.isChecked(), "src": self.rec_source()[2],
+            rec_retro = bool(getattr(self, "retro", None))
+            rec = {"retro": rec_retro, "state": state, "auto": self.auto_rec.isChecked(), "src": self.rec_source()[2],
                    "time": self.rec_time.text() if running else "0:00",
                    "level": round(max(0.0, (meter_db(lvl) - METER_FLOOR_DB) / -METER_FLOOR_DB) * 100) if lvl else 0,
                    "info": self.rec_info.text() if running else
@@ -10147,6 +10618,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.switch_speakers(arg)
         elif action == "mute":
             self.mute_speakers(arg == "1")
+        elif action == "retro":
+            self.save_retro(60)
         elif action == "take":
             if not self.recorder.running() and not pw_node_exists("mbox_tape_in"):
                 self.toast("Set up the rip input on the computer once before the phone can record.", 8000)
@@ -10741,6 +11214,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.remote.stop()
         for k in list(getattr(self, "mirrors", {})):
             self.stop_mirror(k)
+        for job in (getattr(self, "retro", None), getattr(self, "metro", None)):
+            if job:
+                job.stop()
+        if getattr(self, "mt_proc", None):
+            self.mt_proc.terminate()
         if getattr(self, "rules_proc", None):
             self.rules_proc.kill()
             self.rules_proc.waitForFinished(500)
