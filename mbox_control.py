@@ -46,7 +46,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QPointF, QRectF
 
 APP_NAME = "Mbox Control"
-VERSION = "4.19.4"
+VERSION = "4.19.5"
 UPDATE_REPO = ""          # "owner/mbox-control" once the project is on GitHub; empty = no online checks
 HOME = Path.home()
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -4694,13 +4694,14 @@ class LevelStrip(QtWidgets.QWidget):
     Mbox inputs to watch; `marked()` returns how many seconds to shade (what a save would grab), or 0."""
     SPAN, STEP = 60.0, 0.05
 
-    def __init__(self, win, items, marked=lambda: 0):
+    def __init__(self, win, items, marked=lambda: 0, spectrum=True, title="", compact=False):
         super().__init__()
         self.win, self.items, self.marked = win, items, marked
+        self.spectrum, self.title = spectrum, title
         self.hist = collections.deque(maxlen=int(self.SPAN / self.STEP))
         self.now, self.peak, self.peak_t, self.clip_t = -60.0, -60.0, 0.0, 0.0
-        self.setMinimumHeight(64)
-        self.setMaximumHeight(72)
+        self.setMinimumHeight(40 if compact else 64)
+        self.setMaximumHeight(44 if compact else 72)
         self.setToolTip("The last minute of this input. Aim for peaks around the dashed −6 dB line; "
                         "red means turn the gain knob down.")
         self.timer = QtCore.QTimer(self)
@@ -4726,6 +4727,8 @@ class LevelStrip(QtWidgets.QWidget):
         self.sub_key, self.bands = None, None
 
     def resubscribe(self):
+        if not self.spectrum:
+            return
         key = tuple(i for i in self.items() if i)
         if key != self.sub_key:
             self.win.spectrum_hub.unsubscribe(self)
@@ -4763,7 +4766,7 @@ class LevelStrip(QtWidgets.QWidget):
         p.setRenderHint(QtGui.QPainter.Antialiasing)
         w, h = self.width(), self.height()
         meter_w = 118
-        spec_w = self.SPEC_W if w > 620 else 0
+        spec_w = self.SPEC_W if w > 620 and self.spectrum else 0
         gw = w - meter_w - 10 - (spec_w + 10 if spec_w else 0)
         p.setPen(Qt.NoPen)
         p.setBrush(QtGui.QColor(BG2))
@@ -4797,6 +4800,13 @@ class LevelStrip(QtWidgets.QWidget):
             y = self.y_of(db, 4, h - 8)
             p.setBrush(self.colour(db))
             p.drawRect(QRectF(4 + x, y, 1.0, base - y))
+        if self.title:
+            f = p.font()
+            f.setPointSizeF(8)
+            f.setBold(True)
+            p.setFont(f)
+            p.setPen(QtGui.QColor(SUBTLE))
+            p.drawText(QRectF(10, 2, gw - 20, 14), Qt.AlignLeft | Qt.AlignTop, self.title)
         pen = QtGui.QPen(ink(70), 1, Qt.DashLine)          # target: peaks around −6 dB
         p.setPen(pen)
         y6 = self.y_of(-6, 4, h - 8)
@@ -4848,6 +4858,17 @@ class LevelStrip(QtWidgets.QWidget):
         clipped = time.time() - self.clip_t < 3
         p.setPen(QtGui.QColor("#f85149") if clipped else QtGui.QColor(TEXT))
         txt = "—" if self.peak <= -59 else f"{self.peak:+.0f} dB".replace("+", "") if self.peak < 0 else "0 dB"
+        compact = h < 56
+        if compact:                                     # short strips: number and one word on two tight lines
+            p.drawText(QRectF(mx + 24, 0, meter_w - 26, h / 2 + 2), Qt.AlignLeft | Qt.AlignBottom, txt)
+            f.setBold(False)
+            f.setPointSizeF(8)
+            p.setFont(f)
+            p.setPen(QtGui.QColor("#f85149") if clipped else QtGui.QColor(SUBTLE))
+            word = ("CLIPPING" if clipped else "silent" if self.peak <= -59 else "quiet" if self.peak < -24 else
+                    "good" if self.peak < -3 else "hot")
+            p.drawText(QRectF(mx + 24, h / 2 + 2, meter_w - 26, h / 2 - 2), Qt.AlignLeft | Qt.AlignTop, word)
+            return
         p.drawText(QRectF(mx + 24, 4, meter_w - 26, 22), Qt.AlignLeft | Qt.AlignVCenter, txt)
         f.setBold(False)
         f.setPointSizeF(8)
@@ -10657,11 +10678,23 @@ class MainWindow(QtWidgets.QMainWindow):
             cb = QtWidgets.QCheckBox(jack + (f" ({own})" if own else ""))
             cb.setChecked(item in self.app_state.get("mt_inputs", ["Analog-A-1", "Analog-A-2"]))
             cb.toggled.connect(lambda _: (self.app_state.__setitem__(
-                "mt_inputs", [i for i, b in self.mt_boxes.items() if b.isChecked()]), self.save_app_state()))
+                "mt_inputs", [i for i, b in self.mt_boxes.items() if b.isChecked()]), self.save_app_state(),
+                self.refresh_mt_strips()))
             row.addWidget(cb)
             self.mt_boxes[item] = cb
         row.addStretch(1)
         l.addLayout(row)
+        self.mt_strips = {}
+        self.mt_strip_box = QtWidgets.QVBoxLayout()
+        self.mt_strip_box.setSpacing(4)
+        for item, jack in INPUT_JACKS[:4]:              # one level strip per ticked input
+            st = LevelStrip(self, lambda item=item: [item], spectrum=False, compact=True,
+                            title=jack)
+            self.mt_strips[item] = st
+            self.mt_strip_box.addWidget(st)
+        l.addLayout(self.mt_strip_box)
+        self.refresh_mt_strips()
+        self.refreshers.append(self.refresh_mt_strips)      # names change (e.g. the F/R button flipped)
         brow = QtWidgets.QHBoxLayout()
         self.mt_btn = QtWidgets.QPushButton("●  Record multitrack")
         self.mt_btn.clicked.connect(self.toggle_multitrack)
@@ -10671,6 +10704,13 @@ class MainWindow(QtWidgets.QMainWindow):
         l.addLayout(brow)
         lay.addWidget(c)
         self.mt_proc = None
+
+    def refresh_mt_strips(self):
+        for item, st in self.mt_strips.items():
+            own = self.label(f"in{int(item[-1]) - 1}", "")
+            st.title = f"Input {item[-1]}" + (f" — {own}" if own else "")
+            self.mt_boxes[item].setText(f"Input {item[-1]}" + (f" ({own})" if own else ""))
+            st.setVisible(self.mt_boxes[item].isChecked())
 
     def toggle_multitrack(self):
         if self.mt_proc:
@@ -11165,28 +11205,47 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def watch_dead_input(self):
         """A take or capture running on a silent input for 4 s: say why (usually +48V or the F/R button)."""
-        runs = []
+        runs = []                                       # each input watched on its own: a live bass can't hide a dead mic
         if getattr(self, "take_mode", False):
-            runs.append(("take", self.source_items(self.app_state.get("take_src", "mono:Analog-A-1"))))
+            runs += [("take", i) for i in self.source_items(self.app_state.get("take_src", "mono:Analog-A-1"))]
         if getattr(self, "retro", None):
-            runs.append(("retro", self.source_items(getattr(self, "retro_choice", ""))))
+            runs += [("retro", i) for i in self.source_items(getattr(self, "retro_choice", ""))]
+        if getattr(self, "mt_proc", None):
+            runs += [("multitrack", i) for i in self.app_state.get("mt_inputs", [])]
+        keys = {f"{o}:{i}" for o, i in runs}
         live = self.__dict__.setdefault("dead_watch", {})
-        for owner in [o for o in live if o not in dict(runs)]:
-            live.pop(owner)
-        for owner, items in runs:
-            st = live.setdefault(owner, {"t": time.time(), "max": -90.0, "warned": False})
-            st["max"] = max([st["max"]] + [self.item_db(i) for i in items])
-            if st["warned"] or time.time() - st["t"] < 4 or st["max"] > -55:
+        for k in [k for k in live if k not in keys]:
+            live.pop(k)
+        warned_now = set()
+        for owner, item in runs:
+            st = live.setdefault(f"{owner}:{item}", {"t": time.time(), "max": -90.0, "warned": None})
+            st["max"] = max(st["max"], self.item_db(item))
+            age = time.time() - st["t"]
+            if item in warned_now:
                 continue
-            st["warned"] = True
-            self.warn_dead_input(items)
+            if st["warned"] is None and age >= 4 and st["max"] <= -55:
+                st["warned"] = "dead"
+                warned_now.add(item)
+                self.warn_dead_input([item])
+            elif st["warned"] is None and age >= 6 and st["max"] < -40:
+                st["warned"] = "quiet"
+                warned_now.add(item)
+                self.warn_dead_input([item], quiet=st["max"])
 
-    def warn_dead_input(self, items):
+    def warn_dead_input(self, items, quiet=None):
         n = int(items[0][-1])
         own = self.label(f"in{n - 1}", "")
         name = f"Input {n}" + (f" ({own})" if own else "")
         ph = self.ctrl("phantom-powering")
-        if n <= 4 and ph and not ph.values[0]:
+        phantom_off = n <= 4 and ph and not ph.values[0]
+        if quiet is not None:
+            self.hint.offer(f"<b>{name} is very quiet</b> (peaks around {quiet:.0f} dB) — turn its gain knob up "
+                            "until the loudest parts reach about −6 dB." +
+                            (" If it's a condenser mic, it also needs +48V (it's off)." if phantom_off else ""),
+                            [("Turn on +48V", self.toggle_phantom)] if phantom_off else [])
+            self.announce("dialog-warning", f"{name} is very quiet — gain up", 8000)
+            return
+        if phantom_off:
             self.hint.offer(f"<b>Nothing is coming in on {name}.</b> A condenser mic (like an AT2020) needs "
                             "+48V phantom power. Turn your speakers down first — switching it on can pop.",
                             [("Turn on +48V", self.toggle_phantom)])

@@ -187,7 +187,7 @@ def test_dead_input_warns_about_phantom_power(win, monkeypatch):
     win.app_state["take_src"] = "mono:Analog-A-2"
     win.watch_dead_input()
     assert not win.hint.isVisible()                    # not straight away
-    win.dead_watch["take"]["t"] = _t.time() - 5
+    win.dead_watch["take:Analog-A-2"]["t"] = _t.time() - 5
     win.watch_dead_input()
     assert win.hint.isVisible() and "+48V" in win.hint.text.text() and "Input 2" in win.hint.text.text()
     win.hint.hide()
@@ -195,7 +195,7 @@ def test_dead_input_warns_about_phantom_power(win, monkeypatch):
     assert not win.hint.isVisible()                    # once per take
     win.take_mode = False
     win.watch_dead_input()
-    assert "take" not in win.dead_watch
+    assert not win.dead_watch
 
 
 def test_no_warning_when_sound_arrives(win, monkeypatch):
@@ -203,7 +203,8 @@ def test_no_warning_when_sound_arrives(win, monkeypatch):
     monkeypatch.setattr(win, "item_db", lambda item: -20.0)
     win.take_mode = True
     win.watch_dead_input()
-    win.dead_watch["take"]["t"] = _t.time() - 5
+    for st in win.dead_watch.values():
+        st["t"] = _t.time() - 7
     win.watch_dead_input()
     assert not win.hint.isVisible()
     win.take_mode = False
@@ -214,3 +215,41 @@ def test_lossy_takes_are_normalized_a_little_lower(win, uneven):
     win.app_state["save_fmt"] = "mp3_v0"
     out = win.finish_format(uneven, polish=True)
     assert out.suffix == ".mp3" and mc.peak_db(out) < -1.2
+
+
+
+def test_a_live_bass_does_not_hide_a_dead_mic_in_multitrack(win, monkeypatch):
+    import time as _t
+    win.ctrl("phantom-powering").values[0] = False
+    monkeypatch.setattr(win, "item_db", lambda item: -12.0 if item == "Analog-A-1" else -90.0)
+    win.app_state["mt_inputs"] = ["Analog-A-1", "Analog-A-2"]
+    win.mt_proc = object()
+    try:
+        win.watch_dead_input()
+        for st in win.dead_watch.values():
+            st["t"] = _t.time() - 5
+        win.watch_dead_input()
+        assert win.hint.isVisible() and "Input 2" in win.hint.text.text() and "+48V" in win.hint.text.text()
+    finally:
+        win.mt_proc = None
+
+
+def test_too_quiet_mic_is_called_out(win, monkeypatch):
+    import time as _t
+    win.ctrl("phantom-powering").values[0] = True
+    monkeypatch.setattr(win, "item_db", lambda item: -48.0)
+    win.take_mode = True
+    win.app_state["take_src"] = "mono:Analog-A-2"
+    win.watch_dead_input()
+    win.dead_watch["take:Analog-A-2"]["t"] = _t.time() - 7
+    win.watch_dead_input()
+    assert win.hint.isVisible() and "very quiet" in win.hint.text.text() and "+48V" not in win.hint.text.text()
+    win.take_mode = False
+
+
+def test_multitrack_shows_a_strip_per_ticked_input(win):
+    win.mt_boxes["Analog-A-3"].setChecked(True)
+    win.mt_boxes["Analog-A-4"].setChecked(False)
+    assert not win.mt_strips["Analog-A-4"].isVisibleTo(win.mt_btn.parentWidget())
+    assert win.mt_strips["Analog-A-3"].isVisibleTo(win.mt_btn.parentWidget())
+    assert win.mt_strips["Analog-A-1"].spectrum is False

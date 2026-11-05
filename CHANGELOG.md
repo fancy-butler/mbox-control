@@ -1,5 +1,13 @@
 # Changelog
 
+## 4.19.5
+- **Every input is watched on its own** in Quick take, Capture and Multitrack, so a live bass can no
+  longer hide a dead mic. Multitrack is now watched too.
+- **New "very quiet" warning:** peaks under −40 dB after 6 seconds suggest turning that input's gain up.
+  If +48V is off on a mic input, the warning offers to switch it on.
+- **Multitrack shows a level strip per ticked input**, each with its name and a one-word verdict.
+- Multitrack checkboxes now update when you rename inputs or flip the F/R button.
+
 ## 4.19.4
 - **Silent input warning.** If a quick take or capture runs for 4 seconds on an input with no signal,
   a bar explains why:
