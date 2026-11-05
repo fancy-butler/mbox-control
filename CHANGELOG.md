@@ -1,5 +1,14 @@
 # Changelog
 
+## 4.19.4
+- **Silent input warning.** If a quick take or capture runs for 4 seconds on an input with no signal,
+  a bar explains why:
+  - On a mic input with +48V off, it offers **Turn on +48V** (with a "turn your speakers down first"
+    note).
+  - Otherwise, it points to the cable, the gain knob, and the F/R or Mic/Ln button.
+- Takes saved as MP3, AAC, Opus or Ogg are normalized to −2 dB instead of −1 dB, because lossy
+  encoders overshoot a little.
+
 ## 4.19.3
 - **After recording** (Quick take and Capture): leave the take as is, **normalize** it (the loudest point
   goes to −1 dB, volume only), or **even it out** with a gentle compressor and then normalize.

@@ -46,7 +46,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QPointF, QRectF
 
 APP_NAME = "Mbox Control"
-VERSION = "4.19.3"
+VERSION = "4.19.4"
 UPDATE_REPO = ""          # "owner/mbox-control" once the project is on GitHub; empty = no online checks
 HOME = Path.home()
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -6022,6 +6022,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.hist_timer.setSingleShot(True)
         self.hist_timer.timeout.connect(self.record_mix_state)
         QtCore.QTimer.singleShot(1500, self.record_mix_state)
+        self.dead_timer = QtCore.QTimer(self)
+        self.dead_timer.timeout.connect(self.watch_dead_input)
+        self.dead_timer.start(1000)
         self.auto_active = {}
         self.auto_timer = QtCore.QTimer(self)
         self.auto_timer.timeout.connect(self.check_auto_scenes)
@@ -11160,6 +11163,40 @@ class MainWindow(QtWidgets.QMainWindow):
         self.take_mode, self.take_proc = False, None
         self.show_last_take()
 
+    def watch_dead_input(self):
+        """A take or capture running on a silent input for 4 s: say why (usually +48V or the F/R button)."""
+        runs = []
+        if getattr(self, "take_mode", False):
+            runs.append(("take", self.source_items(self.app_state.get("take_src", "mono:Analog-A-1"))))
+        if getattr(self, "retro", None):
+            runs.append(("retro", self.source_items(getattr(self, "retro_choice", ""))))
+        live = self.__dict__.setdefault("dead_watch", {})
+        for owner in [o for o in live if o not in dict(runs)]:
+            live.pop(owner)
+        for owner, items in runs:
+            st = live.setdefault(owner, {"t": time.time(), "max": -90.0, "warned": False})
+            st["max"] = max([st["max"]] + [self.item_db(i) for i in items])
+            if st["warned"] or time.time() - st["t"] < 4 or st["max"] > -55:
+                continue
+            st["warned"] = True
+            self.warn_dead_input(items)
+
+    def warn_dead_input(self, items):
+        n = int(items[0][-1])
+        own = self.label(f"in{n - 1}", "")
+        name = f"Input {n}" + (f" ({own})" if own else "")
+        ph = self.ctrl("phantom-powering")
+        if n <= 4 and ph and not ph.values[0]:
+            self.hint.offer(f"<b>Nothing is coming in on {name}.</b> A condenser mic (like an AT2020) needs "
+                            "+48V phantom power. Turn your speakers down first — switching it on can pop.",
+                            [("Turn on +48V", self.toggle_phantom)])
+        else:
+            jack = "F/R" if n <= 2 else "Mic/Ln" if n <= 4 else ""
+            self.hint.offer(f"<b>Nothing is coming in on {name}.</b> Check the cable, the gain knob" +
+                            (f" and the {jack} button (Hardware → The box shows which jack the app thinks "
+                             "is in use)." if jack else "."), [])
+        self.announce("dialog-warning", f"Nothing coming in on {name}", 8000)
+
     def take_hear_toggled(self, on):
         self.app_state["take_hear"] = on
         self.save_app_state()
@@ -11172,8 +11209,9 @@ class MainWindow(QtWidgets.QMainWindow):
         path = Path(path)
         mode = self.app_state.get("take_polish", "none")
         if polish and mode != "none" and path.exists():
+            lossy = key.startswith("mp3") or key in ("aac", "opus", "ogg")
             try:
-                polish_take(path, mode)
+                polish_take(path, mode, target=-2.0 if lossy else -1.0)    # lossy encoders overshoot a little
             except (RuntimeError, OSError) as e:
                 self.toast(f"Saved as recorded — couldn't {mode} it: {e}", 8000)
         if key == "flac" or not path.exists():
