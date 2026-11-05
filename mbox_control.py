@@ -46,7 +46,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QPointF, QRectF
 
 APP_NAME = "Mbox Control"
-VERSION = "4.17"
+VERSION = "4.18"
 UPDATE_REPO = ""          # "owner/mbox-control" once the project is on GitHub; empty = no online checks
 HOME = Path.home()
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -377,7 +377,7 @@ class Backend:
 
     # A runaway loop that keeps sending the same command can lock the Mbox up until it's power-cycled.
     # These limits are far above anything a person or a scene does, and they log where the loop came from.
-    REPEAT_LIMIT, REPEAT_WINDOW = 4, 10.0      # same control + same value, 4× in 10 s → refuse
+    REPEAT_LIMIT, REPEAT_WINDOW = 8, 10.0      # same control + same value, 8× in 10 s → refuse
     BURST_LIMIT, BURST_WINDOW = 200, 3.0       # any 200 writes in 3 s → refuse for a moment
 
     def _guard(self, ctrl, s):
@@ -750,7 +750,7 @@ CARD_ICONS = {   # card title → icon names (KDE Breeze first, then freedesktop
     "EQ for each speaker set": ["view-media-equalizer"], "Tone": ["view-media-equalizer", "audio-volume-high"],
     "Clean mic (voice chain)": ["audio-input-microphone", "view-media-equalizer"],
     "Capture what I just played": ["document-save", "media-record"], "Multitrack": ["view-split-left-right", "media-record"],
-    "Level check": ["audio-volume-high", "view-statistics"], "Practice player": ["media-repeat-all", "media-playback-start"], "Metronome": ["chronometer", "clock", "media-playback-start"],
+    "Level check": ["audio-volume-high", "view-statistics"], "Automatic scenes": ["system-run", "media-playlist-shuffle"], "Practice player": ["media-repeat-all", "media-playback-start"], "Metronome": ["chronometer", "clock", "media-playback-start"],
 }
 TAB_ICONS = {
     "Rip": ["media-record"], "Quick take": ["audio-input-microphone"], "Practice": ["media-repeat-all", "view-refresh"], "Split & tag": ["edit-cut"],
@@ -4109,6 +4109,11 @@ class SignalMap(QtWidgets.QWidget):
                 box(r, title, "your apps — click to see which", None, self.level_db(key))
             else:
                 box(r, sub or title, title if sub else "", None, self.level_db(key))
+            tag = self.win.item_colour(key) if hasattr(self.win, "item_colour") else ""
+            if tag:                                  # 4.18 colour tag: a stripe down the left edge
+                p.setPen(Qt.NoPen)
+                p.setBrush(QtGui.QColor(tag))
+                p.drawRoundedRect(QRectF(r.left() + 3, r.top() + 8, 4, r.height() - 16), 2, 2)
         for k in mixes:
             users = [n for f_, n, _ in outs if (k, f_) in e_out]
             box(pos[("mix", k)], f"Stereo Mix {k}", "→ " + ", ".join(users), ACCENT)
@@ -5280,6 +5285,151 @@ class PracticeWave(WaveformView):
             x = self._x(self.play_t)
             p.drawLine(QPointF(x, 0), QPointF(x, self.height()))
 
+# ================================================================== 4.18: auto scenes, mixer history, compact mixer
+
+MIX_HISTORY_NAMES = ("mixer-source-gain", "mixer-source", "output-source")
+
+
+def running_programs():
+    """Names of programs running right now (from /proc, no subprocess)."""
+    names = set()
+    for d in Path("/proc").iterdir():
+        if not d.name.isdigit():
+            continue
+        try:
+            names.add((d / "comm").read_text().strip().lower())
+            exe = os.readlink(d / "exe")
+            names.add(Path(exe).name.lower())
+        except OSError:
+            continue
+    return names
+
+
+AUTO_SCENE_HINTS = [("obs", "OBS Studio"), ("guitarix", "Guitarix"), ("audacity", "Audacity"),
+                    ("ardour", "Ardour"), ("reaper", "REAPER"), ("bitwig-studio", "Bitwig Studio"),
+                    ("discord", "Discord"), ("zoom", "Zoom"), ("steam", "Steam"), ("mixxx", "Mixxx"),
+                    ("kdenlive", "Kdenlive"), ("vlc", "VLC"), ("spotify", "Spotify")]
+
+
+class CompactMixer(QtWidgets.QWidget):
+    """A small always-on-top mixer for one output's mix: name, level, meter and mute per source."""
+
+    def __init__(self, win):
+        super().__init__(None, Qt.Tool | Qt.WindowStaysOnTopHint)
+        self.win = win
+        self.setWindowTitle("Mbox mixer")
+        self.setWindowIcon(app_icon())
+        self.resize(360, 420)
+        v = QtWidgets.QVBoxLayout(self)
+        v.setContentsMargins(12, 10, 12, 10)
+        top = QtWidgets.QHBoxLayout()
+        self.out = QtWidgets.QComboBox()
+        for name, first, _ in OUTPUT_PAIRS:
+            own = win.label(f"out{first}", "")
+            self.out.addItem(own or name, first)
+        self.out.currentIndexChanged.connect(lambda _: self.rebuild())
+        top.addWidget(self.out, 1)
+        self.only = QtWidgets.QCheckBox("In use")
+        self.only.setChecked(True)
+        self.only.toggled.connect(lambda _: self.rebuild())
+        top.addWidget(self.only)
+        v.addLayout(top)
+        self.rows_w = QtWidgets.QWidget()
+        self.rows = QtWidgets.QGridLayout(self.rows_w)
+        self.rows.setColumnStretch(2, 1)
+        self.rows.setVerticalSpacing(6)
+        sc = QtWidgets.QScrollArea()
+        sc.setWidgetResizable(True)
+        sc.setFrameShape(QtWidgets.QFrame.NoFrame)
+        sc.setWidget(self.rows_w)
+        v.addWidget(sc, 1)
+        self.note = muted("")
+        v.addWidget(self.note)
+        self.items = []
+        self.timer = QtCore.QTimer(self)
+        self.timer.timeout.connect(self.tick)
+        self.timer.start(120)
+        self.sig = None
+        self.rebuild()
+
+    def mix(self):
+        kind, k, _ = self.win.pair_source(self.out.currentData())
+        return k if kind == "mix" else None
+
+    def rebuild(self):
+        while self.rows.count():
+            it = self.rows.takeAt(0)
+            if it.widget():
+                it.widget().hide()
+                it.widget().deleteLater()
+        self.items = []
+        k = self.mix()
+        if k is None:
+            self.note.setText("This output isn't playing a Stereo Mix — pick another, or set it on the Mixer page.")
+            return
+        self.note.setText(f"Stereo Mix {k}. Changes here are the same as on the Mixer page.")
+        w = self.win
+        r = 0
+        for item in [f"Analog-A-{n}" for n in range(1, 7)] + ["S/PDIF-1", "S/PDIF-2"] + \
+                [f"Stream-{n}" for n in range(1, 9)] + ["Reverb-1", "Reverb-2"]:
+            slot = w.slot_of(item)
+            if slot is None:
+                continue
+            l_, r_ = w.mix_lr(k, slot)
+            if self.only.isChecked() and not (l_ or r_) and f"{k}:{item}" not in w.app_state.get("mutes", {}):
+                continue
+            col = w.item_colour(item)
+            dot = QtWidgets.QLabel("●")
+            dot.setStyleSheet(f"color:{col or ink(70).name()}; font-size:14pt;")
+            self.rows.addWidget(dot, r, 0)
+            name = QtWidgets.QLabel(w.item_title(item))
+            name.setMinimumWidth(90)
+            self.rows.addWidget(name, r, 1)
+            sl = QtWidgets.QSlider(Qt.Horizontal)
+            sl.setRange(-60, 6)
+            g = math.hypot(l_, r_)
+            sl.setValue(max(-60, round(20 * math.log10(g / UNITY))) if g else -60)
+            sl.setToolTip("dB — far left is off")
+            sl.valueChanged.connect(lambda v, it=item: self.set_gain(it, v))
+            self.rows.addWidget(sl, r, 2)
+            bar = QtWidgets.QProgressBar()
+            bar.setTextVisible(False)
+            bar.setFixedSize(50, 8)
+            self.rows.addWidget(bar, r, 3)
+            mute = QtWidgets.QToolButton()
+            mute.setText("M")
+            mute.setCheckable(True)
+            mute.setChecked(bool(w.app_state.get("mutes", {}).get(f"{k}:{item}")))
+            mute.toggled.connect(lambda on, it=item: self.win.set_strip_mute(self.mix(), it, on))
+            self.rows.addWidget(mute, r, 4)
+            self.items.append((item, sl, bar))
+            r += 1
+        self.sig = self.state_sig()
+
+    def state_sig(self):
+        k = self.mix()
+        return (k, tuple(self.win.mix_lr(k, self.win.slot_of(i)) for i, _, _ in self.items) if k else ())
+
+    def set_gain(self, item, db):
+        k = self.mix()
+        slot = self.win.slot_of(item)
+        if k is None or slot is None:
+            return
+        g = 0 if db <= -60 else int(UNITY * 10 ** (db / 20))
+        pan = self.win.app_state.get("pans", {}).get(f"{k}:{item}", 0)
+        self.win.mix_set_lr(k, slot, *from_pan(g, pan))
+        self.sig = self.state_sig()
+
+    def tick(self):
+        if not self.isVisible():
+            return
+        for item, _, bar in self.items:
+            db = self.win.item_db(item) if item.startswith(("Analog", "S/PDIF")) else \
+                meter_db(self.win.input_level(item))
+            bar.setValue(int(max(0, min(100, (db + 60) / 60 * 100))))
+        if self.state_sig() != self.sig:          # changed elsewhere (Mixer page, a scene, MIDI)
+            self.rebuild()
+
 # ================================================================== main window
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -5426,6 +5576,16 @@ class MainWindow(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(2000, self.check_update)
         QtCore.QTimer.singleShot(900, self.refresh_health)
         self.osd = Osd()
+        self.mix_hist, self.mix_pos = [], -1
+        self.ab_slots, self.ab_active = {}, "A"
+        self.hist_timer = QtCore.QTimer(self)
+        self.hist_timer.setSingleShot(True)
+        self.hist_timer.timeout.connect(self.record_mix_state)
+        QtCore.QTimer.singleShot(1500, self.record_mix_state)
+        self.auto_active = {}
+        self.auto_timer = QtCore.QTimer(self)
+        self.auto_timer.timeout.connect(self.check_auto_scenes)
+        self.auto_timer.start(3000)
         QtCore.QTimer.singleShot(3000, self.apply_eq)
         QtCore.QTimer.singleShot(1200, self.start_rules_watch)
         self.sniff_timer = QtCore.QTimer(self)
@@ -6288,6 +6448,14 @@ class MainWindow(QtWidgets.QMainWindow):
             e.editingFinished.connect(lambda r=r, e=e: (self.set_label(f"in{r}", e.text().strip()),
                                                         self.save_setup()))
             g.addWidget(e, r, 1)
+            cb = QtWidgets.QToolButton()                # 4.18 colour tag
+            cb.setFixedSize(22, 22)
+            cb.setToolTip("Colour tag — shown on the mixer, the compact mixer and the signal map.")
+            col = self.item_colour(item)
+            cb.setStyleSheet(f"background:{col}; border-radius:9px;" if col else
+                             f"border:1px dashed {SUBTLE}; border-radius:9px;")
+            cb.clicked.connect(lambda _=False, it=item, b=cb: self.pick_colour(it, b))
+            g.addWidget(cb, r, 2)
         g.setColumnStretch(1, 1)
         gl.addLayout(g)
         lay.addWidget(gc)
@@ -7426,6 +7594,9 @@ class MainWindow(QtWidgets.QMainWindow):
         save_json(STATE_FILE, self.app_state)
 
     def write(self, c, values):
+        if c.name in MIX_HISTORY_NAMES and not getattr(self, "hist_applying", False) and \
+                hasattr(self, "hist_timer"):
+            self.hist_timer.start(700)                  # a mixer change: remember it once it settles
         try:
             self.backend.write(c, values)
         except Exception as e:  # noqa: BLE001
@@ -8119,7 +8290,43 @@ class MainWindow(QtWidgets.QMainWindow):
         outer.setSpacing(10)
         head = QtWidgets.QLabel("Mixer")
         head.setObjectName("h1")
-        outer.addWidget(head)
+        hrow = QtWidgets.QHBoxLayout()
+        hrow.addWidget(head)
+        hrow.addStretch(1)
+        self.undo_btn = QtWidgets.QToolButton()
+        self.undo_btn.setText("↶ Undo")
+        self.undo_btn.setToolTip("Undo the last mixer change (Ctrl+Z)")
+        self.undo_btn.clicked.connect(lambda: self.mix_history_step(-1))
+        self.redo_btn = QtWidgets.QToolButton()
+        self.redo_btn.setText("↷ Redo")
+        self.redo_btn.setToolTip("Redo (Ctrl+Shift+Z)")
+        self.redo_btn.clicked.connect(lambda: self.mix_history_step(+1))
+        hrow.addWidget(self.undo_btn)
+        hrow.addWidget(self.redo_btn)
+        hrow.addSpacing(14)
+        self.ab_btns = {}
+        for L in "AB":
+            b = QtWidgets.QToolButton()
+            b.setText(L)
+            b.setCheckable(True)
+            b.setMinimumWidth(34)
+            b.setToolTip("A/B compare: tweak a mix on A, switch to B and try something else, then flick between "
+                         "them to hear which is better. Whatever you change goes into the lit one.")
+            b.clicked.connect(lambda _=False, L=L: self.ab_switch(L))
+            b.setStyleSheet(f"QToolButton:checked {{ background:{ACCENT}; color:white; border-radius:6px; }}")
+            hrow.addWidget(b)
+            self.ab_btns[L] = b
+        self.ab_btns["A"].setChecked(True)
+        hrow.addSpacing(14)
+        cm = QtWidgets.QToolButton()
+        cm.setText("⧉ Compact mixer")
+        cm.setToolTip("A small always-on-top mixer to keep beside your DAW or game.")
+        cm.clicked.connect(self.open_compact_mixer)
+        hrow.addWidget(cm)
+        outer.addLayout(hrow)
+        for keys, step in (("Ctrl+Z", -1), ("Ctrl+Shift+Z", +1), ("Ctrl+Y", +1)):
+            QtGui.QShortcut(QtGui.QKeySequence(keys), w, activated=lambda s=step: self.mix_history_step(s),
+                            context=Qt.WidgetWithChildrenShortcut)
 
         self.pair_tabs = QtWidgets.QTabBar()
         self.pair_tabs.setExpanding(False)
@@ -8188,6 +8395,210 @@ class MainWindow(QtWidgets.QMainWindow):
         self.swap_btn.toggled.connect(self.swap_toggled)
         self.refreshers.append(self.refresh_mixer)
         return w
+
+    # ---------------------------------------------------------------- 4.18: mixer history, A/B, compact, colours
+    def mix_state(self):
+        return {"ctrls": {c.key: list(c.values) for c in self.ctrls.values() if c.name in MIX_HISTORY_NAMES},
+                "mutes": json.loads(json.dumps(self.app_state.get("mutes", {}))),
+                "solo": json.loads(json.dumps(self.app_state.get("solo", {})))}
+
+    def record_mix_state(self):
+        st = self.mix_state()
+        hist = self.mix_hist
+        if hist and hist[self.mix_pos] == st:
+            return
+        del hist[self.mix_pos + 1:]
+        hist.append(st)
+        del hist[:-100]                                 # keep the last 100 changes
+        self.mix_pos = len(hist) - 1
+        self.refresh_history_buttons()
+
+    def apply_mix_state(self, st):
+        keyed = {c.key: c for c in self.ctrls.values()}
+        self.hist_applying = True
+        try:
+            for key, vals in st["ctrls"].items():
+                c = keyed.get(key)
+                if c is not None and c.values != vals:
+                    try:
+                        self.backend.write(c, vals)
+                        c.values = list(vals)
+                    except Exception:  # noqa: BLE001
+                        pass
+            self.app_state["mutes"], self.app_state["solo"] = st["mutes"], st["solo"]
+            self.save_app_state()
+        finally:
+            self.hist_applying = False
+        self.run_refreshers()
+
+    def mix_history_step(self, step):
+        if self.hist_timer.isActive():                  # a change still settling: record it first
+            self.hist_timer.stop()
+            self.record_mix_state()
+        new = self.mix_pos + step
+        if not 0 <= new < len(self.mix_hist):
+            self.toast("Nothing to undo." if step < 0 else "Nothing to redo.", 2000)
+            return
+        self.mix_pos = new
+        self.apply_mix_state(self.mix_hist[new])
+        self.refresh_history_buttons()
+
+    def refresh_history_buttons(self):
+        if hasattr(self, "undo_btn"):
+            self.undo_btn.setEnabled(self.mix_pos > 0)
+            self.redo_btn.setEnabled(self.mix_pos < len(self.mix_hist) - 1)
+
+    def ab_switch(self, letter):
+        cur = self.ab_active
+        for L, b in self.ab_btns.items():
+            b.setChecked(L == letter)
+        if letter == cur:
+            return
+        self.ab_slots[cur] = self.mix_state()
+        target = self.ab_slots.get(letter)
+        self.ab_active = letter
+        if target is None:                              # first visit: B starts as a copy of A
+            self.ab_slots[letter] = self.mix_state()
+            self.toast(f"{letter} starts as a copy — change things, then flick back to compare.", 5000)
+            return
+        self.apply_mix_state(target)
+        self.record_mix_state()
+
+    def open_compact_mixer(self):
+        if getattr(self, "compact", None) is None:
+            self.compact = CompactMixer(self)
+        self.compact.rebuild()
+        self.compact.show()
+        self.compact.raise_()
+
+    def set_strip_mute(self, k, item, on):
+        slot = self.slot_of(item)
+        if k is None or slot is None:
+            return
+        key = f"{k}:{item}"
+        mutes = self.app_state["mutes"]
+        if on and key not in mutes:
+            mutes[key] = list(self.mix_lr(k, slot))
+            self.mix_set_lr(k, slot, 0, 0)
+        elif not on and key in mutes:
+            l_, r_ = mutes.pop(key)
+            if not self.is_soloed_out(k, item):
+                self.mix_set_lr(k, slot, l_, r_)
+        self.save_app_state()
+        self.run_refreshers()
+
+    def item_colour(self, item):
+        col = self.label(f"stripcol:{item}", "")
+        if not col:
+            m = re.fullmatch(r"(Analog-A-|Stream-|S/PDIF-|Reverb-)(\d+)", item)
+            if m:
+                n = int(m.group(2))
+                col = self.label(f"stripcol:{m.group(1)}{n + 1 if n % 2 else n - 1}", "")
+        return col
+
+    def item_title(self, item):
+        custom = self.label(f"strip:{item}", "")
+        m = re.fullmatch(r"Analog-A-(\d)", item)
+        tag = self.label(f"in{int(m.group(1)) - 1}", "") if m else ""
+        return custom or tag or friendly(item)
+
+    def pick_colour(self, item, button=None):
+        cur = QtGui.QColor(self.item_colour(item) or ACCENT)
+        c = QtWidgets.QColorDialog.getColor(cur, self, f"Colour for {friendly(item)}")
+        if c.isValid():
+            self.set_label(f"stripcol:{item}", c.name())
+            if button:
+                button.setStyleSheet(f"background:{c.name()}; border-radius:9px;")
+            self.run_refreshers()
+
+    # ---------------------------------------------------------------- 4.18: automatic scenes
+    def scene_choices(self):
+        out = [(s["id"], s["name"].strip()) for s in SCENES]
+        out += [(f"user:{n}", f"⭐ {n}") for n in self.user_scenes()]
+        return out
+
+    def check_auto_scenes(self):
+        rules = self.app_state.get("auto_scenes", [])
+        if not rules or self.disconnected:
+            return
+        running = running_programs()
+        active = self.auto_active
+        for rule in rules:
+            proc = rule["proc"].lower()
+            up = proc in running
+            if up and proc not in active:
+                active[proc] = self.snapshot() if rule.get("revert", True) else None
+                sid = rule["scene"]
+                if sid.startswith("user:"):
+                    self.apply_snapshot(load_json(SCENES_DIR / f"{sid[5:]}.json", {}))
+                else:
+                    self.apply_scene(sid)
+                    self.run_refreshers()
+                name = dict(self.scene_choices()).get(sid, sid)
+                self.toast(f"{rule.get('label') or proc} opened → {name}", 6000)
+            elif not up and proc in active:
+                snap = active.pop(proc)
+                if snap and not active:                 # only put things back when no other rule is active
+                    self.apply_snapshot(snap)
+                    self.toast(f"{rule.get('label') or proc} closed — settings put back.", 6000)
+
+    def build_auto_scenes_card(self, lay):
+        c, l = card("Automatic scenes", "Switch scenes by themselves when an app opens — and put everything back "
+                                        "when it closes.")
+        self.auto_rows = QtWidgets.QGridLayout()
+        self.auto_rows.setColumnStretch(1, 1)
+        l.addLayout(self.auto_rows)
+        add = QtWidgets.QHBoxLayout()
+        self.auto_app = QtWidgets.QComboBox()
+        self.auto_app.setEditable(True)
+        self.auto_app.setToolTip("Pick an app or type its program name (the name you'd see in a task manager).")
+        for proc, label in AUTO_SCENE_HINTS:
+            self.auto_app.addItem(label, proc)
+        add.addWidget(QtWidgets.QLabel("When"))
+        add.addWidget(self.auto_app, 1)
+        add.addWidget(QtWidgets.QLabel("opens, use"))
+        self.auto_scene = QtWidgets.QComboBox()
+        for sid, name in self.scene_choices():
+            self.auto_scene.addItem(name, sid)
+        add.addWidget(self.auto_scene, 1)
+        b = QtWidgets.QPushButton("Add")
+        b.clicked.connect(self.add_auto_scene)
+        add.addWidget(b)
+        l.addLayout(add)
+        lay.addWidget(c)
+        self.refresh_auto_scenes()
+
+    def add_auto_scene(self):
+        i = self.auto_app.currentIndex()
+        text = self.auto_app.currentText().strip()
+        proc = self.auto_app.itemData(i) if i >= 0 and self.auto_app.itemText(i) == text else text
+        if not proc:
+            return
+        rules = self.app_state.setdefault("auto_scenes", [])
+        rules[:] = [r for r in rules if r["proc"].lower() != proc.lower()]
+        rules.append({"proc": proc.lower(), "label": text, "scene": self.auto_scene.currentData(), "revert": True})
+        self.save_app_state()
+        self.refresh_auto_scenes()
+
+    def refresh_auto_scenes(self):
+        while self.auto_rows.count():
+            it = self.auto_rows.takeAt(0)
+            if it.widget():
+                it.widget().hide()
+                it.widget().deleteLater()
+        names = dict(self.scene_choices())
+        for r, rule in enumerate(self.app_state.get("auto_scenes", [])):
+            self.auto_rows.addWidget(QtWidgets.QLabel(f"<b>{html_escape(rule.get('label') or rule['proc'])}</b>"), r, 0)
+            self.auto_rows.addWidget(QtWidgets.QLabel("→ " + names.get(rule["scene"], rule["scene"])), r, 1)
+            rv = QtWidgets.QCheckBox("put back when it closes")
+            rv.setChecked(rule.get("revert", True))
+            rv.toggled.connect(lambda on, rule=rule: (rule.__setitem__("revert", on), self.save_app_state()))
+            self.auto_rows.addWidget(rv, r, 2)
+            x = QtWidgets.QToolButton()
+            x.setText("✕")
+            x.clicked.connect(lambda _=False, rule=rule: (self.app_state["auto_scenes"].remove(rule),
+                                                         self.save_app_state(), self.refresh_auto_scenes()))
+            self.auto_rows.addWidget(x, r, 3)
 
     def current_pair(self):
         return OUTPUT_PAIRS[self.pair_tabs.currentIndex()]
@@ -11298,6 +11709,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "Installed ✓" if HEADPHONES_CONF.exists() else "Not installed"))
         lay.addWidget(hc)
 
+        self.build_auto_scenes_card(lay)
         kc, kl = card("Keyboard shortcuts",
                       "In the app: Ctrl+M mute speakers · Ctrl+1…9 scenes · Ctrl+Shift+A/B/C speaker sets · "
                       "Ctrl+↑/↓ speaker volume. For shortcuts that work anywhere (even with the window "
@@ -11477,7 +11889,7 @@ class MainWindow(QtWidgets.QMainWindow):
         out = self.tabify(w, lay, [("Sound", ["Audio engine", "Inputs", "Output trims", "Mixer",
                                                "Headphones output for apps"]),
                                     ("Mbox", ["Front-panel buttons", "Standalone mode"]),
-                                    ("Controls", ["Keyboard shortcuts", "MIDI controller"]),
+                                    ("Controls", ["Automatic scenes", "Keyboard shortcuts", "MIDI controller"]),
                                     ("App", [])])
         t = out.findChild(QtWidgets.QTabWidget)
         setup = self._build_setup()

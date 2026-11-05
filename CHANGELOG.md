@@ -1,5 +1,17 @@
 # Changelog
 
+## 4.18
+- **Automatic scenes** (Settings → Controls): pick an app and a scene, and the scene switches on when the
+  app opens. When the app closes, your previous settings come back (you can turn this off per app).
+- **Mixer undo/redo:** Undo and Redo buttons on the Mixer, plus Ctrl+Z and Ctrl+Shift+Z / Ctrl+Y. Covers
+  faders, pans, routing, mutes and solo, and remembers the last 100 changes.
+- **A/B compare:** flick between two versions of a mix. B starts as a copy of A.
+- **Compact mixer:** a small separate window with one slider per input, level bars and mute buttons,
+  and an "In use" filter. It updates when anything else changes the mix.
+- **Colour tags:** pick a colour per input in Your setup, or from a mixer channel's right-click menu. The
+  colour shows on the mixer, the compact mixer and the signal map. A stereo pair shares one colour.
+- Write-loop guard loosened slightly (8 identical writes in 10 s) so fast undo/redo never trips it.
+
 ## 4.17
 - **Practice player** (Record → Practice) for learning tunes by ear:
   - Slow down to 40% or speed up to 125% without changing the pitch (Rubber Band when ffmpeg has it).

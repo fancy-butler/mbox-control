@@ -119,10 +119,14 @@ def test_fast_meters_can_be_switched_off(monkeypatch):
 
 def test_write_storm_is_blocked_and_logged(win, tmp_path, monkeypatch):
     monkeypatch.setattr(mc, "CRASH_LOG", tmp_path / "crash.log")
+    from PySide6 import QtCore
+    for t in win.findChildren(QtCore.QTimer):        # no background writes (e.g. the meter kick) mid-test
+        t.stop()
     c = win.ctrl("metering")
     win.backend._hist = []                           # forget the app's own start-up writes
     sent = []
-    monkeypatch.setattr(win.backend, "_run", lambda *a: sent.append(a) or "")
+    monkeypatch.setattr(win.backend, "_run",            # the meter poller's reads don't count
+                        lambda *a: (a[0] == "cset" and sent.append(a)) or "")
     for _ in range(mc.Backend.REPEAT_LIMIT):
         win.backend.write(c, [True])
     import pytest
