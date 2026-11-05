@@ -46,7 +46,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QPointF, QRectF
 
 APP_NAME = "Mbox Control"
-VERSION = "4.19.2"
+VERSION = "4.19.3"
 UPDATE_REPO = ""          # "owner/mbox-control" once the project is on GitHub; empty = no online checks
 HOME = Path.home()
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -4541,6 +4541,54 @@ def convert_target(src, key, out_dir=None):
     if dst.resolve() == src.resolve():
         dst = folder / f"{src.stem} (converted).{ext}"
     return dst
+
+
+TAKE_POLISH = [("none", "Leave as is"),
+               ("normalize", "Normalize — loudest point at −1 dB"),
+               ("compress", "Even out + normalize (gentle compressor)")]
+
+
+def peak_db(path):
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", str(path), "-af", "volumedetect", "-f", "null",
+                        "-"], capture_output=True, text=True)
+    m = re.search(r"max_volume:\s*(-?[\d.]+) dB", r.stderr)
+    return float(m.group(1)) if m else None
+
+
+def polish_take(path, mode, target=-1.0):
+    """Normalize (peak → −1 dB) or gently compress then normalize a take, in place (FLAC, same bit depth)."""
+    path = Path(path)
+    if mode not in ("normalize", "compress"):
+        return path
+    src = path
+    tmp = path.with_name(path.stem + ".polish.flac")
+    if mode == "compress":                       # level it to full scale first, so the threshold means the same
+        pre = peak_db(path)                      # thing for a quiet take and a loud one; then ~3:1 above −20 dB
+        pre_gain = (-1.0 - pre) if pre is not None and pre > -90 else 0.0
+        r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(path), "-af",
+                            f"volume={pre_gain:.2f}dB,"
+                            "acompressor=threshold=-20dB:ratio=3:attack=8:release=180:knee=6",
+                            "-c:a", "flac", "-sample_fmt", "s32", str(tmp)], capture_output=True, text=True)
+        if r.returncode != 0:
+            tmp.unlink(missing_ok=True)
+            raise RuntimeError((r.stderr or "compressor failed").strip()[-200:])
+        src = tmp
+    peak = peak_db(src)
+    if peak is None or peak < -90:               # silence: nothing to normalize
+        if src is tmp:
+            tmp.replace(path)
+        return path
+    gain = target - peak
+    out = path.with_name(path.stem + ".norm.flac")
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src), "-af",
+                        f"volume={gain:.2f}dB", "-c:a", "flac", "-sample_fmt", "s32", str(out)],
+                       capture_output=True, text=True)
+    tmp.unlink(missing_ok=True)
+    if r.returncode != 0:
+        out.unlink(missing_ok=True)
+        raise RuntimeError((r.stderr or "normalize failed").strip()[-200:])
+    out.replace(path)
+    return path
 
 
 class ConvertJob(QtCore.QThread):
@@ -10590,7 +10638,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except RuntimeError as e:
             QtWidgets.QMessageBox.warning(self, APP_NAME, f"Couldn't save it: {e}")
             return
-        path = self.finish_format(path)
+        path = self.finish_format(path, polish=True)
         self.app_state["last_take"] = str(path)
         self.save_app_state()
         self.show_last_take()
@@ -11065,6 +11113,22 @@ class MainWindow(QtWidgets.QMainWindow):
                                   "Put back the way it was when the take stops.")
         self.take_hear.toggled.connect(self.take_hear_toggled)
         l.addWidget(self.take_hear)
+        prow = QtWidgets.QHBoxLayout()
+        prow.addWidget(QtWidgets.QLabel("After recording"))
+        self.take_polish = QtWidgets.QComboBox()
+        for key, label in TAKE_POLISH:
+            self.take_polish.addItem(label, key)
+        self.take_polish.setCurrentIndex(max(0, self.take_polish.findData(self.app_state.get("take_polish",
+                                                                                              "none"))))
+        self.take_polish.setToolTip("For quick takes and “Capture what I just played” (not multitrack — those "
+                                    "are for mixing). Normalize only changes the volume; “even out” also brings "
+                                    "quiet and loud notes closer together. Neither can undo clipping — set the "
+                                    "gain knob so peaks sit around −6 dB.")
+        self.take_polish.currentIndexChanged.connect(lambda _: (self.app_state.__setitem__(
+            "take_polish", self.take_polish.currentData()), self.save_app_state()))
+        prow.addWidget(self.take_polish)
+        prow.addStretch(1)
+        l.addLayout(prow)
         frow = QtWidgets.QHBoxLayout()
         frow.addWidget(QtWidgets.QLabel("Save takes as"))
         self.save_fmt = QtWidgets.QComboBox()
@@ -11102,10 +11166,16 @@ class MainWindow(QtWidgets.QMainWindow):
         if getattr(self, "take_mode", False):
             self.input_monitor("take", self.app_state.get("take_src", "mono:Analog-A-1"), on)
 
-    def finish_format(self, path):
-        """Takes are recorded as FLAC; turn them into the chosen format (and drop the FLAC)."""
+    def finish_format(self, path, polish=False):
+        """Takes are recorded as FLAC; polish them if asked, then turn them into the chosen format."""
         key = self.app_state.get("save_fmt", "flac")
         path = Path(path)
+        mode = self.app_state.get("take_polish", "none")
+        if polish and mode != "none" and path.exists():
+            try:
+                polish_take(path, mode)
+            except (RuntimeError, OSError) as e:
+                self.toast(f"Saved as recorded — couldn't {mode} it: {e}", 8000)
         if key == "flac" or not path.exists():
             return path
         dst = path.with_suffix("." + audio_format(key)[2])
@@ -11350,7 +11420,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.rec_btn.setText("●  Arm" if self.auto_rec.isChecked() else "●  Record")
         self.rec_info.setText("Source: " + self.rip_name())
         if ok and Path(path).exists():
-            path = self.finish_format(path)
+            path = self.finish_format(path, polish=True)
             self.app_state["last_take"] = str(path)
             self.save_app_state()
             self.take_level.setText(f"Saved {Path(path).name}")

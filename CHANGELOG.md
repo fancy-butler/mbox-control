@@ -1,5 +1,13 @@
 # Changelog
 
+## 4.19.3
+- **After recording** (Quick take and Capture): leave the take as is, **normalize** it (the loudest point
+  goes to −1 dB, volume only), or **even it out** with a gentle compressor and then normalize.
+  - "Even out" levels the take to full scale first, so it behaves the same however loud you played.
+    In testing, a 22 dB gap between soft and hard notes came out at 10 dB.
+  - Multitrack is left untouched, since those tracks are for mixing.
+  - This runs before conversion, so it works with any "Save takes as" format.
+
 ## 4.19.2
 - **Quick take: hear it while recording** (on by default). Plays the input through Outputs 1/2 straight
   from the Mbox's mixer, with no delay, and puts it back when the take stops. Quick take and Capture

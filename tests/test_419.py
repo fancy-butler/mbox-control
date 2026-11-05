@@ -128,3 +128,51 @@ def test_quick_take_and_capture_can_both_hear_the_same_input(win):
     win.input_monitor("take", "", False)
     assert win.mix_lr(1, slot) == (0, 0)
     assert win.take_hear.isChecked()
+
+
+@pytest.fixture
+def uneven(tmp_path):
+    """A take with a quiet first half (−30 dB) and a loud second half (−8 dB)."""
+    import numpy as np
+    t = np.arange(96000) / 48000
+    x = np.sin(2 * np.pi * 82 * t).astype(np.float32)
+    x[:48000] *= 0.0316
+    x[48000:] *= 0.398
+    p = tmp_path / "take.flac"
+    subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-f", "f32le", "-ar", "48000", "-ac", "1", "-i", "-",
+                    "-c:a", "flac", str(p)], input=x.tobytes(), check=True)
+    return p
+
+
+def _halves_db(path):
+    import numpy as np
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-f", "f32le", "-ac", "1", "-"],
+                         capture_output=True).stdout
+    x = np.frombuffer(raw, np.float32)
+    rms = lambda v: 20 * np.log10(np.sqrt(np.mean(v ** 2)))     # noqa: E731
+    return rms(x[12000:36000]), rms(x[60000:84000])
+
+
+def test_normalize_puts_the_peak_at_minus_one(uneven):
+    q0, l0 = _halves_db(uneven)
+    mc.polish_take(uneven, "normalize")
+    assert abs(mc.peak_db(uneven) - (-1.0)) < 0.3
+    q1, l1 = _halves_db(uneven)
+    assert abs((l1 - q1) - (l0 - q0)) < 0.5           # loud/quiet balance unchanged
+
+
+def test_even_out_brings_quiet_and_loud_closer(uneven):
+    q0, l0 = _halves_db(uneven)
+    mc.polish_take(uneven, "compress")
+    q1, l1 = _halves_db(uneven)
+    assert (l1 - q1) < (l0 - q0) - 6                  # the gap shrinks by several dB
+    assert abs(mc.peak_db(uneven) - (-1.0)) < 0.3
+    assert not list(uneven.parent.glob("*.polish.*")) and not list(uneven.parent.glob("*.norm.*"))
+
+
+def test_takes_are_polished_before_converting(win, uneven):
+    win.app_state["take_polish"] = "normalize"
+    win.app_state["save_fmt"] = "wav24"
+    out = win.finish_format(uneven, polish=True)
+    assert out.suffix == ".wav" and abs(mc.peak_db(out) - (-1.0)) < 0.3
+    assert win.take_polish.count() == 3

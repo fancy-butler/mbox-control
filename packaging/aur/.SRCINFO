@@ -1,6 +1,6 @@
 pkgbase = mbox-control
 	pkgdesc = Unofficial modern control panel for the Avid Mbox Pro 3 (FireWire): mixer, routing, ripping, guitar mode
-	pkgver = 4.19.2
+	pkgver = 4.19.3
 	pkgrel = 1
 	url = https://github.com/CHANGE_ME/mbox-control
 	arch = any
@@ -22,7 +22,7 @@ pkgbase = mbox-control
 	optdepends = chromaprint: identify songs in rips
 	optdepends = avahi: AirPlay speakers
 	optdepends = qpwgraph: see and change PipeWire connections by hand
-	source = mbox-control-4.19.2.tar.gz::https://github.com/CHANGE_ME/mbox-control/archive/refs/tags/v4.19.2.tar.gz
+	source = mbox-control-4.19.3.tar.gz::https://github.com/CHANGE_ME/mbox-control/archive/refs/tags/v4.19.3.tar.gz
 	sha256sums = SKIP
 
 pkgname = mbox-control
