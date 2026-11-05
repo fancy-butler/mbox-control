@@ -46,7 +46,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QPointF, QRectF
 
 APP_NAME = "Mbox Control"
-VERSION = "4.18"
+VERSION = "4.18.1"
 UPDATE_REPO = ""          # "owner/mbox-control" once the project is on GitHub; empty = no online checks
 HOME = Path.home()
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -1224,7 +1224,11 @@ class HardwareView(QtWidgets.QWidget):
               ("front2", QRectF(232, fy + 100, 62, 62), "combo", "Mic/DI 2 (front)"),
               ("hpA", QRectF(766, fy + 150, 30, 30), "trs_s", "Headphone A"),
               ("hpB", QRectF(856, fy + 150, 30, 30), "trs_s", "Headphone B"),
-              ("phantom", QRectF(696, fy + 140, 34, 26), "button", "+48V phantom")]
+              ("phantom", QRectF(696, fy + 140, 34, 26), "button", "+48V phantom"),
+              ("sw1", QRectF(114, fy + 140, 26, 20), "button", "Input 1 Front/Rear button"),
+              ("sw2", QRectF(314, fy + 140, 26, 20), "button", "Input 2 Front/Rear button"),
+              ("sw3", QRectF(414, fy + 140, 26, 20), "button", "Input 3 Mic/Line button"),
+              ("sw4", QRectF(514, fy + 140, 26, 20), "button", "Input 4 Mic/Line button")]
         by = self.FRONT_H + self.GAP
         S += [("foot", QRectF(24, by + 130, 34, 34), "trs", "Foot switch"),
               ("breakout", QRectF(110, by + 120, 70, 34), "db15", "Word clock / MIDI / S/PDIF breakout"),
@@ -1244,8 +1248,8 @@ class HardwareView(QtWidgets.QWidget):
               ("mic3", QRectF(958, by + 70, 70, 70), "xlr", "Mic input 3 (XLR)")]
 
     def jack_tag_key(self, jid):
-        m = {"front1": "in0", "line1": "in0", "front2": "in1", "line2": "in1",
-             "mic3": "in2", "line3": "in2", "mic4": "in3", "line4": "in3",
+        m = {"front1": "in0:a", "line1": "in0:b", "front2": "in1:a", "line2": "in1:b",
+             "mic3": "in2:a", "line3": "in2:b", "mic4": "in3:a", "line4": "in3:b",
              "aux5": "in4", "aux6": "in5", "auxmini": "in4", "hpA": "out6", "hpB": "out8"}
         if jid in m:
             return m[jid]
@@ -1329,7 +1333,10 @@ class HardwareView(QtWidgets.QWidget):
         # gain knobs + per-channel buttons
         for n, x in ((1, 150), (2, 350), (3, 450), (4, 550)):
             self._knob(p, x, 80, 20, None, f"{n:02d}  Gain")
-            self._button(p, QRectF(x - 36, 140, 26, 20), "F/R" if n <= 2 else "Mic/Ln")
+            rear = w.input_side(n - 1) == "b"
+            self._button(p, QRectF(x - 36, 140, 26, 20),
+                         ("Rear" if rear else "Front") if n <= 2 else ("Line" if rear else "Mic"),
+                         led="#5aa9ff", lit=rear)
             self._button(p, QRectF(x + 10, 140, 26, 20), "Limit")
         # meter ladders
         for i in range(4):
@@ -1451,7 +1458,11 @@ class HardwareView(QtWidgets.QWidget):
         jid, label = self._hit(e.position())
         if jid != self.hover:
             self.hover = jid
-            if jid:
+            if jid and jid.startswith("sw"):
+                QtWidgets.QToolTip.showText(e.globalPosition().toPoint(),
+                                            f"<b>{label}</b><br>The app can't see this button — click here "
+                                            "whenever you press it on the Mbox, so the right name shows.")
+            elif jid:
                 tag = self.win.label(self.jack_tag_key(jid), "")
                 QtWidgets.QToolTip.showText(e.globalPosition().toPoint(),
                                             f"<b>{label}</b><br>{tag or 'click to tag what is plugged in'}")
@@ -1461,6 +1472,8 @@ class HardwareView(QtWidgets.QWidget):
         jid, _ = self._hit(e.position())
         if jid == "phantom":
             self.phantomClicked.emit()
+        elif jid and jid.startswith("sw"):
+            self.win.toggle_input_side(int(jid[2]) - 1)
         elif jid:
             self.jackClicked.emit(jid)
 
@@ -5452,6 +5465,7 @@ class MainWindow(QtWidgets.QMainWindow):
                      ("replaygain", True), ("acoustid_key", ""), ("queue", []), ("queue_cur", -1),
                      ("theme", "system"), ("accent", "system")):
             self.app_state.setdefault(k, v)
+        self.migrate_input_names()
         self.tuner = None
         self.last_spk = None
         self.events_alive = False
@@ -6456,6 +6470,22 @@ class MainWindow(QtWidgets.QMainWindow):
                              f"border:1px dashed {SUBTLE}; border-radius:9px;")
             cb.clicked.connect(lambda _=False, it=item, b=cb: self.pick_colour(it, b))
             g.addWidget(cb, r, 2)
+            if r < 4:                                   # two jacks share this input: which one is in use?
+                side = QtWidgets.QComboBox()
+                side.addItems(["Front jack", "Rear jack"] if r < 2 else ["Mic (XLR)", "Line (rear)"])
+                side.setToolTip("Match the " + ("F/R" if r < 2 else "Mic/Ln") + " button on the Mbox — "
+                                "each jack keeps its own name. The app can't see that button.")
+
+                def sync(r=r, side=side, e=e):
+                    side.blockSignals(True)
+                    side.setCurrentIndex(self.input_side(r) == "b")
+                    side.blockSignals(False)
+                    if not e.hasFocus():
+                        e.setText(self.label(f"in{r}", ""))
+                sync()
+                side.currentIndexChanged.connect(lambda i, r=r: self.set_input_side(r, "ab"[i]))
+                self.refreshers.append(sync)
+                g.addWidget(side, r, 3)
         g.setColumnStretch(1, 1)
         gl.addLayout(g)
         lay.addWidget(gc)
@@ -7561,6 +7591,12 @@ class MainWindow(QtWidgets.QMainWindow):
     def toast(self, msg, ms=6000):
         self.statusBar().showMessage(msg, ms)
 
+    def announce(self, icon, msg, ms=6000):
+        """A message about something that happened in the background: on screen even when the app isn't."""
+        self.toast(msg, ms)
+        if not self.isActiveWindow():
+            self.osd.text(icon, msg)
+
     def ctrl(self, name, index=0):
         return self.by_name.get((name, index))
 
@@ -7707,8 +7743,44 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def set_label(self, key, value):
         self.labels[key] = value
+        m = re.fullmatch(r"in([0-3])(?::([ab]))?", key)
+        if m:                                   # inputs 1–4 have two jacks each: keep "the name in use" in step
+            r, side = int(m.group(1)), m.group(2)
+            if side is None:
+                self.labels[f"in{r}:{self.input_side(r)}"] = value
+            elif side == self.input_side(r):
+                self.labels[f"in{r}"] = value
         save_json(LABELS_FILE, self.labels)
         self.run_refreshers()
+
+    def input_side(self, r):
+        """Which jack feeds input r+1: "a" = front (1–2) or mic XLR (3–4), "b" = rear line jack. Set by hand —
+        the Mbox doesn't report its F/R and Mic/Ln buttons."""
+        return self.app_state.get("input_side", {}).get(str(r), "a")
+
+    def toggle_input_side(self, r):
+        self.set_input_side(r, "a" if self.input_side(r) == "b" else "b")
+
+    def set_input_side(self, r, side):
+        self.app_state.setdefault("input_side", {})[str(r)] = side
+        self.save_app_state()
+        self.labels[f"in{r}"] = self.labels.get(f"in{r}:{side}", "")
+        save_json(LABELS_FILE, self.labels)
+        jack = (("front", "rear") if r < 2 else ("mic (XLR)", "line (rear)"))[side == "b"]
+        name = self.labels[f"in{r}"]
+        self.toast(f"Input {r + 1} now on its {jack} jack" + (f" — {name}." if name else "."), 5000)
+        if hasattr(self, "hw_view"):
+            self.hw_view.update()
+        self.run_refreshers()
+
+    def migrate_input_names(self):
+        changed = False
+        for r in range(4):
+            if self.labels.get(f"in{r}") and f"in{r}:a" not in self.labels and f"in{r}:b" not in self.labels:
+                self.labels[f"in{r}:{self.input_side(r)}"] = self.labels[f"in{r}"]
+                changed = True
+        if changed:
+            save_json(LABELS_FILE, self.labels)
 
     def label_edit(self, key, default="", placeholder=""):
         e = QtWidgets.QLineEdit(self.label(key, default))
@@ -8535,12 +8607,12 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.apply_scene(sid)
                     self.run_refreshers()
                 name = dict(self.scene_choices()).get(sid, sid)
-                self.toast(f"{rule.get('label') or proc} opened → {name}", 6000)
+                self.announce("media-playback-start", f"{rule.get('label') or proc} opened → {name}")
             elif not up and proc in active:
                 snap = active.pop(proc)
                 if snap and not active:                 # only put things back when no other rule is active
                     self.apply_snapshot(snap)
-                    self.toast(f"{rule.get('label') or proc} closed — settings put back.", 6000)
+                    self.announce("edit-undo", f"{rule.get('label') or proc} closed — settings put back")
 
     def build_auto_scenes_card(self, lay):
         c, l = card("Automatic scenes", "Switch scenes by themselves when an app opens — and put everything back "
@@ -8575,8 +8647,18 @@ class MainWindow(QtWidgets.QMainWindow):
         if not proc:
             return
         rules = self.app_state.setdefault("auto_scenes", [])
-        rules[:] = [r for r in rules if r["proc"].lower() != proc.lower()]
-        rules.append({"proc": proc.lower(), "label": text, "scene": self.auto_scene.currentData(), "revert": True})
+        sid = self.auto_scene.currentData()
+        old = next((r for r in rules if r["proc"].lower() == proc.lower()), None)
+        scene = self.auto_scene.currentText().strip()
+        if old and old["scene"] == sid:
+            self.toast(f"Already set: {text} → {scene}.", 4000)
+            return
+        if old:
+            old["scene"] = sid
+            self.toast(f"Changed: {text} now uses {scene}.", 4000)
+        else:
+            rules.append({"proc": proc.lower(), "label": text, "scene": sid, "revert": True})
+            self.toast(f"Added: when {text} opens, use {scene}.", 4000)
         self.save_app_state()
         self.refresh_auto_scenes()
 

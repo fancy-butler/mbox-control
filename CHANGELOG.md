@@ -1,5 +1,16 @@
 # Changelog
 
+## 4.18.1
+- **Front/rear and mic/line jacks keep their own names.** Inputs 1–2 (F/R button) and 3–4 (Mic/Ln
+  button) each have two jacks. Name each jack on Hardware → The box. To tell the app which jack is
+  in use, click the F/R or Mic/Ln button in the app's picture of the Mbox, or use the picker in
+  Your setup. The Mbox doesn't report those buttons, so the app can't see them itself. Names you
+  already set move to the jack in use.
+- Automatic-scene messages now pop up on screen even when the app is hidden behind the app that
+  triggered them.
+- The Add button for automatic scenes now gives feedback: Added, Already set, or Changed (pick a
+  different scene for the same app to change it).
+
 ## 4.18
 - **Automatic scenes** (Settings → Controls): pick an app and a scene, and the scene switches on when the
   app opens. When the app closes, your previous settings come back (you can turn this off per app).
