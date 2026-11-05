@@ -71,3 +71,47 @@ def test_convert_card_runs_a_batch(win, tagged, tmp_path, spinner):
     assert (tmp_path / "Converted (Opus 160 kbps)" / "song.opus").exists() or \
         list(tmp_path.glob("Converted*/song.opus"))
     assert win.conv_note.text().startswith("Done: 1 converted")
+
+
+def test_capture_offers_plain_pairs_not_the_rip_setting(win):
+    data = [win.retro_src.itemData(i) for i in range(win.retro_src.count())]
+    assert "rip" not in data and "pair:Analog-A-1" in data and "pair:Analog-A-5" in data
+    src, auxes, name = win.capture_for("pair:Analog-A-5")
+    assert auxes == ["AUX4", "AUX5"] and "Aux In 5/6" in name
+    ss = win.ctrl("stream-source")
+    assert ss.items[ss.values[4]] == "Analog-A-5" and ss.items[ss.values[5]] == "Analog-A-6"
+
+
+def test_old_rip_choice_is_migrated(win):
+    win.app_state["retro_src"] = "rip"
+    box = mc.QtWidgets.QComboBox()
+    win.input_choices(box, "retro_src")
+    assert box.currentData() == f"pair:{win.app_state['setup']['rip']}"
+
+
+def test_hearing_a_stereo_pair_and_putting_it_back(win):
+    l_slot, r_slot = win.slot_of("Analog-A-5"), win.slot_of("Analog-A-6")
+    win.mix_set_lr(1, l_slot, 0, 0)
+    win.mix_set_lr(1, r_slot, 0, 0)
+    win.retro_choice = "pair:Analog-A-5"
+    win.retro_monitor(True)
+    assert win.mix_lr(1, l_slot) == (mc.UNITY, 0) and win.mix_lr(1, r_slot) == (0, mc.UNITY)
+    win.retro_monitor(False)
+    assert win.mix_lr(1, l_slot) == (0, 0) and win.mix_lr(1, r_slot) == (0, 0)
+
+
+def test_a_crash_during_a_quick_take_is_undone_at_start(app, tmp_path, monkeypatch):
+    import json
+    import shutil
+    monkeypatch.setenv("FAKE_STATE", str(tmp_path / "state.json"))
+    shutil.rmtree(mc.CONF_DIR, ignore_errors=True)
+    mc.CONF_DIR.mkdir(parents=True, exist_ok=True)
+    mc.STATE_FILE.write_text(json.dumps({"rec_src": "mono:Analog-A-4", "take_restore": "pair:Analog-A-5"}))
+    monkeypatch.setattr(mc.MainWindow, "run_setup_wizard", lambda self: None)
+    w = mc.MainWindow(mc.Backend(2))
+    try:
+        assert w.app_state["rec_src"] == "pair:Analog-A-5" and "take_restore" not in w.app_state
+    finally:
+        w.quitting = True
+        w.close()
+        w.deleteLater()

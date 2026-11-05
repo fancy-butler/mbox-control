@@ -46,7 +46,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QPointF, QRectF
 
 APP_NAME = "Mbox Control"
-VERSION = "4.19"
+VERSION = "4.19.1"
 UPDATE_REPO = ""          # "owner/mbox-control" once the project is on GitHub; empty = no online checks
 HOME = Path.home()
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -5841,6 +5841,8 @@ class MainWindow(QtWidgets.QMainWindow):
                      ("theme", "system"), ("accent", "system")):
             self.app_state.setdefault(k, v)
         self.migrate_input_names()
+        if "take_restore" in self.app_state:            # the app closed during a quick take: undo its borrowing
+            self.app_state["rec_src"] = self.app_state.pop("take_restore") or None
         self.spectrum_hub = SpectrumHub(self)
         self.tuner = None
         self.last_spk = None
@@ -10410,9 +10412,13 @@ class MainWindow(QtWidgets.QMainWindow):
         for item, jack in INPUT_JACKS[:4]:
             own = self.label(f"in{int(item[-1]) - 1}", "")
             box.addItem(jack + (f" ({own})" if own else ""), f"mono:{item}")
-        if pairs:
-            box.addItem(f"Stereo: {self.rip_name()}", "rip")
-        box.setCurrentIndex(max(0, box.findData(self.app_state.get(key, default))))
+        if pairs:                                       # plain stereo pairs — never “whatever the Rip page uses”
+            for left, _, name in INPUT_PAIRS:
+                box.addItem(f"Stereo: {name}", f"pair:{left}")
+        saved = self.app_state.get(key, default)
+        if saved == "rip":                              # before 4.19.1: meant the rip pair
+            saved = self.app_state[key] = f"pair:{self.app_state['setup'].get('rip', 'Analog-A-5')}"
+        box.setCurrentIndex(max(0, box.findData(saved)))
         box.currentIndexChanged.connect(lambda _: (self.app_state.__setitem__(key, box.currentData()),
                                                    self.save_app_state()))
 
@@ -10435,6 +10441,13 @@ class MainWindow(QtWidgets.QMainWindow):
             return src, ["AUX4", "AUX5"], self.rip_name()
         item = choice.split(":", 1)[1]
         n = int(item[-1])
+        if choice.startswith("pair:"):                    # Inputs n/n+1 → capture AUX(n-1)/AUX(n), their own slots
+            right = pair_right(item)
+            m = int(right[-1])
+            self.set_stream(n - 1, item)
+            self.set_stream(m - 1, right)
+            own = self.label(f"in{n - 1}", "")
+            return src, [f"AUX{n - 1}", f"AUX{m - 1}"], pair_label(item) + (f" — {own}" if own else "")
         self.set_stream(n - 1, item)                      # Input n → capture AUX(n-1)
         own = self.label(f"in{n - 1}", "")
         return src, [f"AUX{n - 1}"], own or dict(INPUT_JACKS).get(item, item)
@@ -10511,26 +10524,28 @@ class MainWindow(QtWidgets.QMainWindow):
         """While listening, play the input through Stereo Mix 1 (Outputs 1/2); put it back afterwards."""
         prev = getattr(self, "retro_mon", None)
         if not on:
-            if prev:
-                k, slot, l_, r_ = prev
+            for k, slot, l_, r_ in reversed(prev or []):
                 self.mix_set_lr(k, slot, l_, r_)
-                self.retro_mon = None
+            self.retro_mon = None
             return
         if prev:
             return
         choice = getattr(self, "retro_choice", "") or ""
-        if not choice.startswith("mono:"):              # the rip pair has its own monitor setting
+        items = self.source_items(choice)
+        if len(items) == 1:
+            want = [(items[0], UNITY, UNITY)]           # one instrument: centred, both speakers
+        else:
+            want = [(items[0], UNITY, 0), (items[1], 0, UNITY)]     # a stereo source: left and right
+        slots = [(item, self.slot_of(item), l, r) for item, l, r in want]
+        if not slots or any(sl is None for _, sl, _, _ in slots):
+            self.toast("That input isn't in the Mbox mixer — can't play it through the speakers.", 6000)
             return
-        for item in [choice.split(":", 1)[1]]:
-            slot = self.slot_of(item)
-            if slot is None:
-                self.toast("That input isn't in the Mbox mixer — can't play it through the speakers.", 6000)
-                return
-            l_, r_ = self.mix_lr(1, slot)
-            if max(l_, r_) >= UNITY // 2:                # already audible: leave it alone
-                return
-            self.retro_mon = (1, slot, l_, r_)
-            self.mix_set_lr(1, slot, UNITY, UNITY)     # one instrument: centred, both speakers
+        if all(max(self.mix_lr(1, sl)) >= UNITY // 2 for _, sl, _, _ in slots):
+            return                                      # already audible: leave it alone
+        self.retro_mon = []
+        for item, sl, l, r in slots:
+            self.retro_mon.append((1, sl, *self.mix_lr(1, sl)))
+            self.mix_set_lr(1, sl, l, r)
 
     def retro_failed(self, msg):
         self.retro_error = time.time()
@@ -11273,6 +11288,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
             QtCore.QThread.msleep(2500)
         self.take_prev = self.app_state.get("rec_src")
+        self.app_state["take_restore"] = self.take_prev or ""   # survives a crash mid-take (see startup)
         self.app_state["rec_src"] = self.app_state.get("take_src", "mono:Analog-A-1")
         self.route_rip_input()
         self.rewire_rec_meters()
@@ -11283,6 +11299,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.recorder.start("mbox_tape_in", path, self.rate())
         except Exception as e:  # noqa: BLE001
             self.app_state["rec_src"] = self.take_prev
+            self.app_state.pop("take_restore", None)
             self.route_rip_input()
             QtWidgets.QMessageBox.warning(self, APP_NAME, str(e))
             return
@@ -11306,6 +11323,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def take_finished(self, path, ok):
         self.take_mode = False
         self.app_state["rec_src"] = self.take_prev
+        self.app_state.pop("take_restore", None)
         self.route_rip_input()
         self.rewire_rec_meters()
         self.take_btn.setText("🎙  Quick take")

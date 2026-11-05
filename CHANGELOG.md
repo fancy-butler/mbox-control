@@ -1,5 +1,15 @@
 # Changelog
 
+## 4.19.1
+- **Fixed: "Capture what I just played" could listen to the wrong input after a quick take.** Its
+  "Stereo: …" entry meant "whatever the Rip page records from", which Quick take borrows while it
+  records. It now offers plain choices instead: each input, plus Inputs 1/2, 3/4 and Aux In 5/6 as
+  stereo pairs. These record straight from their own channels and never touch the Rip page's setting.
+  Old saved choices move over by themselves.
+- "Hear it while listening" now works for stereo pairs too (left to left, right to right).
+- Quick take's borrowing of the rip input is now crash-safe: if the app closes mid-take, the Rip
+  page's source is put back at the next start.
+
 ## 4.19
 - **Save takes as:** pick FLAC (default), WAV 24/16-bit, AIFF, ALAC, MP3 (V0/320/192), AAC (.m4a), Opus or
   Ogg Vorbis for quick takes, "Capture what I just played" and multitrack. Rips stay FLAC.

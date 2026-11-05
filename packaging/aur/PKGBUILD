@@ -2,7 +2,7 @@
 # Before publishing: set _ghuser, then run `updpkgsums && makepkg --printsrcinfo > .SRCINFO`
 _ghuser=CHANGE_ME
 pkgname=mbox-control
-pkgver=4.19
+pkgver=4.19.1
 pkgrel=1
 pkgdesc="Unofficial modern control panel for the Avid Mbox Pro 3 (FireWire): mixer, routing, ripping, guitar mode"
 arch=('any')
