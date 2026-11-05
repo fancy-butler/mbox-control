@@ -184,3 +184,19 @@ def test_switch_buttons_on_the_box_toggle(win, monkeypatch):
             hv.mousePressEvent(ev)
     assert called == [2]
     hv.grab()                                        # paints with the new button labels
+
+
+def test_one_channel_is_captured_as_a_pair():
+    # newer pw-record reads a lone "AUX0" as a layout with 0 channels → "channels and channel-map incompatible"
+    assert mc.capture_auxes(["AUX0"]) == ["AUX0", "AUX1"]
+    assert mc.capture_auxes(["AUX3"]) == ["AUX3", "AUX2"]
+    assert mc.capture_auxes(["AUX4", "AUX5"]) == ["AUX4", "AUX5"]
+    cmd = mc.capture_cmd("src", ["AUX0"], 96000)
+    assert cmd[cmd.index("--channel-map") + 1] == "AUX0,AUX1" and cmd[cmd.index("--channels") + 1] == "2"
+
+
+def test_retro_failure_stays_on_screen(win):
+    win.retro_failed("pw-record stopped: error: channels and channel-map incompatible")
+    win.refresh_retro()
+    assert "incompatible" in win.retro_note.text()
+    assert win.retro_btn.text() == "Start listening"

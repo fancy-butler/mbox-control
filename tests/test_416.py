@@ -105,6 +105,20 @@ def test_retro_really_captures(two_tones, tmp_path):
 
 
 @PW
+def test_retro_keeps_the_right_channel_of_the_pair(two_tones, tmp_path):
+    rb = mc.RetroBuffer("fake_mbox_in", ["AUX1"], seconds=2)       # captured as AUX1,AUX0 → keep AUX1
+    rb.start()
+    time.sleep(0.5)
+    _feed(two_tones).wait()
+    time.sleep(0.3)
+    data = rb.snapshot(1.5)
+    rb.stop()
+    out = tmp_path / "caught.flac"
+    mc.save_raw(data, out, 48000, 1, trim=False)
+    assert abs(_freq(out) - 880) < 3
+
+
+@PW
 def test_multitrack_really_separates(two_tones, tmp_path):
     wav = tmp_path / "all.wav"
     rec = subprocess.Popen(mc.capture_cmd("fake_mbox_in", ["AUX0", "AUX1"], 48000, out=str(wav), fmt="s24"))

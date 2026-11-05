@@ -1,5 +1,14 @@
 # Changelog
 
+## 4.18.2
+- **Fixed: "Capture what I just played" did nothing on newer PipeWire (1.4+).** Newer `pw-record`
+  reads a single channel name like `AUX0` as a layout and refuses it. One-channel captures are now
+  recorded as a pair, and the app keeps the channel you picked. Multitrack with a single input is
+  fixed the same way.
+- If listening fails, the reason now shows in the card instead of only flashing in the status bar.
+- Hardware view: the rear mic jacks are numbered 04 and 03, like the real panel. The jack picker for
+  inputs 3/4 now says "Line (¼")" (both jacks are on the back).
+
 ## 4.18.1
 - **Front/rear and mic/line jacks keep their own names.** Inputs 1–2 (F/R button) and 3–4 (Mic/Ln
   button) each have two jacks. Name each jack on Hardware → The box. To tell the app which jack is

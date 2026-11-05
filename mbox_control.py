@@ -46,7 +46,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QPointF, QRectF
 
 APP_NAME = "Mbox Control"
-VERSION = "4.18.1"
+VERSION = "4.18.2"
 UPDATE_REPO = ""          # "owner/mbox-control" once the project is on GitHub; empty = no online checks
 HOME = Path.home()
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -1396,6 +1396,8 @@ class HardwareView(QtWidgets.QWidget):
             self._text(p, QRectF(x - 40, y, 120, 16), text, 8, bold=True)
         for x in (526, 616):
             self._button(p, QRectF(x, by + 95, 18, 26), "+4/−10")
+        for num, cx in (("04", 887), ("03", 993)):        # numbered like the real panel
+            self._text(p, QRectF(cx - 20, by + 40, 40, 16), num, 9, bold=True)
 
     def _jack(self, p, jid, r, kind, label):
         hl = jid in self.highlight
@@ -4845,8 +4847,19 @@ context.modules = [
 # ================================================================== 4.16: retro-record, multitrack, metronome, level
 import collections
 
+def capture_auxes(auxes):
+    """Channels to ask pw-record for. A lone "AUX0" is read as a *layout* ("0 aux channels") by newer
+    PipeWire (1.4+), so one channel is always captured as a pair; callers keep the first."""
+    auxes = list(auxes)
+    if len(auxes) == 1:
+        n = int(auxes[0][3:])
+        auxes.append(f"AUX{n ^ 1}")
+    return auxes
+
+
 def capture_cmd(source, auxes, rate, out="-", fmt="s16"):
     """pw-record taking exact Mbox capture channels (AUX0…) with no remixing."""
+    auxes = capture_auxes(auxes)
     return ["pw-record", "--target", source, "--rate", str(rate), "--channels", str(len(auxes)),
             "--channel-map", ",".join(auxes), "-P", "stream.dont-remix=true", "-P", "node.dont-reconnect=true",
             "--format", fmt, out]
@@ -4867,23 +4880,36 @@ class RetroBuffer(QtCore.QThread):
         self.stopping = False
 
     def run(self):
+        import array
+        wide = len(capture_auxes(self.auxes))               # a lone channel arrives as a pair
         try:
             self.proc = subprocess.Popen(capture_cmd(self.source, self.auxes, self.rate), stdout=subprocess.PIPE,
-                                         stderr=subprocess.DEVNULL)
+                                         stderr=subprocess.PIPE)
         except OSError as e:
             self.failed.emit(str(e))
             return
         while not self.stopping:
-            data = self.proc.stdout.read(self.rate // 10 * self.frame)     # ~0.1 s
+            data = self.proc.stdout.read(self.rate // 10 * 2 * wide)      # ~0.1 s
             if not data:
                 break
+            if wide != len(self.auxes):
+                a = array.array("h")
+                a.frombytes(data[:len(data) // (2 * wide) * 2 * wide])
+                data = a[0::wide].tobytes()
             with self.lock:
                 self.chunks.append(data)
                 self.size += len(data)
                 while self.size - len(self.chunks[0]) >= self.limit:
                     self.size -= len(self.chunks.popleft())
         if not self.stopping:
-            self.failed.emit("The input went away")
+            err = ""
+            try:
+                self.proc.wait(2)
+                err = (self.proc.stderr.read() or b"").decode(errors="ignore").strip().splitlines()
+                err = err[0] if err else ""
+            except Exception:  # noqa: BLE001
+                pass
+            self.failed.emit(f"pw-record stopped: {err}" if err else "The input went away")
 
     def stop(self):
         self.stopping = True
@@ -6472,7 +6498,7 @@ class MainWindow(QtWidgets.QMainWindow):
             g.addWidget(cb, r, 2)
             if r < 4:                                   # two jacks share this input: which one is in use?
                 side = QtWidgets.QComboBox()
-                side.addItems(["Front jack", "Rear jack"] if r < 2 else ["Mic (XLR)", "Line (rear)"])
+                side.addItems(["Front jack", "Rear jack"] if r < 2 else ["Mic (XLR)", "Line (¼\")"])
                 side.setToolTip("Match the " + ("F/R" if r < 2 else "Mic/Ln") + " button on the Mbox — "
                                 "each jack keeps its own name. The app can't see that button.")
 
@@ -7766,7 +7792,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.save_app_state()
         self.labels[f"in{r}"] = self.labels.get(f"in{r}:{side}", "")
         save_json(LABELS_FILE, self.labels)
-        jack = (("front", "rear") if r < 2 else ("mic (XLR)", "line (rear)"))[side == "b"]
+        jack = (("front", "rear") if r < 2 else ("mic (XLR)", "line (¼\")"))[side == "b"]
         name = self.labels[f"in{r}"]
         self.toast(f"Input {r + 1} now on its {jack} jack" + (f" — {name}." if name else "."), 5000)
         if hasattr(self, "hw_view"):
@@ -10086,13 +10112,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if on and not self.retro:
             src, auxes, name = self.capture_for(self.retro_src.currentData())
             if not src:
-                self.retro_btn.setChecked(False)
-                self.toast("Couldn't find the Mbox input in PipeWire.", 6000)
+                self.retro_failed("Couldn't find the Mbox input in PipeWire.")
                 return
             self.retro = RetroBuffer(src, auxes, self.rate(), seconds=300)
             self.retro.label = name
-            self.retro.failed.connect(lambda msg: (self.retro_btn.setChecked(False),
-                                                   self.toast(f"Stopped listening: {msg}", 6000)))
+            self.retro.failed.connect(self.retro_failed)
             self.retro.start()
         elif not on and self.retro:
             self.retro.stop()
@@ -10100,6 +10124,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.app_state["retro_on"] = on
         self.save_app_state()
         self.refresh_retro()
+
+    def retro_failed(self, msg):
+        self.retro_error = time.time()
+        self.retro_btn.setChecked(False)
+        self.toast(f"Stopped listening: {msg}", 10000)
+        self.retro_note.setText(f"<b style='color:#f85149'>Couldn't listen:</b> {html_escape(msg)}")
 
     def refresh_retro(self):
         on = bool(self.retro)
@@ -10112,6 +10142,8 @@ class MainWindow(QtWidgets.QMainWindow):
         held = self.retro.held() if on else 0
         for secs in (30, 60, 300):
             getattr(self, f"retro_save_{secs}").setEnabled(on and held > 1)
+        if not on and time.time() - getattr(self, "retro_error", 0) < 30:
+            return                                      # leave the error on screen for a while
         self.retro_note.setText(f"Holding the last {int(held // 60)}:{int(held % 60):02d} of {self.retro.label} — "
                                 "memory only; nothing is saved unless you press save." if on else
                                 "Off. When it's on, it never writes anything to disk until you save.")
