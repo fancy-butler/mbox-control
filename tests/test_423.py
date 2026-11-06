@@ -105,3 +105,51 @@ def test_eq_on_off_switches_live_when_the_chain_stays(win, monkeypatch):
     assert sent[-1]["name"] == "Off (flat)" and sent[-1]["subsonic"] is True
     win.toggle_eq()
     assert sent[-1]["name"] == "Cans"
+
+
+def test_old_main_output_is_renamed_once(monkeypatch, tmp_path):
+    old, new = tmp_path / "mbox-sa600.conf", tmp_path / "mbox-main.conf"
+    monkeypatch.setattr(mc, "OLD_MAIN_CONF", old)
+    monkeypatch.setattr(mc, "MAIN_CONF", new)
+    monkeypatch.setattr(mc, "run_quiet", lambda *a, **k: "sa600_sink\n" if "get-default-sink" in a else "")
+    monkeypatch.setattr(mc, "rlog", lambda m: None)
+    old.write_text('capture.props = { node.name = "sa600_sink" }\nplayback.props = { node.name = "sa600_sink_out" '
+                   'target.object = "alsa_output.firewire-x" }\n  { type = builtin name = sub1 label = bq_highpass }\n')
+    state = {"pr_out": "sa600_sink", "mirror": {"B": "sink:sa600_sink"}, "eq_on": True}
+    assert mc.migrate_main_output(state) == (True, True)
+    text = new.read_text()
+    assert '"mbox_main"' in text and '"mbox_main_out"' in text and "sa600" not in text and "sub1" in text
+    assert not old.exists()
+    assert state == {"pr_out": "mbox_main", "mirror": {"B": "sink:mbox_main"}, "eq_on": True}
+    assert mc.migrate_main_output(state) == (False, False)       # second start: nothing to do
+
+
+def test_no_personal_gear_in_user_facing_text():
+    src = open(mc.__file__, encoding="utf-8").read()
+    for word in ("SA-600", "Missions", "the TV on"):
+        assert word not in src, word
+
+
+def test_eq_curve_shape():
+    f = [30.0, 105.0, 1000.0, 10000.0]
+    flat = mc.eq_curve({"preamp": 0, "bands": []}, f)
+    assert all(abs(v) < 1e-6 for v in flat)
+    bass = mc.eq_curve({"preamp": -12, "bands": [{"type": "LSC", "f": 105.0, "q": 0.7, "g": 12.0}]}, f)
+    assert bass[0] == pytest.approx(0, abs=0.6) and bass[3] == pytest.approx(-12, abs=0.1)
+    sub = mc.eq_curve({"preamp": 0, "bands": [], "subsonic": True}, [10.0, 30.0, 1000.0])
+    assert sub[0] < -15 and sub[1] == pytest.approx(-3, abs=0.6) and abs(sub[2]) < 0.1
+
+
+def test_graph_follows_the_tone_slider(win, monkeypatch):
+    setup_eq(win, monkeypatch)
+    monkeypatch.setattr(win, "eq_target", lambda: "H")
+    win.app_state["eq_tone"] = {"bass": 0, "treble": 0}
+    win.apply_eq()
+    before = list(win.eq_graph.cur)
+    win.tone["bass"].setValue(10)
+    win.tone_changed()
+    g = win.eq_graph
+    assert g.cur != before and g.base == before and "Headphones: Cans" in g.title
+    assert g.cur[0] - g.cur[-1] > 8                     # bass now well above treble
+    g.resize(600, 200)
+    g.grab()                                            # paints without errors

@@ -65,7 +65,7 @@ def test_osd_fallback_window(app):
 
 def test_app_rules_move_new_streams(win, monkeypatch):
     moved = []
-    monkeypatch.setattr(mc, "list_sinks", lambda: [{"id": 7, "name": "sa600_sink", "desc": "Speakers"},
+    monkeypatch.setattr(mc, "list_sinks", lambda: [{"id": 7, "name": "mbox_main", "desc": "Speakers"},
                                                    {"id": 8, "name": "mbox_headphones", "desc": "Headphones"}])
     monkeypatch.setattr(mc, "list_app_streams", lambda: [{"id": 41, "sink": 7, "app": "Steam", "what": "", "icon": ""},
                                                          {"id": 42, "sink": 7, "app": "Firefox", "what": "", "icon": ""}])

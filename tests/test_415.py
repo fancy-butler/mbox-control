@@ -81,7 +81,7 @@ def test_eq_follows_the_speaker_set_with_tone(win, monkeypatch):
 @pytest.mark.skipif(not (shutil.which("pw-cli") and os.environ.get("MBOX_TEST_PIPEWIRE")),
                     reason="needs a running PipeWire (set MBOX_TEST_PIPEWIRE=1)")
 def test_eq_really_changes_the_sound():
-    """Plays a 1 kHz tone through the real EQ chain (already loaded as sa600_sink → fake_mbox)."""
+    """Plays a 1 kHz tone through the real EQ chain (already loaded as mbox_main → fake_mbox)."""
     tone = Path("/tmp/mbox-eq-test.wav")
     subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=1000:duration=2",
                     "-ac", "2", str(tone)], check=True)
@@ -93,7 +93,7 @@ def test_eq_really_changes_the_sound():
                                 "-P", "stream.dont-remix=true", "--format", "f32", str(raw)],
                                stderr=subprocess.DEVNULL)
         time.sleep(0.4)
-        subprocess.run(["pw-play", "--target", "sa600_sink", str(tone)])
+        subprocess.run(["pw-play", "--target", "mbox_main", str(tone)])
         time.sleep(0.3)
         rec.terminate()
         rec.wait()
@@ -101,13 +101,13 @@ def test_eq_really_changes_the_sound():
         x = x[:len(x) // 8 * 8].reshape(-1, 8)[:, 6]
         x = x[len(x) // 4: -len(x) // 4]
         return 20 * np.log10(np.sqrt(np.mean(x ** 2)) + 1e-12)
-    assert mc.set_eq_live("sa600_sink", mc.EQ_FLAT)
+    assert mc.set_eq_live("mbox_main", mc.EQ_FLAT)
     time.sleep(0.3)
     flat = level()
-    assert mc.set_eq_live("sa600_sink", {"name": "t", "preamp": 0, "bands": [{"type": "PK", "f": 1000, "q": 1, "g": 12}]})
+    assert mc.set_eq_live("mbox_main", {"name": "t", "preamp": 0, "bands": [{"type": "PK", "f": 1000, "q": 1, "g": 12}]})
     time.sleep(0.3)
     assert level() - flat == pytest.approx(12, abs=0.5)
-    mc.set_eq_live("sa600_sink", mc.EQ_FLAT)
+    mc.set_eq_live("mbox_main", mc.EQ_FLAT)
 
 
 def test_autoeq_url_includes_the_model_folder():
@@ -129,7 +129,7 @@ def test_subsonic_filter_cuts_thumps_but_keeps_the_low_e():
                                 "-P", "stream.dont-remix=true", "--format", "f32", str(raw)],
                                stderr=subprocess.DEVNULL)
         time.sleep(0.4)
-        subprocess.run(["pw-play", "--target", "sa600_sink", str(tone)])
+        subprocess.run(["pw-play", "--target", "mbox_main", str(tone)])
         time.sleep(0.3)
         rec.terminate()
         rec.wait()
@@ -139,12 +139,12 @@ def test_subsonic_filter_cuts_thumps_but_keeps_the_low_e():
         return 20 * np.log10(np.sqrt(np.mean(x ** 2)) + 1e-12)
     off = dict(mc.EQ_FLAT, subsonic=False)
     on = dict(mc.EQ_FLAT, subsonic=True)
-    assert mc.set_eq_live("sa600_sink", off)
+    assert mc.set_eq_live("mbox_main", off)
     time.sleep(0.3)
     t15, t41 = level(15), level(41)
-    assert mc.set_eq_live("sa600_sink", on)
+    assert mc.set_eq_live("mbox_main", on)
     time.sleep(0.3)
     s15, s41 = level(15), level(41)
-    mc.set_eq_live("sa600_sink", off)
+    mc.set_eq_live("mbox_main", off)
     assert t15 - s15 > 20                     # the thump (one octave below 30 Hz): about −24 dB
     assert t41 - s41 < 4                      # the low E: within a few dB

@@ -46,7 +46,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QPointF, QRectF
 
 APP_NAME = "Mbox Control"
-VERSION = "4.23.1"
+VERSION = "4.24"
 UPDATE_REPO = ""          # "owner/mbox-control" once the project is on GitHub; empty = no online checks
 HOME = Path.home()
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -1630,8 +1630,8 @@ class TunerDisplay(QtWidgets.QWidget):
 # ================================================================== built-in scenes
 
 SCENES = [
-    {"id": "listen", "name": "🔊  Listening", "short": "Computer → SA-600 only",
-     "what": "Computer playback → Outputs 1/2 (your SA-600), nothing else in that mix.",
+    {"id": "listen", "name": "🔊  Listening", "short": "Computer → your amplifier only",
+     "what": "Computer playback → Outputs 1/2 (your amplifier), nothing else in that mix.",
      "check": ["Receiver on AUX, switcher set to the Mbox."],
      "jacks": ["out1", "out2"]},
     {"id": "rip", "name": "📼  Rip tape / vinyl", "short": "Aux In 5/6 → computer + speakers",
@@ -2417,7 +2417,9 @@ def service_unit_ok():
         return False
 
 
-SA600_CONF = PW_CONF_DIR / "mbox-sa600.conf"
+MAIN_CONF = PW_CONF_DIR / "mbox-main.conf"
+MAIN_SINK = "mbox_main"
+OLD_MAIN_CONF, OLD_MAIN_SINK = PW_CONF_DIR / "mbox-sa600.conf", "sa600_sink"     # before 4.24
 
 
 def chain_wanted(state):
@@ -2425,25 +2427,25 @@ def chain_wanted(state):
     return bool(state.get("eq_on")) or any(state.get("subsonic_sets", {}).values())
 
 
-def write_sa600_conf(sink, desc="Speakers (Mbox)", eq=None):
+def write_main_conf(sink, desc="Speakers (Mbox)", eq=None):
     PW_CONF_DIR.mkdir(parents=True, exist_ok=True)
     if eq is None:
         eq = chain_wanted(load_json(STATE_FILE, {}))
     if eq:                                         # same node names and channels, with the EQ in between
-        SA600_CONF.write_text(eq_chain_conf(desc, "sa600_sink", sink, ["AUX7", "AUX6"]))
+        MAIN_CONF.write_text(eq_chain_conf(desc, MAIN_SINK, sink, ["AUX7", "AUX6"]))
         return
-    SA600_CONF.write_text(f"""# Written by Mbox Control
+    MAIN_CONF.write_text(f"""# Written by Mbox Control
 context.modules = [
   {{ name = libpipewire-module-loopback
     args = {{
       node.description = "{desc}"
       capture.props = {{
-        node.name = "sa600_sink"
+        node.name = "{MAIN_SINK}"
         media.class = "Audio/Sink"
         audio.position = [ FL FR ]
       }}
       playback.props = {{
-        node.name = "sa600_out"
+        node.name = "mbox_main_out"
         target.object = "{sink}"
         audio.position = [ AUX7 AUX6 ]
         stream.dont-remix = true
@@ -2453,6 +2455,35 @@ context.modules = [
   }}
 ]
 """)
+
+
+def migrate_main_output(state):
+    """4.24 renamed the main output's PipeWire nodes (sa600_sink → mbox_main) and its config file.
+    Rewrites the old file under the new names, fixes saved settings that name the old node, and says
+    whether PipeWire needs a restart (and whether the old node was the default output). → (restart, was_default)"""
+    blob = json.dumps(state)
+    if OLD_MAIN_SINK in blob:
+        state.clear()
+        state.update(json.loads(blob.replace(OLD_MAIN_SINK, MAIN_SINK)))
+    if not OLD_MAIN_CONF.exists():
+        return False, False
+    text = OLD_MAIN_CONF.read_text()
+    text = text.replace('"sa600_sink_out"', '"mbox_main_out"').replace('"sa600_out"', '"mbox_main_out"')
+    MAIN_CONF.write_text(text.replace(f'"{OLD_MAIN_SINK}"', f'"{MAIN_SINK}"'))
+    OLD_MAIN_CONF.unlink()
+    was_default = (run_quiet("pactl", "get-default-sink") or "").strip() == OLD_MAIN_SINK
+    rlog(f"migrated {OLD_MAIN_CONF.name} → {MAIN_CONF.name} (default output: {was_default})")
+    return True, was_default
+
+
+def set_default_when_ready(name, tries=10):
+    """After a PipeWire restart: make `name` the default output as soon as it's there."""
+    def attempt(n):
+        if pw_node_exists(name, "sink"):
+            run_quiet("pactl", "set-default-sink", name)
+        elif n > 0:
+            QtCore.QTimer.singleShot(700, lambda: attempt(n - 1))
+    attempt(tries)
 
 
 def mbox_pw_card():
@@ -2487,7 +2518,7 @@ def pw_sinks():
     return out
 
 
-OUR_LOOPBACKS = {"sa600_out", "sa600_sink_out", "mbox_headphones_out"}
+OUR_LOOPBACKS = {"mbox_main_out", "mbox_headphones_out"}
 
 
 def relink_mbox_streams():
@@ -3609,7 +3640,7 @@ class PreviewPlayer:
         subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{start:.2f}",
                         "-t", f"{secs:.2f}", "-i", str(path), *(["-af", af] if af else []), str(tmp)],
                        capture_output=True)
-        target = ["--target", "sa600_sink"] if pw_node_exists("sa600_sink", "sink") else []
+        target = ["--target", MAIN_SINK] if pw_node_exists(MAIN_SINK, "sink") else []
         self.proc = subprocess.Popen(["pw-play", *target, str(tmp)], stdout=subprocess.DEVNULL,
                                      stderr=subprocess.DEVNULL)
 
@@ -4273,7 +4304,7 @@ def disable_airplay():
 def mirror_sources(main_desc):
     """What can be copied to a speaker: [(key, label)]. key 'sink:<name>' = what plays on that output,
     'src:<name>' = a named Mbox input."""
-    out = [("sink:sa600_sink", f"Everything playing on {main_desc}")]
+    out = [(f"sink:{MAIN_SINK}", f"Everything playing on {main_desc}")]
     for s in pactl_json("list", "sources"):
         n = str(s.get("name", ""))
         if n.startswith("mbox_") and not n.endswith(".monitor"):
@@ -4387,7 +4418,7 @@ DEFAULT_MAIN = "Speakers (Mbox)"
 def main_name_from_conf():
     """The name an older version gave the main output (so updating never renames it)."""
     try:
-        m = re.search(r'node\.description\s*=\s*"([^"]+)"', SA600_CONF.read_text())
+        m = re.search(r'node\.description\s*=\s*"([^"]+)"', MAIN_CONF.read_text())
         return m.group(1) if m else ""
     except OSError:
         return ""
@@ -5635,7 +5666,9 @@ def band_db(b, f, rate=48000.0):
     A, w0 = 10 ** (float(b["g"]) / 40), 2 * math.pi * float(b["f"]) / rate
     alpha, c = math.sin(w0) / (2 * max(0.1, float(b["q"]))), math.cos(w0)
     t = b["type"]
-    if t == "PK":
+    if t == "HP":
+        bb = ((1 + c) / 2, -(1 + c), (1 + c) / 2); aa = (1 + alpha, -2 * c, 1 - alpha)
+    elif t == "PK":
         bb = (1 + alpha * A, -2 * c, 1 - alpha * A); aa = (1 + alpha / A, -2 * c, 1 - alpha / A)
     else:
         k2, sgn = 2 * math.sqrt(A) * alpha, (1 if t == "LSC" else -1)
@@ -5646,6 +5679,73 @@ def band_db(b, f, rate=48000.0):
     z = complex(math.cos(2 * math.pi * f / rate), -math.sin(2 * math.pi * f / rate))
     h = (bb[0] + bb[1] * z + bb[2] * z * z) / (aa[0] + aa[1] * z + aa[2] * z * z)
     return 20 * math.log10(max(abs(h), 1e-9))
+
+
+def eq_curve(profile, freqs):
+    """What a profile does to the sound, in dB at each frequency: bands + overall level + subsonic filter."""
+    bands = list(profile.get("bands", []))
+    if profile.get("subsonic"):
+        bands += [{"type": "HP", "f": SUBSONIC_HZ, "q": q, "g": 0.0} for q in SUBSONIC_Q]
+    pre = float(profile.get("preamp", 0.0))
+    return [pre + sum(band_db(b, f) for b in bands) for f in freqs]
+
+
+class EqGraph(QtWidgets.QWidget):
+    """The EQ as a picture: the line is how much louder or quieter each pitch comes out than without the EQ.
+    A dashed line shows the profile alone, so the Tone sliders' share is visible."""
+    FREQS = [20 * 1000 ** (i / 159) for i in range(160)]
+
+    def __init__(self):
+        super().__init__()
+        self.setMinimumHeight(170)
+        self.cur, self.base, self.title = [], [], ""
+        self.setToolTip("Above the middle line: that pitch comes out louder. Below: quieter. Left = bass, "
+                        "right = treble.")
+
+    def show_profile(self, prof, base=None, title=""):
+        self.cur = eq_curve(prof, self.FREQS)
+        self.base = eq_curve(base, self.FREQS) if base is not None else []
+        self.title = title
+        self.update()
+
+    def paintEvent(self, _):
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing)
+        r = self.rect().adjusted(40, 10, -10, -22)
+        pal = self.palette()
+        fg, dim = pal.color(QtGui.QPalette.WindowText), pal.color(QtGui.QPalette.Mid)
+        vals = self.cur + self.base
+        span = max(12.0, min(48.0, math.ceil((max((abs(v) for v in vals), default=0) + 2) / 6) * 6))
+        x = lambda f: r.left() + r.width() * math.log10(f / 20) / 3                    # noqa: E731
+        y = lambda db: r.center().y() - r.height() / 2 * max(-1.0, min(1.0, db / span))  # noqa: E731
+        p.setPen(QtGui.QPen(dim, 1))
+        small = p.font()
+        small.setPointSizeF(max(7.0, small.pointSizeF() * 0.8))
+        p.setFont(small)
+        for f, lab in ((50, "50"), (100, "100"), (500, "500"), (1000, "1k"), (5000, "5k"), (10000, "10k")):
+            p.drawLine(QtCore.QPointF(x(f), r.top()), QtCore.QPointF(x(f), r.bottom()))
+            p.drawText(QtCore.QRectF(x(f) - 20, r.bottom() + 3, 40, 16), Qt.AlignCenter, lab)
+        for db in (-span, -span / 2, 0, span / 2, span):
+            p.setPen(QtGui.QPen(fg if db == 0 else dim, 1.4 if db == 0 else 1))
+            p.drawLine(QtCore.QPointF(r.left(), y(db)), QtCore.QPointF(r.right(), y(db)))
+            p.drawText(QtCore.QRectF(0, y(db) - 8, 36, 16), Qt.AlignRight | Qt.AlignVCenter, f"{db:+.0f}")
+        p.drawText(QtCore.QRectF(r.left(), r.bottom() + 3, 60, 16), Qt.AlignLeft, "bass")
+        p.drawText(QtCore.QRectF(r.right() - 60, r.bottom() + 3, 60, 16), Qt.AlignRight, "treble")
+
+        def line(pts, pen):
+            if pts:
+                path = QtGui.QPainterPath(QtCore.QPointF(x(self.FREQS[0]), y(pts[0])))
+                for f, v in zip(self.FREQS[1:], pts[1:]):
+                    path.lineTo(x(f), y(v))
+                p.setPen(pen)
+                p.drawPath(path)
+        accent = pal.color(QtGui.QPalette.Highlight)
+        line(self.base, QtGui.QPen(dim, 1.5, Qt.DashLine))
+        line(self.cur, QtGui.QPen(accent, 2.5))
+        if self.title:
+            p.setPen(fg)
+            p.drawText(QtCore.QRectF(r.left() + 6, r.top(), r.width() - 12, 18), Qt.AlignRight, self.title)
+        p.end()
 
 
 def eq_peak_db(bands):
@@ -5726,7 +5826,7 @@ def set_eq_live(sink_node, profile):
         return False
     ok = True
     try:                                                 # a chain written by an older version lacks some slots
-        text = SA600_CONF.read_text() if sink_node == "sa600_sink" else ""
+        text = MAIN_CONF.read_text() if sink_node == MAIN_SINK else ""
         only = {s for s, _ in EQ_SLOTS if f"name = {s} " in text} or None
     except OSError:
         only = None
@@ -6570,6 +6670,12 @@ class MainWindow(QtWidgets.QMainWindow):
                      ("theme", "system"), ("accent", "system")):
             self.app_state.setdefault(k, v)
         self.migrate_input_names()
+        restart, was_default = migrate_main_output(self.app_state)
+        self.save_app_state()
+        if restart and not os.environ.get("MBOX_AMIXER"):
+            restart_pipewire()
+            if was_default:
+                QtCore.QTimer.singleShot(1500, lambda: set_default_when_ready(MAIN_SINK))
         sets = self.app_state.get("eq_sets", {})
         if "H" not in sets and sets.get("B", "Off (flat)") != "Off (flat)":
             sets["H"] = sets["B"]                       # before 4.23 the AutoEQ dialog put headphones on B
@@ -7207,9 +7313,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if have_pactl:
             if not mbox_pw_node("sink"):
                 items.append(("error", "The Mbox's audio is switched off in PipeWire.", "Fix", self.fix_profile))
-            elif not pw_node_exists("sa600_sink", "sink"):
+            elif not pw_node_exists(MAIN_SINK, "sink"):
                 items.append(("error", f"The “{self.main_output_name()}” output is missing.", "Fix",
-                              self.fix_sa600))
+                              self.fix_main_output))
             else:
                 cur = (run_quiet("pactl", "get-default-sink") or "").strip()
                 if "firewire" in cur and "pro-output" in cur:
@@ -7431,17 +7537,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self.main_name_edit.setText(st["main_name"])
         sink = mbox_pw_node("sink")
         if sink:
-            write_sa600_conf(sink, st["main_name"])
+            write_main_conf(sink, st["main_name"])
             restart_pipewire()
             QtCore.QTimer.singleShot(2500, fix_default_sink)
             self.toast(f"Your main output is now called “{st['main_name']}”.", 6000)
 
-    def fix_sa600(self):
+    def fix_main_output(self):
         sink = mbox_pw_node("sink")
         if not sink:
             self.fix_profile()
             return
-        write_sa600_conf(sink, self.main_output_name())
+        write_main_conf(sink, self.main_output_name())
         restart_pipewire()
         QtCore.QTimer.singleShot(3000, lambda: (fix_default_sink(), self.refresh_health()))
         self.toast(f"Recreated the {self.main_output_name()} output.")
@@ -7795,7 +7901,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def scene_view(self, s):
         v = dict(s)
         amp = self.label("out0", "") or "your amplifier"
-        sub = lambda t: t.replace("SA-600", amp)  # noqa: E731
+        sub = lambda t: t.replace("your amplifier", amp) if amp != "your amplifier" else t  # noqa: E731
         v["short"], v["what"], v["check"] = sub(v["short"]), sub(v["what"]), [sub(c) for c in v["check"]]
         if s["id"] == "guitar":
             who = " + ".join(self.guitar_names())
@@ -7947,7 +8053,7 @@ class MainWindow(QtWidgets.QMainWindow):
         mon.toggled.connect(lambda on: (st.__setitem__("rip_monitor", on), self.save_setup()))
         f.addRow("", mon)
         tip = QtWidgets.QLineEdit(st.get("rip_tip", ""))
-        tip.setPlaceholderText("e.g. SA-600: REC MODE on TAPE 1 ▸ 2, TAPE MONITOR on SOURCE")
+        tip.setPlaceholderText("e.g. Receiver: TAPE MONITOR on SOURCE, input set to AUX")
         tip.setToolTip("Your own reminder, shown whenever you start the Rip scene.")
         tip.editingFinished.connect(lambda: (st.__setitem__("rip_tip", tip.text().strip()), self.save_setup()))
         f.addRow("Reminder", tip)
@@ -8121,7 +8227,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not path.exists():
             CONF_DIR.mkdir(parents=True, exist_ok=True)
             make_tone(path, freq, dbfs, secs=60, rate=48000)
-        target = ["--target", "sa600_sink"] if pw_node_exists("sa600_sink", "sink") else []
+        target = ["--target", MAIN_SINK] if pw_node_exists(MAIN_SINK, "sink") else []
         self.tone_proc = subprocess.Popen(["pw-play", *target, str(path)],
                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.toast(f"Playing {freq // 1000} kHz at {dbfs} dBFS for a minute.", 6000)
@@ -8232,8 +8338,8 @@ class MainWindow(QtWidgets.QMainWindow):
         links = run_quiet("pw-link", "-l") or ""
         for item, n in names:
             aux = f"{src}:capture_AUX{int(item[-1]) - 1}"
-            for a, b in ((aux, f"{n}_amp:in_0"), (f"{n}_fx:out_0", "sa600_sink:playback_FL"),
-                         (f"{n}_fx:out_1", "sa600_sink:playback_FR")):
+            for a, b in ((aux, f"{n}_amp:in_0"), (f"{n}_fx:out_0", "mbox_main:playback_FL"),
+                         (f"{n}_fx:out_1", "mbox_main:playback_FR")):
                 run_quiet("pw-link", a, b)
             if aux in links and f"{n}_fx:in_0" in links:      # JACK auto-connect sometimes skips the amp
                 run_quiet("pw-link", "-d", aux, f"{n}_fx:in_0")
@@ -10546,10 +10652,13 @@ class MainWindow(QtWidgets.QMainWindow):
         brow.addWidget(imp)
         brow.addStretch(1)
         l.addLayout(brow)
-        l.addWidget(muted("EQ changes computer sound only — things the Mbox mixes itself (like the TV on Aux 5/6) "
+        l.addWidget(muted("EQ changes computer sound only — things the Mbox mixes itself (like a source on Aux 5/6) "
                           "aren't touched. Switching profiles is instant and silent."))
         lay.addWidget(c)
-        tc, tl = card("Tone", "Quick bass and treble on top of whatever profile is playing.")
+        tc, tl = card("Tone", "Quick bass and treble on top of whatever profile is playing. The line shows what "
+                              "you hear: above the middle = louder, below = quieter. Dashed = the profile alone.")
+        self.eq_graph = EqGraph()
+        tl.addWidget(self.eq_graph)
         self.tone = {}
         for key, label, freq in (("bass", "Bass", 105), ("treble", "Treble", 8000)):
             row = QtWidgets.QHBoxLayout()
@@ -10572,6 +10681,7 @@ class MainWindow(QtWidgets.QMainWindow):
         lay.addWidget(tc)
         lay.addStretch(1)
         self.refresh_eq_ui()
+        self.draw_eq()
         return scroll(w)
 
     def eq_profiles(self):
@@ -10652,9 +10762,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.save_app_state()
         after = chain_wanted(self.app_state)
         sink = mbox_pw_node("sink")
-        has_filter = SA600_CONF.exists() and "name = sub1 " in SA600_CONF.read_text()
+        has_filter = MAIN_CONF.exists() and "name = sub1 " in MAIN_CONF.read_text()
         if sink and (after != before or (after and not has_filter)):
-            write_sa600_conf(sink, self.main_output_name(), eq=after)
+            write_main_conf(sink, self.main_output_name(), eq=after)
             restart_pipewire()
             QtCore.QTimer.singleShot(2500, lambda: (fix_default_sink(), self.apply_eq()))
         else:
@@ -10678,11 +10788,11 @@ class MainWindow(QtWidgets.QMainWindow):
             return "H"
         return self.current_set()
 
-    def eq_profile_now(self):
+    def eq_profile_now(self, tone=True):
         target = self.eq_target()
         name = self.app_state.get("eq_sets", {}).get(target, "Off (flat)")
         prof = dict(self.eq_profiles().get(name, EQ_FLAT))
-        tone = self.app_state.get("eq_tone", {})
+        tone = self.app_state.get("eq_tone", {}) if tone else {}
         extra = [{"type": "LSC", "f": 105.0, "q": 0.7, "g": float(tone.get("bass", 0))},
                  {"type": "HSC", "f": 8000.0, "q": 0.7, "g": float(tone.get("treble", 0))}]
         base = list(prof.get("bands", []))
@@ -10696,12 +10806,24 @@ class MainWindow(QtWidgets.QMainWindow):
         return prof
 
     def apply_eq(self):
+        self.draw_eq()
         if not chain_wanted(self.app_state) or os.environ.get("MBOX_AMIXER"):
             return False
-        ok = set_eq_live("sa600_sink", self.eq_profile_now())
+        ok = set_eq_live(MAIN_SINK, self.eq_profile_now())
         if not ok:
             self.toast("Couldn't change the EQ — is the main output there? (Settings → Sound)", 6000)
         return ok
+
+    def draw_eq(self):
+        if not hasattr(self, "eq_graph"):
+            return
+        t = self.eq_target()
+        who = "Headphones" if t == "H" else f"Speakers {t}"
+        if not self.app_state.get("eq_on"):
+            name = "EQ off"
+        else:
+            name = self.app_state.get("eq_sets", {}).get(t, "Off (flat)")
+        self.eq_graph.show_profile(self.eq_profile_now(), self.eq_profile_now(tone=False), f"{who}: {name}")
 
     def tone_changed(self):
         self.app_state["eq_tone"] = {k: s.value() for k, s in self.tone.items()}
@@ -10718,7 +10840,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.app_state["eq_on"] = on
         self.save_app_state()
         if sink and chain_wanted(self.app_state) != before:
-            write_sa600_conf(sink, self.main_output_name(), eq=chain_wanted(self.app_state))
+            write_main_conf(sink, self.main_output_name(), eq=chain_wanted(self.app_state))
             restart_pipewire()
             QtCore.QTimer.singleShot(2500, lambda: (fix_default_sink(), self.apply_eq()))
         else:
@@ -10936,7 +11058,7 @@ class MainWindow(QtWidgets.QMainWindow):
             combo.setCurrentIndex(max(0, combo.findData(cur)))
             combo.currentIndexChanged.connect(lambda _, L=letter, cb=combo: self.assign_cr(L, cb.currentData()))
             g.addWidget(combo, r, 2)
-            g.addWidget(self.label_edit(f"spk{letter}", "", "e.g. SA-600 / Missions"), r, 3)
+            g.addWidget(self.label_edit(f"spk{letter}", "", "e.g. Hi-fi / Desk monitors"), r, 3)
             go = QtWidgets.QPushButton("Switch to this set")
             go.clicked.connect(lambda _=False, L=letter: self.switch_speakers(L))
             g.addWidget(go, r, 4)
@@ -12681,7 +12803,7 @@ class MainWindow(QtWidgets.QMainWindow):
         p = self.app_state.get("last_take")
         if not p or not shutil.which("pw-play"):
             return
-        target = ["--target", "sa600_sink"] if pw_node_exists("sa600_sink", "sink") else []
+        target = ["--target", MAIN_SINK] if pw_node_exists(MAIN_SINK, "sink") else []
         self.take_proc = subprocess.Popen(["pw-play", *target, p], stdout=subprocess.DEVNULL,
                                           stderr=subprocess.DEVNULL)
         self.take_play.setText("■ Stop")
@@ -14364,8 +14486,8 @@ def ensure_service(card_no):
 def fix_default_sink():
     cur = (run_quiet("pactl", "get-default-sink") or "").strip()
     sinks = run_quiet("pactl", "list", "sinks", "short") or ""
-    if "sa600_sink" in sinks and "firewire" in cur and "pro-output" in cur:
-        run_quiet("pactl", "set-default-sink", "sa600_sink")
+    if MAIN_SINK in sinks and "firewire" in cur and "pro-output" in cur:
+        run_quiet("pactl", "set-default-sink", MAIN_SINK)
         return True
     return False
 

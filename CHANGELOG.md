@@ -2,6 +2,12 @@
 
 
 
+
+## 4.24
+- **EQ graph.** The Tone card draws what you actually hear: the full curve (profile, Tone, overall level, subsonic filter), with the profile alone dashed underneath, and which profile is playing.
+- **Neutral names.** The main output's PipeWire node is now `mbox_main` (was `sa600_sink`) and its file `mbox-main.conf` (was `mbox-sa600.conf`). Existing setups are converted once at start-up — file, saved settings and default output — with one short PipeWire restart.
+- No more of the author's own gear in scene texts and examples.
+
 ## 4.23.1
 - Turn EQ on/off now switches live. With the subsonic filter keeping the chain running, it used to change nothing until the next restart.
 - The Speakers chip on Home is a button: pick Speakers A/B/C, switch the speakers off (headphones only — the headphone EQ follows), or tick "Use the headphone EQ". It shows 🎧 when the headphone EQ is playing.
