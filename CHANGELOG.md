@@ -1,5 +1,18 @@
 # Changelog
 
+## 4.20.2
+- **Sound comes back after wake, not just the card.** While the Mbox is gone, PipeWire moves the default
+  output and the app's "Speakers (Mbox)" / "Headphones (Mbox)" streams to another device, and newer
+  versions don't move them back. After a wake or a recovery, the app now:
+  - switches the Mbox back to pro-audio if needed,
+  - moves its streams back onto the Mbox,
+  - restores the default output from before sleep,
+  - logs what it found and changed. It checks at 2, 6 and 15 seconds.
+- Fixed: a crash when the meters paused for sleep (`events_ok` on a stopped poller).
+- Fixed: time spent asleep was logged as "window not responding" (the watchdog now uses a clock that
+  stops during suspend).
+- **Copy diagnostics** is now also in Settings → App → Sleep & wake, where you'd look for it.
+
 ## 4.20.1
 - The wake hook waits 8 seconds (was 15) for the card to come back on its own before recovering it.
   A hand-made hook that reloads unconditionally after 3 seconds worked on the test machine, so 15

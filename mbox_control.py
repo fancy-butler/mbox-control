@@ -46,7 +46,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QPointF, QRectF
 
 APP_NAME = "Mbox Control"
-VERSION = "4.20.1"
+VERSION = "4.20.2"
 UPDATE_REPO = ""          # "owner/mbox-control" once the project is on GitHub; empty = no online checks
 HOME = Path.home()
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -2439,6 +2439,50 @@ def mbox_pw_card():
         if len(parts) > 1 and "firewire" in parts[1]:
             return parts[1]
     return None
+
+
+def pw_sink_inputs():
+    """[(index, node_name, target, sink_index)] for every playback stream, from pactl's JSON."""
+    try:
+        data = json.loads(run_quiet("pactl", "-f", "json", "list", "sink-inputs", timeout=5) or "[]")
+    except ValueError:
+        return []
+    out = []
+    for si in data:
+        props = si.get("properties", {})
+        out.append((si.get("index"), props.get("node.name", ""), props.get("target.object", ""), si.get("sink")))
+    return out
+
+
+def pw_sinks():
+    """{name: index} of every sink."""
+    out = {}
+    for line in (run_quiet("pactl", "list", "sinks", "short", timeout=5) or "").splitlines():
+        f = line.split("\t")
+        if len(f) > 1 and f[0].strip().isdigit():
+            out[f[1]] = int(f[0])
+    return out
+
+
+OUR_LOOPBACKS = {"sa600_out", "sa600_sink_out", "mbox_headphones_out"}
+
+
+def relink_mbox_streams():
+    """When the Mbox drops out, PipeWire moves our loopbacks ("Speakers (Mbox)", "Headphones (Mbox)") to some
+    other device and doesn't move them back. Put every stream that targets the Mbox back on it.
+    Returns [(stream, from_index, to_sink)] for what was moved."""
+    sinks = pw_sinks()
+    mbox = next((n for n in sinks if "firewire" in n and "pro-output" in n), None)
+    moved = []
+    for idx, name, target, sink in pw_sink_inputs():
+        if not target and name in OUR_LOOPBACKS:          # older PipeWire: target not in the props
+            target = mbox or ""
+        if not target or "firewire" not in target or target not in sinks or idx is None:
+            continue
+        if sink != sinks[target]:
+            run_quiet("pactl", "move-sink-input", str(idx), target, timeout=5)
+            moved.append((name or str(idx), sink, target))
+    return moved
 
 
 # ================================================================== sidebar "now" panel
@@ -6194,6 +6238,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.restore_after_wake = snap
             except Exception as e:  # noqa: BLE001
                 rlog(f"couldn't save the pre-sleep state: {e}")
+            self.remember_default_sink()
             self.close_card_handles("going to sleep")
             self.spectrum_hub.stop_all()
             self.sleep_ctl = self.stop_ctl_daemon()
@@ -6205,6 +6250,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.recover_offered = False
         self.sleep_watch.take_inhibitor()
         self.toast("Woke up — reconnecting to the Mbox…", 0)
+        self.audio_check_pending = True
         rlog("woke up: waiting for the Mbox's card")
         QtCore.QTimer.singleShot(1500, self.watchdog)
 
@@ -6213,6 +6259,39 @@ class MainWindow(QtWidgets.QMainWindow):
         if not getattr(self, "udev_pending", False):          # a burst of events → one check
             self.udev_pending = True
             QtCore.QTimer.singleShot(800, lambda: (setattr(self, "udev_pending", False), self.watchdog()))
+
+    def remember_default_sink(self):
+        cur = (run_quiet("pactl", "get-default-sink", timeout=4) or "").strip()
+        if cur:
+            self.sleep_default_sink = cur
+            rlog(f"default output before: {cur}")
+
+    def restore_audio_after_wake(self):
+        """The card is back — now the PipeWire side: Mbox outputs present, our loopbacks linked to the Mbox
+        again, and the default output what it was. Logs what it finds, so a report shows the state."""
+        if os.environ.get("MBOX_AMIXER") or self.asleep or self.recovering:
+            return
+        sinks = pw_sinks()
+        mbox = [n for n in sinks if "firewire" in n]
+        if not mbox:
+            card = mbox_pw_card()
+            rlog(f"after wake: no Mbox output in PipeWire (card {card or 'not found'}) — switching it to pro-audio")
+            if card:
+                run_quiet("pactl", "set-card-profile", card, "pro-audio", timeout=5)
+            return                                       # the next check (a few seconds later) finishes up
+        moved = relink_mbox_streams()
+        for name, frm, to in moved:
+            rlog(f"after wake: moved {name} back to the Mbox (it had been moved to sink {frm})")
+        want = getattr(self, "sleep_default_sink", "")
+        cur = (run_quiet("pactl", "get-default-sink", timeout=4) or "").strip()
+        if want and want in sinks and cur != want:
+            run_quiet("pactl", "set-default-sink", want, timeout=4)
+            rlog(f"after wake: default output was {cur or 'none'} — put back to {want}")
+        elif want and want not in sinks:
+            rlog(f"after wake: the old default output {want} isn't there (yet)")
+        else:
+            rlog(f"after wake: audio OK — default {cur}, Mbox outputs {', '.join(mbox)}")
+        self.refresh_health()
 
     def maybe_offer_recovery(self):
         """Card gone but the FireWire unit is there: the stuck-after-sleep case. Give the sleep hook time if
@@ -6248,6 +6327,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "anyway? Sound stops for a few seconds.") != QtWidgets.QMessageBox.Yes:
             return
         self.recovering = True
+        self.remember_default_sink()
         rlog(f"recovery started ({'manual' if u['card'] is not None or not self.recover_offered else 'offered'})")
         self.close_card_handles("recovery")
         self.spectrum_hub.stop_all()
@@ -6266,12 +6346,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if ok:
             self.hint.hide()
             self.toast("The Mbox is back.", 6000)
+            self.audio_check_pending = True
             rlog(f"recovery finished: {msg}")
             self.watchdog()
             return
         rlog(f"recovery failed: {msg}")
         self.hint.offer(f"<b>Couldn't bring the Mbox back.</b> {html_escape(msg)} Try again, or restart the PC. "
-                        "The recovery log has every step (Settings → App → Sleep & wake).",
+                        "Settings → App → Sleep & wake → Copy diagnostics has every step.",
                         [("Try again", lambda: self.recover_mbox(force=True)), ("Open log", self.open_recovery_log)])
 
     def open_recovery_log(self):
@@ -6347,6 +6428,12 @@ class MainWindow(QtWidgets.QMainWindow):
         lg = QtWidgets.QPushButton("Open recovery log")
         lg.clicked.connect(self.open_recovery_log)
         row.addWidget(lg)
+        dg = QtWidgets.QPushButton("Copy diagnostics")
+        dg.setToolTip("Copies your system details and both recovery logs (no personal info) — paste them "
+                      "into a bug report or a chat.")
+        dg.clicked.connect(lambda: (QtWidgets.QApplication.clipboard().setText(diagnostics()),
+                                    self.toast("Diagnostics copied — paste them with Ctrl+V.", 6000)))
+        row.addWidget(dg)
         row.addStretch(1)
         l.addLayout(row)
         lay.addWidget(c)
@@ -6429,6 +6516,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.run_refreshers()
         self.check_reset()
         QtCore.QTimer.singleShot(2500, lambda: (fix_default_sink(), self.refresh_health()))
+        if getattr(self, "audio_check_pending", False):  # after sleep/recovery: make sure sound flows again
+            self.audio_check_pending = False
+            for delay in (2000, 6000, 15000):
+                QtCore.QTimer.singleShot(delay, self.restore_audio_after_wake)
+        rlog(f"reconnected to the Mbox (card {card})")
         self.toast("Reconnected to the Mbox.", 5000)
 
     # The Mbox forgets its mixer when powered off (and Avid's driver rewrites it in Windows).
@@ -8320,7 +8412,8 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---------------------------------------------------------------- live data
     def on_events_alive(self, ok):
         self.events_alive = ok
-        self.poller.events_ok = ok
+        if self.poller:                                  # None while paused for sleep / recovery
+            self.poller.events_ok = ok
         if hasattr(self, "events_lbl"):
             self.events_lbl.setText("connected ✓" if ok else "not available — polling instead")
 
@@ -14056,7 +14149,7 @@ class FreezeWatch:
         self.f = open(CRASH_LOG, "a", buffering=1)
         self.f.write(f"\n=== Mbox Control {VERSION} started {datetime.now():%Y-%m-%d %H:%M:%S} ===\n")
         faulthandler.enable(file=self.f, all_threads=True)
-        self.beat = time.time()
+        self.beat = time.monotonic()                     # stands still while the PC sleeps
         self.reported = False
         self.timer = QtCore.QTimer()
         self.timer.timeout.connect(self._tick)
@@ -14071,14 +14164,14 @@ class FreezeWatch:
         sys.excepthook = hook
 
     def _tick(self):
-        self.beat = time.time()
+        self.beat = time.monotonic()
         self.reported = False
 
     def _watch(self):
         import faulthandler
         while True:
             time.sleep(1)
-            stuck = time.time() - self.beat
+            stuck = time.monotonic() - self.beat
             if stuck > 5 and not self.reported:
                 self.reported = True
                 self.f.write(f"--- window not responding for {stuck:.0f} s at {datetime.now():%H:%M:%S} ---\n")

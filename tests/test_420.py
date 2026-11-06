@@ -324,3 +324,60 @@ def test_packaged_system_files_match_the_app():
         mc.sleep_hook_text("/usr/lib/mbox-control/mbox-wake-recover")
     pkg = (Path(__file__).resolve().parents[1] / "packaging/aur/PKGBUILD").read_text()
     assert "system-sleep" not in pkg.split("package()")[1].replace("system-sleep/)", "")   # hook not enabled
+
+
+def test_loopbacks_are_moved_back_to_the_mbox_after_wake(monkeypatch):
+    """While the Mbox was gone PipeWire parked "Speakers (Mbox)" on the HDMI sink; put it back."""
+    mbox = "alsa_output.firewire-0x00a07e0401000000.pro-output-0"
+    calls = []
+
+    def fake(*a, **k):
+        calls.append(a)
+        if a[:3] == ("pactl", "-f", "json"):
+            import json
+            return json.dumps([
+                {"index": 41, "sink": 7, "properties": {"node.name": "sa600_sink_out", "target.object": mbox}},
+                {"index": 42, "sink": 9, "properties": {"node.name": "mbox_headphones_out"}},   # no target prop
+                {"index": 43, "sink": 7, "properties": {"node.name": "firefox"}},              # not ours
+            ])
+        if a[:4] == ("pactl", "list", "sinks", "short"):
+            return f"7\talsa_output.pci-0000_2d_00.1.hdmi-stereo\tPipeWire\n9\t{mbox}\tPipeWire\n55\tsa600_sink\tPipeWire\n"
+        return ""
+    monkeypatch.setattr(mc, "run_quiet", fake)
+    moved = mc.relink_mbox_streams()
+    assert moved == [("sa600_sink_out", 7, mbox)]
+    assert ("pactl", "move-sink-input", "41", mbox) in calls
+    assert not any(c[:2] == ("pactl", "move-sink-input") and c[2] in ("42", "43") for c in calls)
+
+
+def test_default_output_is_put_back_after_wake(win, monkeypatch, tmp_path):
+    monkeypatch.setattr(mc, "RECOVERY_LOG", tmp_path / "recovery.log")
+    monkeypatch.delenv("MBOX_AMIXER", raising=False)
+    state = {"default": "sa600_sink"}
+    calls = []
+
+    def fake(*a, **k):
+        calls.append(a)
+        if a[:2] == ("pactl", "get-default-sink"):
+            return state["default"] + "\n"
+        if a[:2] == ("pactl", "set-default-sink"):
+            state["default"] = a[2]
+            return ""
+        if a[:4] == ("pactl", "list", "sinks", "short"):
+            return ("7\talsa_output.pci-0000_2d_00.1.hdmi-stereo\tPipeWire\n"
+                    "9\talsa_output.firewire-0x00a07e0401000000.pro-output-0\tPipeWire\n55\tsa600_sink\tPipeWire\n")
+        if a[:3] == ("pactl", "-f", "json"):
+            return "[]"
+        return ""
+    monkeypatch.setattr(mc, "run_quiet", fake)
+    win.remember_default_sink()                       # before sleep: Speakers (Mbox)
+    state["default"] = "alsa_output.pci-0000_2d_00.1.hdmi-stereo"   # PipeWire fell back to HDMI
+    win.restore_audio_after_wake()
+    assert state["default"] == "sa600_sink"
+    text = (tmp_path / "recovery.log").read_text()
+    assert "put back to sa600_sink" in text
+
+
+def test_events_signal_after_meters_paused_does_not_crash(win):
+    win.stop_live()
+    win.on_events_alive(False)                         # used to raise AttributeError (poller is None)
