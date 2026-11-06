@@ -67,12 +67,13 @@ def test_eq_follows_the_speaker_set_with_tone(win, monkeypatch):
     win.save_eq_profile(hd280())
     win.assign_eq("B", "HD 280 Pro")
     win.app_state["eq_tone"] = {"bass": 4, "treble": 0}
-    monkeypatch.setattr(win, "current_set", lambda: "B")
+    monkeypatch.setattr(win, "eq_target", lambda: "B")
     win.apply_eq()
     p = sent[-1]
     assert p["name"] == "HD 280 Pro" and any(b["f"] == 105.0 and b["g"] == 4 for b in p["bands"])
-    assert p["preamp"] == pytest.approx(-9.8)          # −5.8 plus room for the +4 dB bass
-    monkeypatch.setattr(win, "current_set", lambda: "A")
+    extra = mc.eq_peak_db(p["bands"]) - mc.eq_peak_db(hd280()["bands"])
+    assert -9.8 <= p["preamp"] <= -5.8 and p["preamp"] == pytest.approx(-5.8 - extra)
+    monkeypatch.setattr(win, "eq_target", lambda: "A")
     win.apply_eq()
     assert sent[-1]["name"] == "Off (flat)"
 

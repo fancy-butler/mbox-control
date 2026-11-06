@@ -1,5 +1,12 @@
 # Changelog
 
+
+## 4.23
+- **Headphones get their own EQ.** The Mbox's headphone jack hears the same mix as the speakers, so the EQ can't follow the Spkr button for them. New Headphones row in Speakers → EQ; it plays when "Listening on headphones" is ticked or the speakers are switched off. A profile that was on Speakers B (where the AutoEQ dialog used to put headphones) is copied over.
+- AutoEQ dialog defaults to Headphones.
+- Bass/treble boosts lower the overall level only by as much as the combined curve really rises (computed from the actual filter shapes), not by the full boost on top of the profile's own headroom.
+- EQ card shows which profile is playing now.
+
 ## 4.22.2
 - **Metronome: "Beats" is now a time signature.** Choose from 4/4, 3/4, 2/4, 5/4, 6/8, 9/8, 12/8, 5/8,
   7/8, or no accent.

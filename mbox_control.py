@@ -46,7 +46,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QPointF, QRectF
 
 APP_NAME = "Mbox Control"
-VERSION = "4.22.2"
+VERSION = "4.23"
 UPDATE_REPO = ""          # "owner/mbox-control" once the project is on GitHub; empty = no online checks
 HOME = Path.home()
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -5612,6 +5612,32 @@ def eq_params(profile):
     return vals
 
 
+def band_db(b, f, rate=48000.0):
+    """Gain in dB of one EQ band (RBJ biquad, as PipeWire builds it) at frequency f."""
+    A, w0 = 10 ** (float(b["g"]) / 40), 2 * math.pi * float(b["f"]) / rate
+    alpha, c = math.sin(w0) / (2 * max(0.1, float(b["q"]))), math.cos(w0)
+    t = b["type"]
+    if t == "PK":
+        bb = (1 + alpha * A, -2 * c, 1 - alpha * A); aa = (1 + alpha / A, -2 * c, 1 - alpha / A)
+    else:
+        k2, sgn = 2 * math.sqrt(A) * alpha, (1 if t == "LSC" else -1)
+        bb = (A * ((A + 1) - sgn * (A - 1) * c + k2), sgn * 2 * A * ((A - 1) - sgn * (A + 1) * c),
+              A * ((A + 1) - sgn * (A - 1) * c - k2))
+        aa = ((A + 1) + sgn * (A - 1) * c + k2, -sgn * 2 * ((A - 1) + sgn * (A + 1) * c),
+              (A + 1) + sgn * (A - 1) * c - k2)
+    z = complex(math.cos(2 * math.pi * f / rate), -math.sin(2 * math.pi * f / rate))
+    h = (bb[0] + bb[1] * z + bb[2] * z * z) / (aa[0] + aa[1] * z + aa[2] * z * z)
+    return 20 * math.log10(max(abs(h), 1e-9))
+
+
+def eq_peak_db(bands):
+    """Highest point of the combined curve, 20 Hz–20 kHz: how much the level must drop so nothing clips."""
+    if not bands:
+        return 0.0
+    freqs = [20 * 1000 ** (i / 199) for i in range(200)]
+    return max(0.0, max(sum(band_db(b, f) for b in bands) for f in freqs))
+
+
 def eq_pw_params(profile, per_call=5, only=None):
     """→ pw-cli parameter lists, a few slots each. pw-cli silently drops lists longer than ~500 characters
     (and still says OK), so a whole profile is sent in small pieces. `only`: slots the running chain has."""
@@ -6526,6 +6552,9 @@ class MainWindow(QtWidgets.QMainWindow):
                      ("theme", "system"), ("accent", "system")):
             self.app_state.setdefault(k, v)
         self.migrate_input_names()
+        sets = self.app_state.get("eq_sets", {})
+        if "H" not in sets and sets.get("B", "Off (flat)") != "Off (flat)":
+            sets["H"] = sets["B"]                       # before 4.23 the AutoEQ dialog put headphones on B
         install_wheel_guard()
         if "take_restore" in self.app_state:            # the app closed during a quick take: undo its borrowing
             self.app_state["rec_src"] = self.app_state.pop("take_restore") or None
@@ -10471,7 +10500,9 @@ class MainWindow(QtWidgets.QMainWindow):
         lay.setContentsMargins(0, 8, 0, 0)
         lay.setSpacing(14)
         c, l = card("EQ for each speaker set", "Correct your headphones or speakers. The EQ follows the Spkr "
-                                               "button: headphones get theirs, speakers get theirs.")
+                                               "button. The Mbox's headphone jack hears the same thing as the "
+                                               "speakers, so headphones get their EQ when you tick 'Listening on "
+                                               "headphones' below or switch the speakers off.")
         top = QtWidgets.QHBoxLayout()
         self.eq_on_btn = QtWidgets.QPushButton()
         self.eq_on_btn.clicked.connect(self.toggle_eq)
@@ -10538,11 +10569,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 it.widget().deleteLater()
         names = list(self.eq_profiles())
         assign = self.app_state.get("eq_sets", {})
-        for r, L in enumerate("ABC"):
-            own = self.label(f"spk{L}", "")
-            dot = LETTER_COLOUR[L][1]
-            self.eq_rows.addWidget(QtWidgets.QLabel(f"<span style='color:{dot}'>●</span> <b>Speakers {L}</b>"
-                                                    + (f" — {html_escape(own)}" if own else "")), r, 0)
+        for r, L in enumerate("ABCH"):
+            if L == "H":
+                self.eq_rows.addWidget(QtWidgets.QLabel("🎧 <b>Headphones</b>"), r, 0)
+            else:
+                own = self.label(f"spk{L}", "")
+                dot = LETTER_COLOUR[L][1]
+                self.eq_rows.addWidget(QtWidgets.QLabel(f"<span style='color:{dot}'>●</span> <b>Speakers {L}</b>"
+                                                        + (f" — {html_escape(own)}" if own else "")), r, 0)
             cb = QtWidgets.QComboBox()
             cb.addItems(names)
             cb.setCurrentText(assign.get(L, "Off (flat)") if assign.get(L) in names else "Off (flat)")
@@ -10557,16 +10591,34 @@ class MainWindow(QtWidgets.QMainWindow):
                            "you want to hear everything on. Computer sound only.")
             sub.toggled.connect(lambda on, L=L: self.set_subsonic(L, on))
             self.eq_rows.addWidget(sub, r, 2)
+        hp = QtWidgets.QCheckBox("Listening on headphones — use the Headphones EQ (also automatic when the "
+                                 "speakers are switched off)")
+        hp.setChecked(bool(self.app_state.get("hp_listen")))
+        hp.setToolTip("The speakers, if they're on, get the headphone EQ too while this is ticked.")
+        hp.toggled.connect(self.set_hp_listen)
+        self.eq_rows.addWidget(hp, 4, 0, 1, 3)
+        t = self.eq_target() if hasattr(self, "by_name") else "A"
+        now = "Headphones" if t == "H" else f"Speakers {t}"
+        self.eq_rows.addWidget(muted(f"Playing now: {now} — "
+                                     f"{self.app_state.get('eq_sets', {}).get(t, 'Off (flat)')}"), 5, 0, 1, 3)
+
+    def set_hp_listen(self, on):
+        self.app_state["hp_listen"] = bool(on)
+        self.save_app_state()
+        self.apply_eq()
+        QtCore.QTimer.singleShot(0, self.refresh_eq_ui)
+        self.toast("Headphone EQ on." if on else "EQ follows the Spkr button again.", 4000)
 
     def set_subsonic(self, letter, on):
         before = chain_wanted(self.app_state)
         self.app_state.setdefault("subsonic_sets", {})[letter] = bool(on)
         self.subsonic_changed(before)
-        self.toast(f"Subsonic filter {'on' if on else 'off'} for Speakers {letter}.", 4000)
+        who = "the headphones" if letter == "H" else f"Speakers {letter}"
+        self.toast(f"Subsonic filter {'on' if on else 'off'} for {who}.", 4000)
 
     def enable_subsonic_everywhere(self):
         before = chain_wanted(self.app_state)
-        self.app_state["subsonic_sets"] = {L: True for L in "ABC"}
+        self.app_state["subsonic_sets"] = {L: True for L in "ABCH"}
         self.subsonic_changed(before)
         self.refresh_eq_ui()
         self.toast("Subsonic filter on — turn it off per speaker set in Speakers → EQ.", 6000)
@@ -10591,23 +10643,34 @@ class MainWindow(QtWidgets.QMainWindow):
         self.app_state.setdefault("eq_sets", {})[letter] = name
         self.save_app_state()
         self.apply_eq()
+        QtCore.QTimer.singleShot(0, self.refresh_eq_ui)
 
     def current_set(self):
         it = (self.ctrl_item("spkr-button") or "").split("-")[0]
         return SPEAKERS.get(it, ("A",))[0]
 
+    def eq_target(self):
+        """Whose EQ plays: 'H' (headphones) when 'Listening on headphones' is ticked or the speakers are
+        switched off — the Mbox's headphone jack hears the same mix as the speakers — else the speaker set."""
+        if self.app_state.get("hp_listen") or (self.ctrl_item("spkr-button") or "Off") == "Off":
+            return "H"
+        return self.current_set()
+
     def eq_profile_now(self):
-        name = self.app_state.get("eq_sets", {}).get(self.current_set(), "Off (flat)")
+        target = self.eq_target()
+        name = self.app_state.get("eq_sets", {}).get(target, "Off (flat)")
         prof = dict(self.eq_profiles().get(name, EQ_FLAT))
         tone = self.app_state.get("eq_tone", {})
         extra = [{"type": "LSC", "f": 105.0, "q": 0.7, "g": float(tone.get("bass", 0))},
                  {"type": "HSC", "f": 8000.0, "q": 0.7, "g": float(tone.get("treble", 0))}]
-        prof["bands"] = list(prof.get("bands", [])) + [b for b in extra if b["g"]]
-        boost = max([0.0] + [b["g"] for b in extra])
-        prof["preamp"] = float(prof.get("preamp", 0.0)) - boost          # tone boosts never clip
+        base = list(prof.get("bands", []))
+        prof["bands"] = base + [b for b in extra if b["g"]]
+        # drop the level only as far as the combined curve rises above the profile's own peak: never clips
+        extra_peak = eq_peak_db(prof["bands"]) - eq_peak_db(base)
+        prof["preamp"] = float(prof.get("preamp", 0.0)) - max(0.0, extra_peak)
         if not self.app_state.get("eq_on"):
             prof = dict(EQ_FLAT)                         # chain only there for the subsonic filter
-        prof["subsonic"] = bool(self.app_state.get("subsonic_sets", {}).get(self.current_set()))
+        prof["subsonic"] = bool(self.app_state.get("subsonic_sets", {}).get(target))
         return prof
 
     def apply_eq(self):
@@ -10677,10 +10740,11 @@ class MainWindow(QtWidgets.QMainWindow):
         row = QtWidgets.QHBoxLayout()
         row.addWidget(QtWidgets.QLabel("Use it for"))
         target = QtWidgets.QComboBox()
+        target.addItem("Headphones", "H")
         for L in "ABC":
             own = self.label(f"spk{L}", "")
             target.addItem(f"Speakers {L}" + (f" — {own}" if own else ""), L)
-        target.setCurrentIndex(1)                                   # B = headphones on most setups
+        target.setCurrentIndex(0)                                   # AutoEQ only has headphones
         row.addWidget(target, 1)
         use = QtWidgets.QPushButton("Use this one")
         use.setObjectName("primary")
@@ -10927,7 +10991,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh_soon()
 
     def on_speaker_change(self, item, force=False):
-        QtCore.QTimer.singleShot(0, self.apply_eq)            # each speaker set has its own EQ
+        QtCore.QTimer.singleShot(0, lambda: (self.apply_eq(), self.refresh_eq_ui()))   # each set has its own EQ
         if not item or not self.app_state["cr_enabled"] or self.app_state.get("spk_mute"):
             self.last_spk = item
             return
