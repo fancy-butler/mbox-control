@@ -416,3 +416,38 @@ def test_subsonic_tip_can_be_dismissed(win):
     assert tips and len(tips[0]) == 5
     tips[0][4]()
     assert not [i for i in win.health_items() if "subsonic" in i[1]]
+
+
+def _route_out(win, first, mix=None, direct=None):
+    c = win.ctrl("output-source")
+    if mix:
+        c.values[first], c.values[first + 1] = c.items.index(f"Mixer-{2 * mix - 1}"), c.items.index(f"Mixer-{2 * mix}")
+    else:
+        c.values[first], c.values[first + 1] = c.items.index(direct[0]), c.items.index(direct[1])
+
+
+def test_metronome_reaches_the_headphone_mix_and_puts_it_back(win):
+    _route_out(win, 0, mix=1)                          # speakers: Stereo Mix 1
+    _route_out(win, 6, mix=3)                          # Headphone A: Stereo Mix 3, without computer 1/2
+    _route_out(win, 8, mix=1)                          # Headphone B: same as the speakers
+    sl, sr = win.slot_of("Stream-1"), win.slot_of("Stream-2")
+    for k in (1, 3):
+        win.mix_set_lr(k, sl, 0, 0)
+        win.mix_set_lr(k, sr, 0, 0)
+    assert win.metro_route(True) == ["Headphone A"]
+    assert win.mix_lr(3, sl) == (mc.UNITY, 0) and win.mix_lr(3, sr) == (0, mc.UNITY)
+    assert win.mix_lr(1, sl) == (0, 0)                 # never onto the speakers
+    win.metro_route(False)
+    assert win.mix_lr(3, sl) == (0, 0) and win.mix_lr(3, sr) == (0, 0)
+
+
+def test_metronome_explains_when_it_cannot_reach_headphones(win, monkeypatch):
+    _route_out(win, 0, mix=1)
+    _route_out(win, 6, mix=1)
+    _route_out(win, 8, mix=1)
+    monkeypatch.setattr(mc, "pw_node_exists", lambda name, kind: True)
+    started = []
+    monkeypatch.setattr(mc.Metronome, "start", lambda self: started.append(1))
+    win.toggle_metronome()
+    assert not started and win.hint.isVisible() and "can't reach your headphones" in win.hint.text.text()
+    assert win.metro is None

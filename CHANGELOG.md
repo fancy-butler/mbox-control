@@ -1,5 +1,14 @@
 # Changelog
 
+## 4.21.1
+- **Fixed: the metronome could start and play nothing.** It plays through "Headphones (Mbox)" (computer
+  1/2), which only reaches a headphone jack whose mix includes those channels. After a scene change or a
+  reset, or with headphones in the B jack, the clicks went nowhere.
+  - The metronome now adds itself to whatever mix each headphone jack is playing (never the speakers'),
+    and puts it back when it stops.
+  - It says which jack it's on.
+  - If no headphone jack has its own mix, it explains and offers to set one up.
+
 ## 4.21
 - **Subsonic filter** (Speakers → EQ, per speaker set). A 24 dB/octave high-pass at 30 Hz cuts the
   rumble and thumps from hard bass plucks that make small speakers pop. Measured through PipeWire:

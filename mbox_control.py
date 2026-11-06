@@ -46,7 +46,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QPointF, QRectF
 
 APP_NAME = "Mbox Control"
-VERSION = "4.21"
+VERSION = "4.21.1"
 UPDATE_REPO = ""          # "owner/mbox-control" once the project is on GitHub; empty = no online checks
 HOME = Path.home()
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -11320,14 +11320,58 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.metro:
             self.metro.stop()
             self.metro = None
+            self.metro_route(False)
             self.met_btn.setText("▶  Start")
             self.save_app_state()
             return
         target = "mbox_headphones" if pw_node_exists("mbox_headphones", "sink") else None
+        if target:
+            reached = self.metro_route(True)
+            if reached:
+                self.toast(f"Metronome → {' and '.join(reached)}.", 4000)
+            else:
+                self.hint.offer("<b>The metronome can't reach your headphones.</b> Both headphone jacks play the "
+                                "same mix as the speakers, so the clicks would end up on the speakers (and on a "
+                                "recording). Give the headphones their own mix — the Headphone A jack then "
+                                "plays computer sound for headphones, the metronome and anything you monitor.",
+                                [("Give headphones their own mix", self.install_headphones)])
+                return
+        else:
+            self.hint.offer("<b>Playing the metronome on your normal output.</b> Add a “Headphones (Mbox)” "
+                            "output and it clicks in the headphones only, never on the speakers.",
+                            [("Add Headphones (Mbox)", self.install_headphones)])
         self.metro = Metronome(target, self.met_bpm.value(), self.met_beats.value(), self.met_vol.value() / 100,
                                rate=self.rate())
         self.metro.start()
         self.met_btn.setText("■  Stop")
+
+    def metro_route(self, on):
+        """Make sure the clicks (computer 1/2, the "Headphones (Mbox)" channels) reach whatever each headphone
+        jack is playing — never the speakers' mix. Put it back on stop. → names of the jacks reached."""
+        saved = getattr(self, "metro_saved", None)
+        if not on:
+            for k, slot, l_, r_ in reversed(saved or []):
+                self.mix_set_lr(k, slot, l_, r_)
+            self.metro_saved = None
+            return []
+        if saved:
+            return []
+        kind0, spk_mix, _ = self.pair_source(0)
+        spk_mix = spk_mix if kind0 == "mix" else None
+        sl, sr = self.slot_of(PC_HP_LEFT), self.slot_of(PC_HP_RIGHT)
+        reached, self.metro_saved = [], []
+        for name, first in (("Headphone A", 6), ("Headphone B", 8)):
+            kind, val, _ = self.pair_source(first)
+            if kind == "direct" and tuple(val) == (PC_HP_LEFT, PC_HP_RIGHT):
+                reached.append(name)
+            elif kind == "mix" and val != spk_mix and None not in (sl, sr):
+                for slot, want in ((sl, (UNITY, 0)), (sr, (0, UNITY))):
+                    cur = self.mix_lr(val, slot)
+                    if max(cur) < UNITY // 2:
+                        self.metro_saved.append((val, slot, *cur))
+                        self.mix_set_lr(val, slot, *want)
+                reached.append(name)
+        return reached
 
     # ---------------------------------------------------------------- 4.17: practice player
     def build_practice_card(self, lay):
