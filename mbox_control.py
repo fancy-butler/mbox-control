@@ -46,7 +46,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QPointF, QRectF
 
 APP_NAME = "Mbox Control"
-VERSION = "4.19.6"
+VERSION = "4.19.7"
 UPDATE_REPO = ""          # "owner/mbox-control" once the project is on GitHub; empty = no online checks
 HOME = Path.home()
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -10504,6 +10504,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if choice.startswith("pair:"):
             left = choice[5:]
             return [left, pair_right(left)]
+        if choice.startswith("multi:"):
+            return [i for i in choice[6:].split(",") if i]
         return [choice[5:]] if choice.startswith("mono:") else []
 
     def capture_for(self, choice):
@@ -10607,21 +10609,44 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if prev:
             return
-        items = self.source_items(choice or "")
-        if len(items) == 1:
-            want = [(items[0], UNITY, UNITY)]           # one instrument: centred, both speakers
+        choice = choice or ""
+        items = self.source_items(choice)
+        if choice.startswith("multi:") or len(items) == 1:
+            want = [(i, UNITY, UNITY) for i in items]   # instruments/mics: each centred, both sides
         else:
             want = [(items[0], UNITY, 0), (items[1], 0, UNITY)]     # a stereo source: left and right
         slots = [(item, self.slot_of(item), l, r) for item, l, r in want]
         if not slots or any(sl is None for _, sl, _, _ in slots):
             self.toast("That input isn't in the Mbox mixer — can't play it through the speakers.", 6000)
             return
-        if all(max(self.mix_lr(1, sl)) >= UNITY // 2 for _, sl, _, _ in slots):
-            return                                      # already audible: leave it alone
+        mixes, direct = self.listening_mixes()
+        if direct and not self.app_state.get("hp_direct_told"):
+            self.app_state["hp_direct_told"] = True
+            self.save_app_state()
+            self.hint.offer(f"<b>{' and '.join(direct)} play{'s' if len(direct) == 1 else ''} the computer "
+                            "directly</b>, so you won't hear your inputs there while recording. To hear them, "
+                            "set the headphones to a mix on the Mixer page (e.g. Stereo Mix 1, same as the "
+                            "speakers).", [("Open the Mixer", lambda: self.nav.setCurrentRow(
+                                self.page_index("Mixer")))])
         mons[owner] = []
-        for item, sl, l, r in slots:
-            mons[owner].append((1, sl, *self.mix_lr(1, sl)))
-            self.mix_set_lr(1, sl, l, r)
+        for k in mixes:
+            if all(max(self.mix_lr(k, sl)) >= UNITY // 2 for _, sl, _, _ in slots):
+                continue                                # already audible in this mix: leave it alone
+            for item, sl, l, r in slots:
+                mons[owner].append((k, sl, *self.mix_lr(k, sl)))
+                self.mix_set_lr(k, sl, l, r)
+
+    def listening_mixes(self):
+        """The stereo mixes the speakers (Outputs 1/2) and headphones play, and any output playing the computer
+        straight (where an input can't be added)."""
+        mixes, direct = [], []
+        for name, first in (("Outputs 1/2", 0), ("Headphone A", 6), ("Headphone B", 8)):
+            kind, k, _ = self.pair_source(first)
+            if kind == "mix" and k not in mixes:
+                mixes.append(k)
+            elif kind == "direct" and name.startswith("Headphone"):
+                direct.append(name)
+        return (mixes or [1]), direct
 
     def retro_failed(self, msg):
         self.retro_error = time.time()
@@ -10694,6 +10719,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.mt_strips[item] = st
             self.mt_strip_box.addWidget(st)
         l.addLayout(self.mt_strip_box)
+        self.mt_hear = QtWidgets.QCheckBox("Hear them while recording (speakers and headphones)")
+        self.mt_hear.setChecked(self.app_state.get("mt_hear", True))
+        self.mt_hear.setToolTip("Plays the ticked inputs from the Mbox's own mixer — no delay, exactly what's "
+                                "being recorded. Put back the way it was when you stop.")
+        self.mt_hear.toggled.connect(self.mt_hear_toggled)
+        l.addWidget(self.mt_hear)
+        l.addWidget(self.lowcut_row())
         self.refresh_mt_strips()
         self.refreshers.append(self.refresh_mt_strips)      # names change (e.g. the F/R button flipped)
         brow = QtWidgets.QHBoxLayout()
@@ -10705,6 +10737,48 @@ class MainWindow(QtWidgets.QMainWindow):
         l.addLayout(brow)
         lay.addWidget(c)
         self.mt_proc = None
+
+    def lowcut_row(self):
+        """75 Hz low-cut switches for Inputs 1–4 — a setting in the Mbox itself, so it applies to every
+        recording. On for mics (rumble, desk thumps, a bass leaking into the mic); off for bass."""
+        box = QtWidgets.QWidget()
+        h = QtWidgets.QHBoxLayout(box)
+        h.setContentsMargins(0, 0, 0, 0)
+        lab = QtWidgets.QLabel("Low-cut (75 Hz)")
+        lab.setToolTip("Removes rumble, thumps and the low end leaking into a mic. Use it on mics, not on "
+                       "bass or kick drum. It's the Mbox's own filter, so it applies to every recording "
+                       "and to what you hear.")
+        h.addWidget(lab)
+        boxes = []
+        for i in range(4):
+            cb = self.bind_check("input-hp-filter", f"Input {i + 1}", 0, i)
+            cb.setToolTip(lab.toolTip())
+            h.addWidget(cb)
+            boxes.append(cb)
+        h.addStretch(1)
+
+        def names():
+            for i, cb in enumerate(boxes):
+                own = self.label(f"in{i}", "")
+                cb.setText(f"Input {i + 1}" + (f" ({own})" if own else ""))
+        names()
+        self.refreshers.append(names)
+        return box
+
+    def show_takes_folder(self):
+        folder = self.takes_dir()
+        folder.mkdir(parents=True, exist_ok=True)
+        last = Path(self.app_state.get("last_take") or "")
+        reveal_in_files(last if last.is_file() and last.parent == folder else folder)
+
+    def mt_choice(self):
+        return "multi:" + ",".join(self.app_state.get("mt_inputs", []))
+
+    def mt_hear_toggled(self, on):
+        self.app_state["mt_hear"] = on
+        self.save_app_state()
+        if self.mt_proc:
+            self.input_monitor("multitrack", self.mt_choice(), on)
 
     def refresh_mt_strips(self):
         for item, st in self.mt_strips.items():
@@ -10718,6 +10792,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.mt_proc.terminate()
             self.mt_proc.wait(3000)
             self.mt_proc = None
+            self.input_monitor("multitrack", "", False)
             self.mt_timer.stop()
             self.mt_btn.setText("●  Record multitrack")
             self.mt_btn.setStyleSheet("")
@@ -10749,6 +10824,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mt_proc = subprocess.Popen(capture_cmd(src, auxes, self.rate(), out=str(self.mt_file), fmt="s24"),
                                         stderr=subprocess.DEVNULL)
         self.mt_started = time.time()
+        if self.mt_hear.isChecked():
+            self.input_monitor("multitrack", self.mt_choice(), True)
         self.mt_btn.setText("■  Stop")
         self.mt_btn.setStyleSheet("background:#f85149; color:white;")
         self.mt_timer = QtCore.QTimer(self)
@@ -11157,6 +11234,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                   "Put back the way it was when the take stops.")
         self.take_hear.toggled.connect(self.take_hear_toggled)
         l.addWidget(self.take_hear)
+        l.addWidget(self.lowcut_row())
         prow = QtWidgets.QHBoxLayout()
         prow.addWidget(QtWidgets.QLabel("After recording"))
         self.take_polish = QtWidgets.QComboBox()
@@ -11194,9 +11272,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.take_aud = QtWidgets.QPushButton("Open in Audacity")
         self.take_aud.clicked.connect(lambda: self.open_audacity(self.app_state.get("last_take")))
         self.take_dir_btn = QtWidgets.QPushButton("Show folder")
-        self.take_dir_btn.clicked.connect(lambda: (self.takes_dir().mkdir(parents=True, exist_ok=True),
-                                                   QtGui.QDesktopServices.openUrl(
-                                                       QtCore.QUrl.fromLocalFile(str(self.takes_dir())))))
+        self.take_dir_btn.clicked.connect(self.show_takes_folder)
         for b in (self.take_play, self.take_aud, self.take_dir_btn):
             last.addWidget(b)
         l.addLayout(last)
@@ -13142,6 +13218,28 @@ def service_ready(backend):
 
 
 CRASH_LOG = CONF_DIR / "crash.log"
+
+
+def reveal_in_files(path):
+    """Show a file (selected) or folder in the file manager and bring its window to the front — even when
+    that folder is already open behind other windows. Uses the freedesktop FileManager1 service (Dolphin,
+    Nautilus, Nemo, Thunar…), which raises the existing window; falls back to opening the folder."""
+    path = Path(path)
+    try:
+        from PySide6 import QtDBus
+        bus = QtDBus.QDBusConnection.sessionBus()
+        iface = QtDBus.QDBusInterface("org.freedesktop.FileManager1", "/org/freedesktop/FileManager1",
+                                      "org.freedesktop.FileManager1", bus)
+        if iface.isValid():
+            uri = QtCore.QUrl.fromLocalFile(str(path)).toString()
+            method = "ShowItems" if path.is_file() else "ShowFolders"
+            token = os.environ.get("XDG_ACTIVATION_TOKEN", "")
+            reply = iface.call(method, [uri], token)
+            if reply.type() != QtDBus.QDBusMessage.ErrorMessage:
+                return True
+    except Exception:  # noqa: BLE001
+        pass
+    return QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path if path.is_dir() else path.parent)))
 
 
 class WheelGuard(QtCore.QObject):

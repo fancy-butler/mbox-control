@@ -1,5 +1,21 @@
 # Changelog
 
+## 4.19.7
+- **Multitrack: "Hear them while recording"** (on by default). The ticked inputs play from the Mbox's
+  own mixer, with no delay, exactly as they're being recorded. They're put back when you stop.
+- **"Hear it" now reaches the headphones.** Quick take, Capture and Multitrack add the input to every
+  mix your speakers and headphones play, not only Outputs 1/2.
+- If a headphone output plays the computer directly (so no input can be added), the app explains that
+  once and offers to open the Mixer.
+- **Low-cut (75 Hz) switches for Inputs 1–4**, right in Quick take and Multitrack. Before, only the
+  "Record voice" scene turned it on. Use it for mics; leave it off for bass. It's the Mbox's own
+  filter, so it also applies to Capture and to what you hear.
+- **Show folder brings the folder to the front** even if it's already open behind other windows, and
+  selects your last take. It uses the desktop's file-manager service (Dolphin and others), and falls
+  back to simply opening the folder.
+- Checked: the Mbox doesn't report its Multi button to Linux (only meter events arrive), so it can't
+  be used.
+
 ## 4.19.6
 - **Scrolling the page never changes a setting.** Drop-downs, number boxes and sliders (mixer faders
   included) only respond to the wheel or trackpad after you click them. Otherwise the scroll moves the

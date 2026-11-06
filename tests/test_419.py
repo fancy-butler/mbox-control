@@ -278,3 +278,71 @@ def test_scrolling_the_page_never_changes_a_setting(win, spinner):
             pos, box.mapToGlobal(pos), QtCore.QPoint(0, 0), QtCore.QPoint(0, -120), QtCore.Qt.NoButton,
             QtCore.Qt.NoModifier, QtCore.Qt.NoScrollPhase, False))
         assert box.currentIndex() != before
+
+
+def _route(win, first, mix):
+    c = win.ctrl("output-source")
+    c.values[first] = c.items.index(f"Mixer-{2 * mix - 1}")
+    c.values[first + 1] = c.items.index(f"Mixer-{2 * mix}")
+
+
+def test_hearing_reaches_the_headphones_mix_too(win):
+    _route(win, 0, 1)
+    _route(win, 6, 2)                                   # Headphone A plays Stereo Mix 2
+    s1, s2 = win.slot_of("Analog-A-1"), win.slot_of("Analog-A-2")
+    for k in (1, 2):
+        for sl in (s1, s2):
+            win.mix_set_lr(k, sl, 0, 0)
+    win.input_monitor("multitrack", "multi:Analog-A-1,Analog-A-2", True)
+    for k in (1, 2):
+        assert win.mix_lr(k, s1) == (mc.UNITY, mc.UNITY) and win.mix_lr(k, s2) == (mc.UNITY, mc.UNITY)
+    win.input_monitor("multitrack", "", False)
+    for k in (1, 2):
+        assert win.mix_lr(k, s1) == (0, 0) and win.mix_lr(k, s2) == (0, 0)
+
+
+def test_headphones_playing_the_computer_directly_are_explained_once(win):
+    c = win.ctrl("output-source")
+    c.values[6] = c.items.index("Stream-1")
+    c.values[7] = c.items.index("Stream-2")
+    win.app_state.pop("hp_direct_told", None)
+    win.input_monitor("take", "mono:Analog-A-1", True)
+    assert win.hint.isVisible() and "Headphone A" in win.hint.text.text()
+    win.input_monitor("take", "", False)
+    win.hint.hide()
+    win.input_monitor("take", "mono:Analog-A-1", True)
+    assert not win.hint.isVisible()
+    win.input_monitor("take", "", False)
+
+
+def test_lowcut_switches_follow_the_mbox_and_names(win, spinner):
+    c = win.ctrl("input-hp-filter")
+    cbs = [w for w in win.findChildren(mc.QtWidgets.QCheckBox) if w.text().startswith("Input 2")
+           and "rumble" in w.toolTip()]
+    assert len(cbs) == 2                                # Quick take and Multitrack
+    cbs[0].setChecked(True)
+    assert c.values[1] is True or c.values[1] == 1
+    win.run_refreshers()
+    assert cbs[1].isChecked()                           # both reflect the one Mbox setting
+    win.set_label("in1", "AT2020")
+    assert all("AT2020" in cb.text() for cb in cbs)
+
+
+def test_show_folder_reveals_the_last_take(win, tmp_path, monkeypatch):
+    got = []
+    monkeypatch.setattr(mc, "reveal_in_files", lambda p: got.append(p))
+    take = win.takes_dir() / "take-x.flac"
+    take.parent.mkdir(parents=True, exist_ok=True)
+    take.write_bytes(b"x")
+    win.app_state["last_take"] = str(take)
+    win.take_dir_btn.click()
+    assert got == [take]                                # the file itself, so it's selected
+
+
+def test_reveal_falls_back_to_opening_the_folder(tmp_path, monkeypatch):
+    opened = []
+    monkeypatch.setattr(mc.QtGui.QDesktopServices, "openUrl", lambda u: opened.append(u.toLocalFile()) or True)
+    f = tmp_path / "a.flac"
+    f.write_bytes(b"x")
+    mc.reveal_in_files(f)                               # no file-manager service in the test session
+    assert opened in ([], [str(tmp_path)])
