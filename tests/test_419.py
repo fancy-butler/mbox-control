@@ -346,3 +346,37 @@ def test_reveal_falls_back_to_opening_the_folder(tmp_path, monkeypatch):
     f.write_bytes(b"x")
     mc.reveal_in_files(f)                               # no file-manager service in the test session
     assert opened in ([], [str(tmp_path)])
+
+
+def test_kwin_raise_script_is_valid_javascript_shape(tmp_path):
+    js = mc.KWIN_RAISE_JS % '"Mbox takes"'
+    assert 'var want = "Mbox takes"' in js and "activeWindow" in js and "activeClient" in js
+    assert mc.kwin_raise("Mbox takes") is False          # no KWin in the test session: quietly does nothing
+
+
+def test_multitrack_can_normalize_each_track(win, tmp_path):
+    """Stop a (fake) multitrack: a quiet mic track and a loud bass track both come out peaking at −1 dB."""
+    import numpy as np
+    t = np.arange(48000) / 48000
+    x = np.stack([0.5 * np.sin(2 * np.pi * 82 * t), 0.03 * np.sin(2 * np.pi * 220 * t)], 1).astype(np.float32)
+    folder = tmp_path / "session"
+    folder.mkdir()
+    wav = folder / "all-inputs.wav"
+    subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-f", "f32le", "-ar", "48000", "-ac", "2", "-i", "-",
+                    "-c:a", "pcm_s24le", str(wav)], input=x.tobytes(), check=True)
+
+    class P:
+        def terminate(self):
+            pass
+
+        def wait(self, _t):
+            pass
+    win.mt_proc, win.mt_file, win.mt_names, win.mt_folder = P(), wav, ["Bass", "Mic"], folder
+    win.mt_timer = mc.QtCore.QTimer()
+    win.app_state["save_fmt"] = "flac"
+    win.mt_norm.setChecked(True)
+    win.toggle_multitrack()
+    outs = sorted(folder.glob("*.flac"))
+    assert len(outs) == 2
+    for o in outs:
+        assert abs(mc.peak_db(o) - (-1.0)) < 0.3

@@ -46,7 +46,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QPointF, QRectF
 
 APP_NAME = "Mbox Control"
-VERSION = "4.19.7"
+VERSION = "4.19.8"
 UPDATE_REPO = ""          # "owner/mbox-control" once the project is on GitHub; empty = no online checks
 HOME = Path.home()
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -10725,6 +10725,14 @@ class MainWindow(QtWidgets.QMainWindow):
                                 "being recorded. Put back the way it was when you stop.")
         self.mt_hear.toggled.connect(self.mt_hear_toggled)
         l.addWidget(self.mt_hear)
+        self.mt_norm = QtWidgets.QCheckBox("Normalize each track after recording")
+        self.mt_norm.setChecked(self.app_state.get("mt_norm", False))
+        self.mt_norm.setToolTip("Turns each track up (or down) on its own so its loudest point sits at −1 dB — "
+                                "a quiet mic track comes up next to the bass. Volume only; the sound isn't "
+                                "changed. Leave it off if you'll set levels in a mixing program anyway.")
+        self.mt_norm.toggled.connect(lambda on: (self.app_state.__setitem__("mt_norm", on),
+                                                 self.save_app_state()))
+        l.addWidget(self.mt_norm)
         l.addWidget(self.lowcut_row())
         self.refresh_mt_strips()
         self.refreshers.append(self.refresh_mt_strips)      # names change (e.g. the F/R button flipped)
@@ -10799,6 +10807,14 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 outs = split_multitrack(self.mt_file, self.mt_names, self.mt_folder)
                 self.mt_file.unlink()
+                if self.mt_norm.isChecked():
+                    key = self.app_state.get("save_fmt", "flac")
+                    lossy = key.startswith("mp3") or key in ("aac", "opus", "ogg")
+                    for o in outs:
+                        try:
+                            polish_take(o, "normalize", target=-2.0 if lossy else -1.0)
+                        except (RuntimeError, OSError) as e:
+                            self.toast(f"Couldn't normalize {o.name}: {e}", 8000)
                 outs = [self.finish_format(o) for o in outs]
                 self.mt_note.setText(f"Saved {len(outs)} tracks in {self.mt_folder.name}.")
                 self.toast(f"Saved {len(outs)} tracks — {self.mt_folder}", 8000)
@@ -13220,6 +13236,50 @@ def service_ready(backend):
 CRASH_LOG = CONF_DIR / "crash.log"
 
 
+KWIN_RAISE_JS = """
+var want = %s;
+var list = (typeof workspace.windowList === "function") ? workspace.windowList() : workspace.clientList();
+for (var i = 0; i < list.length; i++) {
+    var w = list[i];
+    var cls = String(w.resourceClass || "").toLowerCase();
+    var file = /dolphin|nautilus|nemo|thunar|caja|pcmanfm/.test(cls);
+    if (file && String(w.caption).indexOf(want) >= 0) {
+        if (w.minimized) { w.minimized = false; }
+        if ("activeWindow" in workspace) { workspace.activeWindow = w; } else { workspace.activeClient = w; }
+        break;
+    }
+}
+"""
+
+
+def kwin_raise(folder_name):
+    """Ask KWin (Plasma 5 or 6) to bring the file-manager window showing `folder_name` to the front."""
+    try:
+        from PySide6 import QtDBus
+        js = Path(os.environ.get("XDG_RUNTIME_DIR") or "/tmp") / f"mbox-raise-{os.getuid()}.js"
+        js.write_text(KWIN_RAISE_JS % json.dumps(folder_name))
+        bus = QtDBus.QDBusConnection.sessionBus()
+        sc = QtDBus.QDBusInterface("org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", bus)
+        if not sc.isValid():
+            return False
+        name = "mbox-control-raise"
+        sc.call("unloadScript", name)
+        r = sc.call("loadScript", str(js), name)
+        args = r.arguments()
+        if r.type() == QtDBus.QDBusMessage.ErrorMessage or not args:
+            return False
+        sid = int(args[0])
+        for obj in (f"/Scripting/Script{sid}", f"/{sid}"):      # Plasma 6 / Plasma 5 object paths
+            run = QtDBus.QDBusInterface("org.kde.KWin", obj, "org.kde.kwin.Script", bus)
+            if run.isValid() and run.call("run").type() != QtDBus.QDBusMessage.ErrorMessage:
+                QtCore.QTimer.singleShot(1500, lambda: sc.call("unloadScript", name))
+                return True
+        sc.call("unloadScript", name)
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
 def reveal_in_files(path):
     """Show a file (selected) or folder in the file manager and bring its window to the front — even when
     that folder is already open behind other windows. Uses the freedesktop FileManager1 service (Dolphin,
@@ -13236,6 +13296,11 @@ def reveal_in_files(path):
             token = os.environ.get("XDG_ACTIVATION_TOKEN", "")
             reply = iface.call(method, [uri], token)
             if reply.type() != QtDBus.QDBusMessage.ErrorMessage:
+                if "KDE" in os.environ.get("XDG_CURRENT_DESKTOP", "").upper():
+                    # Plasma on Wayland keeps an already-open window behind ("focus stealing prevention")
+                    # unless asked properly: a tiny KWin script raises the file-manager window for us.
+                    folder = path.parent if path.is_file() else path
+                    QtCore.QTimer.singleShot(400, lambda: kwin_raise(folder.name))
                 return True
     except Exception:  # noqa: BLE001
         pass

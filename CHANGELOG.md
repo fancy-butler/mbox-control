@@ -1,5 +1,13 @@
 # Changelog
 
+## 4.19.8
+- **Show folder on Plasma:** the file manager's own "show this folder" request wasn't enough under
+  Plasma's focus-stealing prevention. After it, a tiny one-off KWin script now brings the file-manager
+  window showing that folder to the front (and un-minimizes it). Works with Plasma 5 and 6.
+- **Multitrack: "Normalize each track after recording"** (off by default). Each track's loudest point
+  goes to −1 dB (−2 dB for lossy formats), so a quiet mic track comes up next to the bass. It changes
+  volume only.
+
 ## 4.19.7
 - **Multitrack: "Hear them while recording"** (on by default). The ticked inputs play from the Mbox's
   own mixer, with no delay, exactly as they're being recorded. They're put back when you stop.
