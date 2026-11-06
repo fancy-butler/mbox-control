@@ -2,13 +2,13 @@
 # Before publishing: set _ghuser, then run `updpkgsums && makepkg --printsrcinfo > .SRCINFO`
 _ghuser=CHANGE_ME
 pkgname=mbox-control
-pkgver=4.19.8
+pkgver=4.20
 pkgrel=1
 pkgdesc="Unofficial modern control panel for the Avid Mbox Pro 3 (FireWire): mixer, routing, ripping, guitar mode"
 arch=('any')
 url="https://github.com/${_ghuser}/mbox-control"
 license=('GPL-3.0-or-later')
-depends=('python' 'pyside6' 'python-numpy' 'ffmpeg' 'alsa-utils' 'libpulse'
+depends=('python' 'pyside6' 'python-numpy' 'python-pyudev' 'ffmpeg' 'alsa-utils' 'libpulse'
          'pipewire' 'pipewire-pulse' 'wireplumber' 'polkit'
          'snd-firewire-ctl-services')
 optdepends=('guitarix: amp and effects for Guitar mode'
@@ -32,4 +32,11 @@ package() {
   install -Dm644 README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"
   install -Dm644 CHANGELOG.md "${pkgdir}/usr/share/doc/${pkgname}/CHANGELOG.md"
   install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  # sleep/wake recovery: root helper + polkit action (always), wake hook as a template (NOT enabled —
+  # turn it on in the app: Settings → App → Sleep & wake, or copy the template to system-sleep/)
+  install -Dm755 packaging/linux/mbox-reload-driver "${pkgdir}/usr/lib/${pkgname}/mbox-reload-driver"
+  install -Dm755 packaging/linux/mbox-wake-recover "${pkgdir}/usr/lib/${pkgname}/mbox-wake-recover"
+  install -Dm644 packaging/linux/org.fancybutler.mboxcontrol.policy \
+    "${pkgdir}/usr/share/polkit-1/actions/org.fancybutler.mboxcontrol.policy"
+  install -Dm644 packaging/linux/mbox-control.sleep-hook "${pkgdir}/usr/share/${pkgname}/mbox-control.sleep-hook"
 }

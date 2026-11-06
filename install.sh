@@ -56,11 +56,11 @@ say "Packages (asks for your password)"
 PKGS=() ; BUILD=()
 case "$FAMILY" in
     arch)
-        PKGS=(python pyside6 python-numpy ffmpeg alsa-utils libpulse pipewire pipewire-pulse wireplumber polkit)
+        PKGS=(python pyside6 python-numpy python-pyudev ffmpeg alsa-utils libpulse pipewire pipewire-pulse wireplumber polkit)
         BUILD=(git base-devel meson ninja pkgconf glib2 gobject-introspection alsa-lib systemd-libs curl) ;;
     debian)
         sudo apt-get update
-        PKGS=(python3 python3-numpy ffmpeg alsa-utils pulseaudio-utils pipewire-bin wireplumber)
+        PKGS=(python3 python3-numpy python3-pyudev ffmpeg alsa-utils pulseaudio-utils pipewire-bin wireplumber)
         if have_pkg pkexec; then PKGS+=(pkexec); else PKGS+=(policykit-1); fi
         if have_pkg python3-pyside6.qtwidgets; then
             PKGS+=(python3-pyside6.qtcore python3-pyside6.qtgui python3-pyside6.qtwidgets
@@ -73,7 +73,7 @@ case "$FAMILY" in
         have_pkg libhinawa-dev && BUILD+=(libhinawa-dev)
         have_pkg libhitaki-dev && BUILD+=(libhitaki-dev) ;;
     fedora)
-        PKGS=(python3 python3-pyside6 python3-numpy alsa-utils pulseaudio-utils pipewire-utils wireplumber polkit)
+        PKGS=(python3 python3-pyside6 python3-numpy python3-pyudev alsa-utils pulseaudio-utils pipewire-utils wireplumber polkit)
         command -v ffmpeg >/dev/null || PKGS+=(ffmpeg-free)   # don't fight RPM Fusion's full ffmpeg
         BUILD=(git gcc meson ninja-build pkgconf-pkg-config glib2-devel gobject-introspection-devel
                alsa-lib-devel systemd-devel curl) ;;
@@ -87,7 +87,7 @@ if ! python3 -c "import PySide6.QtWidgets, PySide6.QtNetwork, PySide6.QtSvg" 2>/
     say "PySide6 isn't packaged here — installing it privately for the app (pip)"
     [ -x "$DEST/venv/bin/python3" ] || python3 -m venv --system-site-packages "$DEST/venv"
     "$DEST/venv/bin/pip" install --upgrade --quiet pip
-    "$DEST/venv/bin/pip" install --quiet "PySide6>=6.5" numpy
+    "$DEST/venv/bin/pip" install --quiet "PySide6>=6.5" numpy pyudev
     PY="$DEST/venv/bin/python3"
 fi
 

@@ -1,0 +1,126 @@
+#!/bin/sh
+# Mbox Control: after the PC wakes up, bring back a FireWire audio card that didn't return by itself.
+# Conditional: does nothing unless a FireWire audio unit is present but its ALSA card is missing.
+# Never touches firewire_ohci. Logs every step to /var/log/mbox-control-wake.log and the journal.
+SYS=${MBOX_SYSFS:-/sys}; PROC=${MBOX_PROCFS:-/proc}; RUN=${MBOX_RUNDIR:-/run}   # overridable for tests
+LOG=${MBOX_WAKE_LOG:-/var/log/mbox-control-wake.log}
+WAIT=${MBOX_WAKE_WAIT:-15}
+DRIVERS=" snd_dice snd_bebob snd_fireworks snd_oxfw snd_firewire_motu snd_fireface snd_firewire_digi00x snd_firewire_tascam "
+log() { echo "$(date '+%F %T') $*" >>"$LOG"; logger -t mbox-control "$*" 2>/dev/null || true; }
+daemon_for() {
+    case "$1" in
+        snd_dice) echo snd-dice-ctl-service ;;
+        snd_bebob) echo snd-bebob-ctl-service ;;
+        snd_fireworks) echo snd-fireworks-ctl-service ;;
+        snd_oxfw) echo snd-oxfw-ctl-service ;;
+        snd_firewire_motu) echo snd-firewire-motu-ctl-service ;;
+        snd_fireface) echo snd-fireface-ctl-service ;;
+        snd_firewire_digi00x) echo snd-firewire-digi00x-ctl-service ;;
+        snd_firewire_tascam) echo snd-firewire-tascam-ctl-service ;;
+    esac
+}
+driver_of() {  # sysfs driver link, else the module the unit's modalias resolves to
+    if [ -e "$1/driver" ]; then basename "$(readlink -f "$1/driver")"; return; fi
+    [ -r "$1/modalias" ] || return
+    for m in $(modprobe -R "$(cat "$1/modalias")" 2>/dev/null); do
+        m=$(echo "$m" | tr - _)
+        case "$DRIVERS" in *" $m "*) echo "$m"; return ;; esac
+    done
+}
+missing() {  # prints "unit driver" for the first FireWire audio unit whose card isn't in /proc/asound/cards
+    for u in "$SYS"/bus/firewire/devices/fw*.*; do
+        [ -e "$u" ] || continue
+        d=$(driver_of "$u")
+        case "$DRIVERS" in *" $d "*) ;; *) continue ;; esac
+        grep -q " at $(basename "$u")\b" "$PROC"/asound/cards 2>/dev/null && continue
+        echo "$(basename "$u") $d"; return
+    done
+}
+as_user() {  # as_user UID cmd...  — run in that user's session (systemd --user)
+    uid=$1; shift
+    name=$(getent passwd "$uid" | cut -d: -f1)
+    [ -n "$name" ] || return 1
+    runuser -u "$name" -- env XDG_RUNTIME_DIR="$RUN/user/$uid" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=$RUN/user/$uid/bus" "$@"
+}
+holds_snd() {  # does process dir $1 have a sound device open (deleted nodes of a zombie card included)?
+    for f in "$1"/fd/*; do
+        case "$(readlink "$f" 2>/dev/null)" in /dev/snd/*) return 0 ;; esac
+    done
+    return 1
+}
+users() {  # logged-in users with a systemd --user instance
+    for d in "$RUN"/user/*; do
+        u=$(basename "$d")
+        [ "$u" -ge 1000 ] 2>/dev/null && [ -S "$d/bus" ] && echo "$u"
+    done
+}
+
+log "wake: checking FireWire audio"
+n=0
+while [ $n -lt "$WAIT" ]; do               # give it a moment to come back by itself
+    m=$(missing)
+    [ -z "$m" ] && { log "wake: all FireWire audio cards are present - nothing to do"; exit 0; }
+    sleep 1; n=$((n + 1))
+done
+unit=${m% *}; drv=${m#* }; daemon=$(daemon_for "$drv")
+log "wake: $unit is present but its sound card is missing (driver $drv) - recovering"
+
+for uid in $(users); do                    # let go of the card in every session
+    if as_user "$uid" systemctl --user is-active --quiet mbox-ctl.service; then
+        as_user "$uid" systemctl --user stop mbox-ctl.service && echo "$uid" >>"$RUN"/mbox-control.ctl-restart
+        log "uid $uid: stopped mbox-ctl.service"
+    fi
+    if as_user "$uid" systemctl --user is-active --quiet pipewire.service || \
+       as_user "$uid" systemctl --user is-active --quiet pipewire.socket; then
+        as_user "$uid" systemctl --user stop pipewire.socket pipewire-pulse.socket pipewire.service \
+            pipewire-pulse.service wireplumber.service 2>>"$LOG"
+        echo "$uid pipewire" >>"$RUN"/mbox-control.restart
+        log "uid $uid: stopped PipeWire (and its sockets)"
+    elif as_user "$uid" systemctl --user is-active --quiet pulseaudio.service; then
+        as_user "$uid" systemctl --user stop pulseaudio.socket pulseaudio.service 2>>"$LOG"
+        echo "$uid pulseaudio" >>"$RUN"/mbox-control.restart
+        log "uid $uid: stopped PulseAudio"
+    else
+        log "uid $uid: no PipeWire/PulseAudio user units active - skipping"
+    fi
+done
+if [ -n "$daemon" ] && pkill -x "$daemon"; then log "stopped $daemon"; fi
+sleep 1
+for p in "$PROC"/[0-9]*; do
+    holds_snd "$p" && log "note: still open on a sound device: $(basename "$p") $(cat "$p/comm" 2>/dev/null)"
+done
+
+if modprobe -r "$drv" 2>>"$LOG"; then
+    if modprobe "$drv" 2>>"$LOG"; then log "reloaded $drv"; else log "ERROR: modprobe $drv failed"; fi
+else
+    log "ERROR: $drv still in use (see the holders above)"
+fi
+
+n=0
+while [ $n -lt 10 ] && [ -n "$(missing)" ]; do sleep 1; n=$((n + 1)); done
+if [ -z "$(missing)" ]; then
+    log "card is back: $(grep -B1 " at $unit" "$PROC"/asound/cards | head -1 | sed 's/^ *//')"
+else
+    log "ERROR: card still missing after reload"
+fi
+
+if [ -f "$RUN"/mbox-control.restart ]; then
+    while read -r uid stack; do
+        if [ "$stack" = pipewire ]; then
+            as_user "$uid" systemctl --user start pipewire.socket pipewire-pulse.socket pipewire.service \
+                pipewire-pulse.service wireplumber.service 2>>"$LOG"
+        else
+            as_user "$uid" systemctl --user start pulseaudio.socket pulseaudio.service 2>>"$LOG"
+        fi
+        log "uid $uid: started $stack again"
+    done <"$RUN"/mbox-control.restart
+    rm -f "$RUN"/mbox-control.restart
+fi
+if [ -f "$RUN"/mbox-control.ctl-restart ]; then
+    while read -r uid; do
+        as_user "$uid" systemctl --user start mbox-ctl.service && log "uid $uid: started mbox-ctl.service"
+    done <"$RUN"/mbox-control.ctl-restart
+    rm -f "$RUN"/mbox-control.ctl-restart
+fi
+log "wake: done"

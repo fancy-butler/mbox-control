@@ -1,0 +1,15 @@
+#!/bin/sh
+# Mbox Control: reload ONE FireWire *sound* driver (never the FireWire controller, firewire_ohci).
+# Run through pkexec (polkit action org.fancybutler.mboxcontrol.reload-driver) or by the sleep hook.
+set -u
+case "${1:-}" in
+    snd_dice|snd_bebob|snd_fireworks|snd_oxfw|snd_firewire_motu|snd_fireface|snd_firewire_digi00x|snd_firewire_tascam) ;;
+    *) echo "mbox-reload-driver: refusing unknown driver '${1:-}'" >&2; exit 2 ;;
+esac
+logger -t mbox-control "reloading $1" 2>/dev/null || true
+if ! modprobe -r "$1"; then
+    echo "mbox-reload-driver: $1 is still in use" >&2
+    exit 3
+fi
+modprobe "$1" || exit 4
+echo "mbox-reload-driver: $1 reloaded"

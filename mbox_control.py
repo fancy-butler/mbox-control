@@ -46,7 +46,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QPointF, QRectF
 
 APP_NAME = "Mbox Control"
-VERSION = "4.19.8"
+VERSION = "4.20"
 UPDATE_REPO = ""          # "owner/mbox-control" once the project is on GitHub; empty = no online checks
 HOME = Path.home()
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -265,7 +265,7 @@ def parse_amixer(text):
 
 def find_mbox_card():
     try:
-        text = Path("/proc/asound/cards").read_text()
+        text = (PROCFS / "asound/cards").read_text()
     except OSError:
         return None
     for line in text.splitlines():
@@ -500,6 +500,8 @@ PKGS = {   # feature → package names per package manager
     "audacity": {"pacman": ["audacity"], "apt-get": ["audacity"], "dnf": ["audacity"], "zypper": ["audacity"]},
     "chromaprint": {"pacman": ["chromaprint"], "apt-get": ["libchromaprint-tools"], "dnf": ["chromaprint-tools"],
                     "zypper": ["chromaprint-fpcalc"]},
+    "pyudev": {"pacman": ["python-pyudev"], "apt-get": ["python3-pyudev"], "dnf": ["python3-pyudev"],
+               "zypper": ["python3-pyudev"]},
     "numpy": {"pacman": ["python-numpy"], "apt-get": ["python3-numpy"], "dnf": ["python3-numpy"],
               "zypper": ["python3-numpy"]},
     "ffmpeg": {"pacman": ["ffmpeg"], "apt-get": ["ffmpeg"], "dnf": ["ffmpeg-free"], "zypper": ["ffmpeg"]},
@@ -2368,7 +2370,7 @@ def refresh_launcher_if_old():
 
 SERVICE_UNIT = HOME / ".config/systemd/user/mbox-ctl.service"
 SERVICE_WRAPPER = HOME / ".local/bin/mbox-ctl-start"
-WAKE_HOOK = Path("/usr/lib/systemd/system-sleep/mbox-rebind")
+WAKE_HOOK = Path("/usr/lib/systemd/system-sleep/mbox-rebind")   # the old (pre-4.20) wake fix; removed on install
 
 
 def install_service_unit():
@@ -2395,33 +2397,6 @@ def service_unit_ok():
         return SERVICE_UNIT.exists() and str(SERVICE_WRAPPER) in SERVICE_UNIT.read_text()
     except OSError:
         return False
-
-
-WAKE_SCRIPT = """#!/bin/sh
-# Written by Mbox Control: reconnect the Mbox's FireWire audio driver after the PC wakes up.
-[ "$1" = post ] || exit 0
-sleep 3
-for d in /sys/bus/firewire/drivers/snd_dice/fw*; do
-    [ -e "$d" ] || continue
-    n=$(basename "$d")
-    echo "$n" > /sys/bus/firewire/drivers/snd_dice/unbind
-    sleep 1
-    echo "$n" > /sys/bus/firewire/drivers/snd_dice/bind
-done
-exit 0
-"""
-
-
-def install_wake_hook():
-    """Needs admin rights; pkexec shows the desktop's password prompt."""
-    if not shutil.which("pkexec"):
-        return False, "pkexec isn't available."
-    tmp = CONF_DIR / "mbox-rebind.sh"
-    CONF_DIR.mkdir(parents=True, exist_ok=True)
-    tmp.write_text(WAKE_SCRIPT)
-    r = subprocess.run(["pkexec", "install", "-m", "755", str(tmp), str(WAKE_HOOK)],
-                       capture_output=True, text=True)
-    return r.returncode == 0, (r.stderr or "").strip()
 
 
 SA600_CONF = PW_CONF_DIR / "mbox-sa600.conf"
@@ -5914,6 +5889,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if "take_restore" in self.app_state:            # the app closed during a quick take: undo its borrowing
             self.app_state["rec_src"] = self.app_state.pop("take_restore") or None
         self.spectrum_hub = SpectrumHub(self)
+        self.asleep, self.recovering, self.woke_at, self.recover_offered = False, False, 0.0, False
+        self.sleep_watch = SleepWatch(self)
+        self.sleep_watch.sleeping.connect(self.on_sleep)
+        self.udev = None
+        if UdevWatch.available() and not os.environ.get("MBOX_AMIXER"):
+            self.udev = UdevWatch()
+            self.udev.changed.connect(self.on_udev)
+            self.udev.start()
         self.tuner = None
         self.last_spk = None
         self.events_alive = False
@@ -6110,12 +6093,16 @@ class MainWindow(QtWidgets.QMainWindow):
     def watchdog(self):
         if os.environ.get("MBOX_AMIXER"):        # simulated hardware: nothing to watch
             return
+        if self.asleep or self.recovering:
+            return
         card = find_mbox_card()
         if card is None:
             if not self.disconnected:
                 self.disconnected = True
+                self.close_card_handles("card gone")
                 self.toast("The Mbox isn't connected — waiting for it to come back…", 0)
                 self.refresh_health()
+            self.maybe_offer_recovery()
             return
         # Something stopped answering (amixer = the Mbox's control service, pactl = PipeWire talking to
         # the Mbox). Don't keep waiting on it — say what to do, and pick things up again once it answers.
@@ -6170,6 +6157,221 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.write(m, [True])
             self.reconnect(card)
 
+    # ---------------------------------------------------------------- 4.20: sleep / wake / recovery
+    def close_card_handles(self, why):
+        """Let go of everything this app holds on the card (meters, events, direct reads) — before sleep
+        or a driver reload, or the kernel module stays 'in use'."""
+        self.stop_live()
+        if self.backend.direct:
+            try:
+                self.backend.direct.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self.backend.direct = None
+        self.backend.direct_tried = False
+        rlog(f"closed this app's handles to the card ({why})")
+
+    def stop_ctl_daemon(self):
+        """Stop the ctl daemon (it holds the card). Returns how it was running, so wake can restart it."""
+        u = mbox_unit()
+        daemon = u["daemon"] if u else "snd-dice-ctl-service"
+        if unit_active("mbox-ctl.service"):
+            systemd_user("stop", "mbox-ctl.service")
+            rlog("stopped mbox-ctl.service")
+            return "unit"
+        if run_quiet("pkill", "-x", daemon) is not None:
+            rlog(f"stopped {daemon}")
+            return "proc"
+        return None
+
+    def on_sleep(self, going):
+        if going:
+            self.asleep = True
+            try:
+                if not self.disconnected and self.ctrls:
+                    snap = CONF_DIR / "before-sleep.json"
+                    save_json(snap, self.snapshot())
+                    self.restore_after_wake = snap
+            except Exception as e:  # noqa: BLE001
+                rlog(f"couldn't save the pre-sleep state: {e}")
+            self.close_card_handles("going to sleep")
+            self.spectrum_hub.stop_all()
+            self.sleep_ctl = self.stop_ctl_daemon()
+            self.disconnected = True
+            self.sleep_watch.release_inhibitor()            # done: the PC may sleep now
+            return
+        self.asleep = False
+        self.woke_at = time.time()
+        self.recover_offered = False
+        self.sleep_watch.take_inhibitor()
+        self.toast("Woke up — reconnecting to the Mbox…", 0)
+        rlog("woke up: waiting for the Mbox's card")
+        QtCore.QTimer.singleShot(1500, self.watchdog)
+
+    def on_udev(self, what):
+        rlog(f"udev: {what}")
+        if not getattr(self, "udev_pending", False):          # a burst of events → one check
+            self.udev_pending = True
+            QtCore.QTimer.singleShot(800, lambda: (setattr(self, "udev_pending", False), self.watchdog()))
+
+    def maybe_offer_recovery(self):
+        """Card gone but the FireWire unit is there: the stuck-after-sleep case. Give the sleep hook time if
+        it's installed; otherwise (or if it didn't manage) offer the one-click recovery."""
+        if self.recover_offered or self.recovering:
+            return
+        if not card_missing_after_wake():
+            return
+        since_wake = time.time() - self.woke_at if self.woke_at else 1e9
+        if sleep_fix_installed() and since_wake < 45:
+            return                                       # the root hook is on it
+        if since_wake < 12:
+            return                                       # sometimes it just takes a moment
+        self.recover_offered = True
+        u = mbox_unit()
+        rlog(f"card missing while {u['unit']} is present — offering recovery")
+        self.hint.offer("<b>The Mbox didn't come back after sleep.</b> The FireWire connection is fine, but its "
+                        "sound card is stuck. Recover it: the app restarts the audio system and reloads the "
+                        "Mbox's driver (asks for your password).",
+                        [("Recover Mbox", self.recover_mbox)])
+        self.announce("dialog-warning", "The Mbox didn't come back — Recover it in Mbox Control", 10000)
+
+    def recover_mbox(self, force=False):
+        if self.recovering:
+            return
+        u = mbox_unit()
+        if not u:
+            QtWidgets.QMessageBox.information(self, APP_NAME, "No FireWire audio interface found. Is the Mbox "
+                                              "switched on and its FireWire cable plugged in?")
+            return
+        if u["card"] is not None and not force and QtWidgets.QMessageBox.question(
+                self, APP_NAME, "The Mbox looks fine right now. Restart the audio system and reload its driver "
+                "anyway? Sound stops for a few seconds.") != QtWidgets.QMessageBox.Yes:
+            return
+        self.recovering = True
+        rlog(f"recovery started ({'manual' if u['card'] is not None or not self.recover_offered else 'offered'})")
+        self.close_card_handles("recovery")
+        self.spectrum_hub.stop_all()
+        self.disconnected = True
+        self.hint.offer("<b>Recovering the Mbox…</b> Sound stops for a few seconds.", [])
+        self.recovery = RecoveryJob(u)
+        self.recovery.step.connect(lambda m: self.toast(m, 0))
+        self.recovery.done.connect(self.recovered)
+        self.recovery.start()
+
+    def recovered(self, ok, msg):
+        job, self.recovery = self.recovery, None
+        if job:
+            job.wait(2000)
+        self.recovering = False
+        if ok:
+            self.hint.hide()
+            self.toast("The Mbox is back.", 6000)
+            rlog(f"recovery finished: {msg}")
+            self.watchdog()
+            return
+        rlog(f"recovery failed: {msg}")
+        self.hint.offer(f"<b>Couldn't bring the Mbox back.</b> {html_escape(msg)} Try again, or restart the PC. "
+                        "The recovery log has every step (Settings → App → Sleep & wake).",
+                        [("Try again", lambda: self.recover_mbox(force=True)), ("Open log", self.open_recovery_log)])
+
+    def open_recovery_log(self):
+        rlog("log opened")
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(RECOVERY_LOG)))
+
+    def sleep_fix_script(self, install):
+        """One root script for pkexec: install (or remove) the helper, polkit policy and sleep hook."""
+        packaged = SYSTEM_DIRS[0]
+        local = SYSTEM_DIRS[1]
+        hook = SLEEP_HOOK_DIR / SLEEP_HOOK_NAME
+        lines = ["#!/bin/sh", "set -e", f"rm -f {WAKE_HOOK}   # the old unbind/bind fix (can leave a stuck card)"]
+        if not install:
+            lines += [f"rm -f {hook}"]
+            if (local / "mbox-wake-recover").exists():
+                lines += [f"rm -rf {local}",
+                          f"rm -f /usr/share/polkit-1/actions/{POLKIT_ACTION}.local.policy"]
+            return "\n".join(lines) + "\n"
+        if (packaged / "mbox-wake-recover").exists():             # installed from a package: just the hook
+            recover = packaged / "mbox-wake-recover"
+        else:
+            recover = local / "mbox-wake-recover"
+            stage = CONF_DIR / "system"
+            stage.mkdir(parents=True, exist_ok=True)
+            (stage / "mbox-reload-driver").write_text(RELOAD_HELPER)
+            (stage / "mbox-wake-recover").write_text(WAKE_RECOVER)
+            (stage / "policy").write_text(polkit_policy(local / "mbox-reload-driver").replace(
+                f'id="{POLKIT_ACTION}"', f'id="{POLKIT_ACTION}.local"'))
+            lines += [f"install -d -m 755 {local}",
+                      f"install -m 755 '{stage / 'mbox-reload-driver'}' {local}/mbox-reload-driver",
+                      f"install -m 755 '{stage / 'mbox-wake-recover'}' {local}/mbox-wake-recover",
+                      f"install -D -m 644 '{stage / 'policy'}' "
+                      f"/usr/share/polkit-1/actions/{POLKIT_ACTION}.local.policy"]
+        stage = CONF_DIR / "system"
+        stage.mkdir(parents=True, exist_ok=True)
+        (stage / "hook").write_text(sleep_hook_text(recover))
+        lines += [f"install -D -m 755 '{stage / 'hook'}' {hook}"]
+        return "\n".join(lines) + "\n"
+
+    def set_sleep_fix(self, install):
+        if not shutil.which("pkexec"):
+            QtWidgets.QMessageBox.warning(self, APP_NAME, "pkexec isn't available, so the app can't ask for "
+                                          "admin rights.")
+            return
+        script = CONF_DIR / "sleep-fix.sh"
+        CONF_DIR.mkdir(parents=True, exist_ok=True)
+        script.write_text(self.sleep_fix_script(install))
+        r = subprocess.run(["pkexec", "/bin/sh", str(script)], capture_output=True, text=True)
+        ok = r.returncode == 0
+        rlog(("installed" if install else "removed") + " the sleep/wake fix" if ok else
+             f"sleep/wake fix {'install' if install else 'removal'} failed: {(r.stderr or '').strip()}")
+        self.toast(("Sleep/wake fix installed." if install else "Sleep/wake fix removed.") if ok else
+                   "Not changed" + (f": {r.stderr.strip()}" if r.stderr.strip() else "."), 8000)
+        self.refresh_sleep_card()
+        self.refresh_health()
+
+    def build_sleep_card(self, lay):
+        c, l = card("Sleep & wake", "Keeps the Mbox working after the PC sleeps. The app lets go of the Mbox "
+                                    "before sleep and reconnects by itself after. If the Mbox's sound card "
+                                    "gets stuck anyway, Recover brings it back without a reboot.")
+        self.sleep_status = muted("")
+        self.sleep_status.setWordWrap(True)
+        l.addWidget(self.sleep_status)
+        row = QtWidgets.QHBoxLayout()
+        rb = QtWidgets.QPushButton("Recover Mbox now…")
+        rb.setToolTip("Stops the audio system, reloads the Mbox's sound driver (asks for your password) and "
+                      "starts everything again. Never touches the FireWire controller.")
+        rb.clicked.connect(lambda: self.recover_mbox())
+        row.addWidget(rb)
+        self.sleep_fix_btn = QtWidgets.QPushButton()
+        self.sleep_fix_btn.clicked.connect(lambda: self.set_sleep_fix(not sleep_fix_installed()))
+        row.addWidget(self.sleep_fix_btn)
+        lg = QtWidgets.QPushButton("Open recovery log")
+        lg.clicked.connect(self.open_recovery_log)
+        row.addWidget(lg)
+        row.addStretch(1)
+        l.addLayout(row)
+        lay.addWidget(c)
+        self.refresh_sleep_card()
+
+    def refresh_sleep_card(self):
+        if not hasattr(self, "sleep_status"):
+            return
+        on = sleep_fix_installed()
+        self.sleep_fix_btn.setText("Remove sleep/wake fix…" if on else "Install sleep/wake fix…")
+        self.sleep_fix_btn.setToolTip(
+            "Removes the system hook." if on else
+            "Asks for your password once: adds a small system hook that, after waking, checks whether the "
+            "Mbox's sound card came back and recovers it if not — no password needed then. Off by default.")
+        u = mbox_unit() if not os.environ.get("MBOX_AMIXER") else None
+        bits = [f"Sleep/wake fix: {'installed' if on else 'not installed'}",
+                f"sleep watch: {'on' if self.sleep_watch.connected else 'unavailable'}",
+                f"instant reconnect (udev): {'on' if self.udev else 'off — install python-pyudev'}"]
+        if u:
+            bits.append(f"Mbox: {u['unit']} · driver {u['driver']} · " +
+                        (f"card {u['card']}" if u["card"] is not None else "card MISSING"))
+        if WAKE_HOOK.exists():
+            bits.append("an older wake-up fix (mbox-rebind) is installed — installing replaces it")
+        self.sleep_status.setText(" · ".join(bits))
+
     def show_not_answering(self):
         if getattr(self, "not_answering", False):
             return
@@ -6214,6 +6416,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.reload_state()
         self.ensure_metering()
         self.disconnected = False
+        self.recover_offered = False
+        snap = getattr(self, "restore_after_wake", None)
+        if snap:
+            self.restore_after_wake = None
+            if not self.marker_present() and snap.exists():
+                self.apply_snapshot(load_json(snap, {}))
+                self.ensure_marker()
+                rlog("restored the routing/mixer state from before sleep")
+                self.toast("The Mbox had forgotten its settings while asleep — put them back.", 8000)
         self.start_live()
         self.run_refreshers()
         self.check_reset()
@@ -6285,9 +6496,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.app_state.get("startup_scene"):
             items.append(("tip", "Pick a startup scene so your setup comes back automatically after the "
                                  "Mbox is switched off or used in Windows.", "Choose…", self.choose_startup))
-        if not WAKE_HOOK.exists() and not os.environ.get("MBOX_AMIXER"):
-            items.append(("tip", "Install the wake-up fix so the Mbox keeps working after the PC sleeps.",
-                          "Install…", self.install_wake))
+        if WAKE_HOOK.exists() and not os.environ.get("MBOX_AMIXER"):
+            items.append(("warn", "An older wake-up fix is installed that can leave the Mbox stuck after "
+                                  "sleep. Replace it with the new one.", "Replace…",
+                          lambda: self.set_sleep_fix(True)))
         return items
 
     def refresh_health(self):
@@ -6491,9 +6703,7 @@ class MainWindow(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(3000, self.refresh_health)
 
     def install_wake(self):
-        ok, err = install_wake_hook()
-        self.toast("Wake-up fix installed." if ok else f"Wake-up fix not installed. {err}", 8000)
-        self.refresh_health()
+        self.set_sleep_fix(True)
 
     def choose_startup(self):
         NOW = "What's set up right now (recommended)"
@@ -6747,6 +6957,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tray_scenes = menu.addMenu("Scenes")
         self.fill_tray_scenes()
         menu.addSeparator()
+        menu.addAction("Recover Mbox…").triggered.connect(lambda: self.recover_mbox())
         menu.addAction("Quit").triggered.connect(self.quit_app)
         self.tray_menu = menu
         self.tray.setContextMenu(menu)
@@ -6792,6 +7003,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def quit_app(self):
         self.spectrum_hub.stop_all()
+        self.sleep_watch.release_inhibitor()
+        if self.udev:
+            self.udev.stop()
         self.quitting = True
         self.close()
         QtWidgets.QApplication.quit()
@@ -12868,16 +13082,13 @@ class MainWindow(QtWidgets.QMainWindow):
         rp.setToolTip("Reinstalls the service so it finds the Mbox by name and restarts itself")
         rp.clicked.connect(self.repair_service)
         row.addWidget(rp)
-        wk = QtWidgets.QPushButton("Install wake-up fix…")
-        wk.setToolTip("Asks for your password: adds a small system hook that reconnects the Mbox after sleep")
-        wk.clicked.connect(self.install_wake)
-        row.addWidget(wk)
         ln = QtWidgets.QPushButton("Install app launcher")
         ln.clicked.connect(self.install_launcher)
         row.addWidget(ln)
         row.addStretch(1)
         svl.addLayout(row)
         lay.addWidget(sv)
+        self.build_sleep_card(lay)
         lay.addStretch(1)
         out = self.tabify(w, lay, [("Sound", ["Audio engine", "Inputs", "Output trims", "Mixer",
                                                "Headphones output for apps"]),
@@ -13236,6 +13447,500 @@ def service_ready(backend):
 CRASH_LOG = CONF_DIR / "crash.log"
 
 
+# ================================================================== 4.20: sleep/wake survival & recovery
+#
+# What goes wrong (seen on a TI XIO2213 + CachyOS + PipeWire): after resume the FireWire unit comes back
+# (fw1.0 in /sys/bus/firewire/devices) but its ALSA card doesn't. The old card lingers as a zombie because
+# PipeWire/WirePlumber, the ctl daemon and this app still hold its (deleted) device nodes, so the kernel
+# module can't be reloaded ("in use"). The recovery that works: let go of every handle, stop the audio
+# stack (sockets too, so nothing grabs the card again), reload the *sound* driver, start everything again.
+# NEVER touch firewire_ohci: unbinding or reloading the controller wedges the whole FireWire stack until
+# a reboot.
+
+# One place for the kernel driver ↔ control daemon mapping (snd-firewire-ctl-services binaries), so the
+# ProFire 610 (BeBoB), Fireworks, MOTU… apps can reuse it.
+FW_DAEMONS = {
+    "snd_dice": "snd-dice-ctl-service",
+    "snd_bebob": "snd-bebob-ctl-service",
+    "snd_fireworks": "snd-fireworks-ctl-service",
+    "snd_oxfw": "snd-oxfw-ctl-service",
+    "snd_firewire_motu": "snd-firewire-motu-ctl-service",
+    "snd_fireface": "snd-fireface-ctl-service",
+    "snd_firewire_digi00x": "snd-firewire-digi00x-ctl-service",
+    "snd_firewire_tascam": "snd-firewire-tascam-ctl-service",
+}
+SYSFS = Path(os.environ.get("MBOX_SYSFS", "/sys"))
+PROCFS = Path(os.environ.get("MBOX_PROCFS", "/proc"))
+RECOVERY_LOG = CONF_DIR / "recovery.log"
+WAKE_LOG = Path("/var/log/mbox-control-wake.log")
+PIPEWIRE_UNITS = ["pipewire.socket", "pipewire-pulse.socket", "pipewire.service", "pipewire-pulse.service",
+                  "wireplumber.service"]
+PULSE_UNITS = ["pulseaudio.socket", "pulseaudio.service"]
+SYSTEM_DIRS = (Path("/usr/lib/mbox-control"), Path("/usr/local/lib/mbox-control"))  # packaged, app-installed
+SLEEP_HOOK_NAME = "mbox-control"
+SLEEP_HOOK_DIR = Path("/usr/lib/systemd/system-sleep")
+POLKIT_ACTION = "org.fancybutler.mboxcontrol.reload-driver"
+
+
+def rlog(msg):
+    """Every recovery step goes here, so setups that behave differently can send a useful report."""
+    line = f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}"
+    try:
+        CONF_DIR.mkdir(parents=True, exist_ok=True)
+        with open(RECOVERY_LOG, "a") as f:
+            f.write(line + "\n")
+        if RECOVERY_LOG.stat().st_size > 400_000:            # keep it small: last ~half
+            text = RECOVERY_LOG.read_text(errors="ignore")
+            RECOVERY_LOG.write_text(text[len(text) // 2:])
+    except OSError:
+        pass
+    return line
+
+
+def _driver_of(unit):
+    """Kernel driver of a FireWire unit: its sysfs driver link, or — if no driver is bound (a failed probe
+    after wake) — whatever module its modalias resolves to."""
+    link = unit / "driver"
+    if link.exists():
+        return Path(os.path.realpath(link)).name
+    try:
+        alias = (unit / "modalias").read_text().strip()
+    except OSError:
+        return None
+    out = run_quiet("modprobe", "-R", alias, timeout=4) or ""
+    for mod in out.split():
+        if mod.replace("-", "_") in FW_DAEMONS:
+            return mod.replace("-", "_")
+    return None
+
+
+def fw_audio_units():
+    """[{unit: 'fw1.0', driver: 'snd_dice', daemon: 'snd-dice-ctl-service', card: 1 | None}] for every
+    FireWire audio unit present. card is None when the unit is there but its ALSA card isn't."""
+    base = SYSFS / "bus/firewire/devices"
+    try:
+        cards_txt = (PROCFS / "asound/cards").read_text()
+    except OSError:
+        cards_txt = ""
+    out = []
+    for unit in sorted(base.glob("fw*.*")) if base.exists() else []:
+        drv = _driver_of(unit)
+        if drv not in FW_DAEMONS:
+            continue
+        card = None
+        m = re.search(r"^\s*(\d+)\s+\[[^\]]*\]:.*\n.*\bat " + re.escape(unit.name) + r"\b", cards_txt, re.M)
+        if m:
+            card = int(m.group(1))
+        else:
+            for c in sorted(unit.glob("sound/card*")):          # the card's device lives under the unit
+                n = c.name[4:]
+                if n.isdigit() and re.search(rf"^\s*{n}\s+\[", cards_txt, re.M):
+                    card = int(n)
+                    break
+        out.append({"unit": unit.name, "driver": drv, "daemon": FW_DAEMONS[drv], "card": card})
+    return out
+
+
+def mbox_unit():
+    """The Mbox's FireWire unit (or the first FireWire audio unit), whether or not its card is up."""
+    units = fw_audio_units()
+    card = find_mbox_card()
+    for u in units:
+        if card is not None and u["card"] == card:
+            return u
+    dice = [u for u in units if u["driver"] == "snd_dice"]
+    return (dice or units or [None])[0]
+
+
+def card_missing_after_wake():
+    """True only when a FireWire audio unit is present but its ALSA card isn't — the one case the driver
+    reload is for. Never true without a unit (nothing plugged in / Mbox off)."""
+    u = mbox_unit()
+    return bool(u and u["card"] is None)
+
+
+def systemd_user(*args, timeout=15):
+    return run_quiet("systemctl", "--user", *args, timeout=timeout)
+
+
+def unit_active(name):
+    return (systemd_user("is-active", name, timeout=5) or "").strip() == "active"
+
+
+def existing_user_units(names):
+    out = systemd_user("list-unit-files", "--no-legend", *names, timeout=8) or ""
+    have = {line.split()[0] for line in out.splitlines() if line.strip()}
+    return [n for n in names if n in have]
+
+
+def audio_stack():
+    """('pipewire' | 'pulseaudio' | None, [units to stop/start])."""
+    if unit_active("pipewire.service") or unit_active("pipewire.socket"):
+        return "pipewire", existing_user_units(PIPEWIRE_UNITS)
+    if unit_active("pulseaudio.service") or unit_active("pulseaudio.socket"):
+        return "pulseaudio", existing_user_units(PULSE_UNITS)
+    return None, []
+
+
+def card_holders():
+    """Processes with a sound device open — including deleted nodes of a zombie card — as {pid: name}."""
+    found = {}
+    for p in PROCFS.glob("[0-9]*"):
+        try:
+            for fd in (p / "fd").iterdir():
+                try:
+                    target = os.readlink(fd)
+                except OSError:
+                    continue
+                if target.startswith("/dev/snd/") or "/dev/snd/" in target and "(deleted)" in target:
+                    found[int(p.name)] = (p / "comm").read_text().strip()
+                    break
+        except (OSError, ValueError):
+            continue
+    return found
+
+
+def helper_path(name):
+    for d in SYSTEM_DIRS:
+        if (d / name).exists():
+            return d / name
+    return None
+
+
+def sleep_fix_installed():
+    return (SLEEP_HOOK_DIR / SLEEP_HOOK_NAME).exists()
+
+
+RELOAD_HELPER = """#!/bin/sh
+# Mbox Control: reload ONE FireWire *sound* driver (never the FireWire controller, firewire_ohci).
+# Run through pkexec (polkit action org.fancybutler.mboxcontrol.reload-driver) or by the sleep hook.
+set -u
+case "${1:-}" in
+    %(drivers)s) ;;
+    *) echo "mbox-reload-driver: refusing unknown driver '${1:-}'" >&2; exit 2 ;;
+esac
+logger -t mbox-control "reloading $1" 2>/dev/null || true
+if ! modprobe -r "$1"; then
+    echo "mbox-reload-driver: $1 is still in use" >&2
+    exit 3
+fi
+modprobe "$1" || exit 4
+echo "mbox-reload-driver: $1 reloaded"
+""" % {"drivers": "|".join(FW_DAEMONS)}
+
+WAKE_RECOVER = r"""#!/bin/sh
+# Mbox Control: after the PC wakes up, bring back a FireWire audio card that didn't return by itself.
+# Conditional: does nothing unless a FireWire audio unit is present but its ALSA card is missing.
+# Never touches firewire_ohci. Logs every step to /var/log/mbox-control-wake.log and the journal.
+SYS=${MBOX_SYSFS:-/sys}; PROC=${MBOX_PROCFS:-/proc}; RUN=${MBOX_RUNDIR:-/run}   # overridable for tests
+LOG=${MBOX_WAKE_LOG:-/var/log/mbox-control-wake.log}
+WAIT=${MBOX_WAKE_WAIT:-15}
+DRIVERS=" %(drivers)s "
+log() { echo "$(date '+%%F %%T') $*" >>"$LOG"; logger -t mbox-control "$*" 2>/dev/null || true; }
+daemon_for() {
+    case "$1" in
+%(daemons)s
+    esac
+}
+driver_of() {  # sysfs driver link, else the module the unit's modalias resolves to
+    if [ -e "$1/driver" ]; then basename "$(readlink -f "$1/driver")"; return; fi
+    [ -r "$1/modalias" ] || return
+    for m in $(modprobe -R "$(cat "$1/modalias")" 2>/dev/null); do
+        m=$(echo "$m" | tr - _)
+        case "$DRIVERS" in *" $m "*) echo "$m"; return ;; esac
+    done
+}
+missing() {  # prints "unit driver" for the first FireWire audio unit whose card isn't in /proc/asound/cards
+    for u in "$SYS"/bus/firewire/devices/fw*.*; do
+        [ -e "$u" ] || continue
+        d=$(driver_of "$u")
+        case "$DRIVERS" in *" $d "*) ;; *) continue ;; esac
+        grep -q " at $(basename "$u")\b" "$PROC"/asound/cards 2>/dev/null && continue
+        echo "$(basename "$u") $d"; return
+    done
+}
+as_user() {  # as_user UID cmd...  — run in that user's session (systemd --user)
+    uid=$1; shift
+    name=$(getent passwd "$uid" | cut -d: -f1)
+    [ -n "$name" ] || return 1
+    runuser -u "$name" -- env XDG_RUNTIME_DIR="$RUN/user/$uid" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=$RUN/user/$uid/bus" "$@"
+}
+holds_snd() {  # does process dir $1 have a sound device open (deleted nodes of a zombie card included)?
+    for f in "$1"/fd/*; do
+        case "$(readlink "$f" 2>/dev/null)" in /dev/snd/*) return 0 ;; esac
+    done
+    return 1
+}
+users() {  # logged-in users with a systemd --user instance
+    for d in "$RUN"/user/*; do
+        u=$(basename "$d")
+        [ "$u" -ge 1000 ] 2>/dev/null && [ -S "$d/bus" ] && echo "$u"
+    done
+}
+
+log "wake: checking FireWire audio"
+n=0
+while [ $n -lt "$WAIT" ]; do               # give it a moment to come back by itself
+    m=$(missing)
+    [ -z "$m" ] && { log "wake: all FireWire audio cards are present - nothing to do"; exit 0; }
+    sleep 1; n=$((n + 1))
+done
+unit=${m%% *}; drv=${m#* }; daemon=$(daemon_for "$drv")
+log "wake: $unit is present but its sound card is missing (driver $drv) - recovering"
+
+for uid in $(users); do                    # let go of the card in every session
+    if as_user "$uid" systemctl --user is-active --quiet mbox-ctl.service; then
+        as_user "$uid" systemctl --user stop mbox-ctl.service && echo "$uid" >>"$RUN"/mbox-control.ctl-restart
+        log "uid $uid: stopped mbox-ctl.service"
+    fi
+    if as_user "$uid" systemctl --user is-active --quiet pipewire.service || \
+       as_user "$uid" systemctl --user is-active --quiet pipewire.socket; then
+        as_user "$uid" systemctl --user stop pipewire.socket pipewire-pulse.socket pipewire.service \
+            pipewire-pulse.service wireplumber.service 2>>"$LOG"
+        echo "$uid pipewire" >>"$RUN"/mbox-control.restart
+        log "uid $uid: stopped PipeWire (and its sockets)"
+    elif as_user "$uid" systemctl --user is-active --quiet pulseaudio.service; then
+        as_user "$uid" systemctl --user stop pulseaudio.socket pulseaudio.service 2>>"$LOG"
+        echo "$uid pulseaudio" >>"$RUN"/mbox-control.restart
+        log "uid $uid: stopped PulseAudio"
+    else
+        log "uid $uid: no PipeWire/PulseAudio user units active - skipping"
+    fi
+done
+if [ -n "$daemon" ] && pkill -x "$daemon"; then log "stopped $daemon"; fi
+sleep 1
+for p in "$PROC"/[0-9]*; do
+    holds_snd "$p" && log "note: still open on a sound device: $(basename "$p") $(cat "$p/comm" 2>/dev/null)"
+done
+
+if modprobe -r "$drv" 2>>"$LOG"; then
+    if modprobe "$drv" 2>>"$LOG"; then log "reloaded $drv"; else log "ERROR: modprobe $drv failed"; fi
+else
+    log "ERROR: $drv still in use (see the holders above)"
+fi
+
+n=0
+while [ $n -lt 10 ] && [ -n "$(missing)" ]; do sleep 1; n=$((n + 1)); done
+if [ -z "$(missing)" ]; then
+    log "card is back: $(grep -B1 " at $unit" "$PROC"/asound/cards | head -1 | sed 's/^ *//')"
+else
+    log "ERROR: card still missing after reload"
+fi
+
+if [ -f "$RUN"/mbox-control.restart ]; then
+    while read -r uid stack; do
+        if [ "$stack" = pipewire ]; then
+            as_user "$uid" systemctl --user start pipewire.socket pipewire-pulse.socket pipewire.service \
+                pipewire-pulse.service wireplumber.service 2>>"$LOG"
+        else
+            as_user "$uid" systemctl --user start pulseaudio.socket pulseaudio.service 2>>"$LOG"
+        fi
+        log "uid $uid: started $stack again"
+    done <"$RUN"/mbox-control.restart
+    rm -f "$RUN"/mbox-control.restart
+fi
+if [ -f "$RUN"/mbox-control.ctl-restart ]; then
+    while read -r uid; do
+        as_user "$uid" systemctl --user start mbox-ctl.service && log "uid $uid: started mbox-ctl.service"
+    done <"$RUN"/mbox-control.ctl-restart
+    rm -f "$RUN"/mbox-control.ctl-restart
+fi
+log "wake: done"
+""" % {"drivers": " ".join(FW_DAEMONS),
+       "daemons": "\n".join(f"        {d}) echo {s} ;;" for d, s in FW_DAEMONS.items())}
+
+
+def sleep_hook_text(recover):
+    return ("#!/bin/sh\n# Mbox Control sleep/wake fix (optional). Remove it in Mbox Control: Settings → App →\n"
+            "# Sleep & wake, or delete this file. Runs the recovery in the background so resume isn't held up.\n"
+            '[ "$1" = post ] || exit 0\n'
+            f"{recover} </dev/null >/dev/null 2>&1 &\nexit 0\n")
+
+
+def polkit_policy(helper):
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>Mbox Control</vendor>
+  <action id="{POLKIT_ACTION}">
+    <description>Reload the sound driver of a FireWire audio interface</description>
+    <message>Mbox Control needs to reload the Mbox's sound driver to bring it back</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">{helper}</annotate>
+  </action>
+</policyconfig>
+"""
+
+
+class RecoveryJob(QtCore.QThread):
+    """The user-side recovery: stop the ctl daemon and the audio stack, reload the sound driver through the
+    root helper (one password prompt), start everything again, wait for the card. Every step is logged."""
+    step = QtCore.Signal(str)
+    done = QtCore.Signal(bool, str)
+
+    def __init__(self, unit, force=False):
+        super().__init__()
+        self.unit, self.force = unit, force
+
+    def say(self, msg):
+        rlog(msg)
+        self.step.emit(msg)
+
+    def run(self):
+        try:
+            ok, msg = self._run()
+        except Exception as e:  # noqa: BLE001
+            ok, msg = False, f"recovery crashed: {e}"
+            rlog(msg)
+        self.done.emit(ok, msg)
+
+    def _run(self):
+        u = self.unit
+        if not u:
+            return False, "No FireWire audio unit found — is the Mbox switched on and plugged in?"
+        drv, daemon = u["driver"], u["daemon"]
+        self.say(f"recover: unit {u['unit']}, driver {drv}, daemon {daemon}, card {u['card']}")
+        restart_ctl = unit_active("mbox-ctl.service")
+        if restart_ctl:
+            systemd_user("stop", "mbox-ctl.service")
+            self.say("stopped mbox-ctl.service")
+        if run_quiet("pkill", "-x", daemon) is not None:
+            self.say(f"stopped {daemon}")
+        stack, units = audio_stack()
+        if units:
+            systemd_user("stop", *units, timeout=30)
+            self.say(f"stopped {stack}: {' '.join(units)}")
+        else:
+            self.say("no PipeWire/PulseAudio user units active — not stopping an audio server")
+        time.sleep(1)
+        held = card_holders()
+        if held:
+            self.say("still holding a sound device: " + ", ".join(f"{n} ({p})" for p, n in sorted(held.items())))
+        helper = helper_path("mbox-reload-driver")
+        if helper:
+            cmd = ["pkexec", str(helper), drv]
+        else:                                                   # not installed: run the same script once
+            tmp = CONF_DIR / "mbox-reload-driver.sh"
+            tmp.write_text(RELOAD_HELPER)
+            cmd = ["pkexec", "/bin/sh", str(tmp), drv]
+        self.say("reloading the driver: " + " ".join(cmd).replace(str(HOME), "~"))
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        out = ((r.stdout or "") + (r.stderr or "")).strip()
+        if out:
+            self.say("helper: " + out.replace("\n", " | "))
+        reloaded = r.returncode == 0
+        if not reloaded:
+            self.say(f"driver reload failed (exit {r.returncode})" +
+                     (" — cancelled at the password prompt" if r.returncode in (126, 127) else ""))
+        if units:
+            systemd_user("start", *units, timeout=30)
+            self.say(f"started {stack} again")
+        card = None
+        for _ in range(30):
+            fresh = next((x for x in fw_audio_units() if x["unit"] == u["unit"]), None)
+            if fresh and fresh["card"] is not None:
+                card = fresh["card"]
+                break
+            time.sleep(0.5)
+        if card is None:
+            held = card_holders()
+            msg = "The card didn't come back." + (
+                " Still holding a sound device: " + ", ".join(sorted(set(held.values()))) if held and not
+                reloaded else "")
+            self.say(msg)
+            return False, msg
+        self.say(f"card is back as card {card}")
+        if restart_ctl:
+            systemd_user("start", "mbox-ctl.service")
+            self.say("started mbox-ctl.service again")
+        return True, f"card {card}"
+
+
+class UdevWatch(QtCore.QThread):
+    """Card/unit appear and disappear events from udev (sound + firewire). Without pyudev the app falls back
+    to its slow watchdog poll."""
+    changed = QtCore.Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.running = True
+
+    @staticmethod
+    def available():
+        import importlib.util
+        return importlib.util.find_spec("pyudev") is not None
+
+    def run(self):
+        try:
+            import pyudev
+            ctx = pyudev.Context()
+            mon = pyudev.Monitor.from_netlink(ctx)
+            mon.filter_by("sound")
+            mon.filter_by("firewire")
+            mon.start()
+            while self.running:
+                dev = mon.poll(timeout=1.0)
+                if dev is not None:
+                    self.changed.emit(f"{dev.action} {dev.subsystem} {dev.sys_name}")
+        except Exception as e:  # noqa: BLE001
+            rlog(f"udev watch stopped: {e}")
+
+    def stop(self):
+        self.running = False
+
+
+class SleepWatch(QtCore.QObject):
+    """logind's PrepareForSleep(true/false), plus a short 'delay' inhibitor so the app gets a moment to let
+    go of the card before the PC actually sleeps."""
+    sleeping = QtCore.Signal(bool)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.inhibitor = None
+        self.connected = False
+        try:
+            from PySide6 import QtDBus
+            bus = QtDBus.QDBusConnection.sessionBus() if os.environ.get("MBOX_SLEEP_BUS") == "session" else \
+                QtDBus.QDBusConnection.systemBus()
+            self.connected = bus.connect("", "/org/freedesktop/login1", "org.freedesktop.login1.Manager",
+                                         "PrepareForSleep", self, QtCore.SLOT("on_prepare(bool)"))
+        except Exception as e:  # noqa: BLE001
+            rlog(f"sleep watch unavailable: {e}")
+        self.take_inhibitor()
+
+    @QtCore.Slot(bool)
+    def on_prepare(self, going):
+        rlog("logind: going to sleep" if going else "logind: woke up")
+        self.sleeping.emit(bool(going))
+
+    def take_inhibitor(self):
+        if self.inhibitor or not shutil.which("systemd-inhibit") or os.environ.get("MBOX_AMIXER"):
+            return
+        try:
+            self.inhibitor = subprocess.Popen(
+                ["systemd-inhibit", "--what=sleep", "--mode=delay", "--who=Mbox Control",
+                 "--why=Let go of the Mbox before sleep", "sleep", "infinity"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError:
+            self.inhibitor = None
+
+    def release_inhibitor(self):
+        if self.inhibitor:
+            try:
+                os.killpg(self.inhibitor.pid, signal.SIGTERM)
+            except OSError:
+                pass
+            self.inhibitor = None
+
+
+
+
 KWIN_RAISE_JS = """
 var want = %s;
 var list = (typeof workspace.windowList === "function") ? workspace.windowList() : workspace.clientList();
@@ -13413,9 +14118,23 @@ def diagnostics():
             ("Meter reading", ("direct (fast)" if card is not None and Backend(card).enable_direct()
                                else "amixer (slow)") if card is not None else "n/a"),
             ("snd-dice module", "loaded" if Path("/sys/module/snd_dice").exists() else "not loaded"),
+            ("FireWire audio", "; ".join(f"{u['unit']} {u['driver']} card "
+                                         f"{u['card'] if u['card'] is not None else 'MISSING'}"
+                                         for u in fw_audio_units()) or "none found"),
+            ("Audio server", audio_stack()[0] or "none detected"),
+            ("Sleep/wake fix", "installed" if sleep_fix_installed() else
+             ("OLD mbox-rebind hook" if WAKE_HOOK.exists() else "not installed")),
+            ("udev (pyudev)", "yes" if UdevWatch.available() else "no"),
             ("Firewall", firewall_kind() or "none active"),
             ("ffmpeg", "yes" if shutil.which("ffmpeg") else "no"), ("pw-jack", "yes" if shutil.which("pw-jack") else "no")]
     out = "\n".join(f"{k}: {v}" for k, v in rows)
+    for title, path in (("Recovery log", RECOVERY_LOG), ("Wake hook log", WAKE_LOG)):
+        try:
+            lines = path.read_text(errors="replace").splitlines()[-40:]
+        except OSError:
+            continue
+        if lines:
+            out += f"\n\n{title} (last {len(lines)} lines):\n" + "\n".join(lines).replace(str(HOME), "~")
     tail = crash_log_tail()
     if "---" in tail:
         out += "\n\nRecent problems (crash.log):\n" + tail.replace(str(HOME), "~")

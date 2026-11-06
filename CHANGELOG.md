@@ -1,5 +1,31 @@
 # Changelog
 
+## 4.20 — surviving sleep and wake
+- **Lets go of the Mbox before sleep.** The app listens for logind's PrepareForSleep, holds a short
+  "delay" inhibitor, and closes every handle it has on the card first: meters, events, direct reads
+  and the control service. Your routing and mixer are saved.
+- **Reconnects by itself after wake.** udev events (python-pyudev) trigger the reconnect immediately,
+  with the old watchdog as a fallback. It finds the card by name, never by number, restarts the control
+  service, and restores the saved routing and mixer if the box forgot them.
+- **Recover Mbox** (offered automatically when the card is stuck, plus the tray and Settings → App →
+  Sleep & wake). It stops the control service and the audio server (PipeWire including its sockets,
+  or PulseAudio), reloads the sound driver through a polkit-authorised root helper, then starts
+  everything again. It reports any program still holding the card.
+- **Optional sleep/wake fix:** a systemd sleep hook that recovers a stuck card after wake without a
+  password. It only acts when a FireWire audio unit is present but its card is missing. No hardcoded
+  user names, paths or card numbers. Off by default, and can be removed from the same setting.
+- The kernel driver and its control daemon are detected from sysfs (with a modalias fallback), using
+  one mapping table for all snd-firewire-ctl-services drivers.
+- Never touches firewire_ohci.
+- Every step is logged to recovery.log, and the wake hook logs to /var/log/mbox-control-wake.log.
+  Both are included in Copy diagnostics.
+- **Replaces the old wake-up fix (mbox-rebind)**, which unbound the driver while PipeWire still held
+  the card. That can leave exactly this kind of stuck card. The app now warns if the old fix is
+  installed and offers to replace it.
+- Packaging: the helper, recovery script and polkit action ship in the AUR package. The hook ships as
+  a template only. python-pyudev is a new dependency, also added to install.sh for Ubuntu/Debian,
+  Fedora and Arch.
+
 ## 4.19.8
 - **Show folder on Plasma:** the file manager's own "show this folder" request wasn't enough under
   Plasma's focus-stealing prevention. After it, a tiny one-off KWin script now brings the file-manager

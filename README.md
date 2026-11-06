@@ -98,6 +98,46 @@ included.
 A short setup asks what's plugged in where, for example what Outputs 1/2 feed and what's on each
 input. Everything is optional, and you can change it any time in **Settings → Your setup**.
 
+## Sleep and wake
+
+On some systems the Mbox's sound card doesn't come back after the PC wakes up. The FireWire unit
+reappears (`/sys/bus/firewire/devices/fw1.0`), but the ALSA card doesn't, and the old card can't be
+cleared because programs still hold it.
+
+Mbox Control handles this in three layers:
+
+1. **Before sleep**, the app lets go of the card: meters, events, direct reads and the control
+   service. It listens for logind's `PrepareForSleep` signal and holds a short "delay" inhibitor so it
+   has time to do this.
+2. **After wake**, it reconnects by itself, using udev events (`python-pyudev`) to notice the card
+   coming back. It finds the card by name, never by number, restarts the control service and puts
+   your routing and mixer back if the box forgot them.
+3. **If the card is stuck** (FireWire unit present, ALSA card missing), the app offers **Recover Mbox**
+   (also in the tray, and in **Settings → App → Sleep & wake**). This:
+   - stops the control service and the audio server (PipeWire with its sockets, or PulseAudio),
+   - reloads the sound driver through a small root helper (one password prompt, via polkit),
+   - starts everything again.
+
+   The driver and its control service are detected from sysfs, not hardcoded (`snd_dice` ↔
+   `snd-dice-ctl-service`, `snd_bebob` ↔ `snd-bebob-ctl-service`, …).
+
+**Optional: automatic recovery without a password.** **Settings → App → Sleep & wake → Install
+sleep/wake fix** adds a systemd sleep hook. After every wake it waits 15 seconds and then checks
+whether a FireWire audio card is missing. Only if one is, it stops the logged-in users' audio servers,
+reloads the sound driver and starts everything again. It has no hardcoded user names or paths, and it
+logs every step to `/var/log/mbox-control-wake.log` and the journal (`journalctl -t mbox-control`).
+Remove it from the same button.
+
+The AUR package installs the helper (`/usr/lib/mbox-control/mbox-reload-driver`), the recovery script
+and the polkit action. The hook is only shipped as a template
+(`/usr/share/mbox-control/mbox-control.sleep-hook`) and is **not enabled by default**.
+
+What it never does: touch the FireWire controller driver (`firewire_ohci`). Unbinding or reloading
+that wedges the whole FireWire stack until a reboot.
+
+If recovery doesn't work on your system, send **Copy diagnostics**. It includes the recovery log.
+Recovery has so far been proven on one system: TI XIO2213 FireWire card, CachyOS, PipeWire.
+
 ## Known limits
 
 - Only tested on the Mbox Pro 3. Other DICE-based interfaces won't work without changes.
