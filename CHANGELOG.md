@@ -1,5 +1,12 @@
 # Changelog
 
+## 4.19.6
+- **Scrolling the page never changes a setting.** Drop-downs, number boxes and sliders (mixer faders
+  included) only respond to the wheel or trackpad after you click them. Otherwise the scroll moves the
+  page. Qt's default was to change whatever happened to be under the pointer.
+- The "very quiet" warning now triggers when peaks stay under −30 dB (it was −40). A real AT2020 take
+  peaking at −37 dB slipped past the old threshold.
+
 ## 4.19.5
 - **Every input is watched on its own** in Quick take, Capture and Multitrack, so a live bass can no
   longer hide a dead mic. Multitrack is now watched too.

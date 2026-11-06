@@ -46,7 +46,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QPointF, QRectF
 
 APP_NAME = "Mbox Control"
-VERSION = "4.19.5"
+VERSION = "4.19.6"
 UPDATE_REPO = ""          # "owner/mbox-control" once the project is on GitHub; empty = no online checks
 HOME = Path.home()
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -5910,6 +5910,7 @@ class MainWindow(QtWidgets.QMainWindow):
                      ("theme", "system"), ("accent", "system")):
             self.app_state.setdefault(k, v)
         self.migrate_input_names()
+        install_wheel_guard()
         if "take_restore" in self.app_state:            # the app closed during a quick take: undo its borrowing
             self.app_state["rec_src"] = self.app_state.pop("take_restore") or None
         self.spectrum_hub = SpectrumHub(self)
@@ -11227,7 +11228,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 st["warned"] = "dead"
                 warned_now.add(item)
                 self.warn_dead_input([item])
-            elif st["warned"] is None and age >= 6 and st["max"] < -40:
+            elif st["warned"] is None and age >= 6 and st["max"] < -30:     # a voice peaking at −37 is too quiet
                 st["warned"] = "quiet"
                 warned_now.add(item)
                 self.warn_dead_input([item], quiet=st["max"])
@@ -13141,6 +13142,38 @@ def service_ready(backend):
 
 
 CRASH_LOG = CONF_DIR / "crash.log"
+
+
+class WheelGuard(QtCore.QObject):
+    """Scrolling the page must never change a setting: drop-downs, number boxes and sliders only take the
+    wheel/trackpad once you've clicked them; otherwise the scroll goes to the page underneath."""
+    TYPES = (QtWidgets.QComboBox, QtWidgets.QAbstractSpinBox, QtWidgets.QAbstractSlider)
+
+    def eventFilter(self, obj, ev):
+        if ev.type() == QtCore.QEvent.Wheel and isinstance(obj, self.TYPES) and not obj.hasFocus() \
+                and not isinstance(obj, QtWidgets.QScrollBar):
+            p = obj.parentWidget()
+            while p is not None and not isinstance(p, QtWidgets.QAbstractScrollArea):
+                p = p.parentWidget()
+            if p is not None:
+                QtWidgets.QApplication.sendEvent(p.verticalScrollBar() if ev.angleDelta().y() else
+                                                 p.horizontalScrollBar(), ev)
+            return True
+        if ev.type() == QtCore.QEvent.Polish and isinstance(obj, self.TYPES) \
+                and obj.focusPolicy() == Qt.WheelFocus:
+            obj.setFocusPolicy(Qt.StrongFocus)           # a wheel turn mustn't give them focus either
+        return False
+
+
+_WHEEL_GUARD = None
+
+
+def install_wheel_guard():
+    global _WHEEL_GUARD
+    app = QtWidgets.QApplication.instance()
+    if app is not None and _WHEEL_GUARD is None:
+        _WHEEL_GUARD = WheelGuard(app)
+        app.installEventFilter(_WHEEL_GUARD)
 
 
 class FreezeWatch:

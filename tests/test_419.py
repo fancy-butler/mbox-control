@@ -253,3 +253,28 @@ def test_multitrack_shows_a_strip_per_ticked_input(win):
     assert not win.mt_strips["Analog-A-4"].isVisibleTo(win.mt_btn.parentWidget())
     assert win.mt_strips["Analog-A-3"].isVisibleTo(win.mt_btn.parentWidget())
     assert win.mt_strips["Analog-A-1"].spectrum is False
+
+
+def test_scrolling_the_page_never_changes_a_setting(win, spinner):
+    from PySide6 import QtCore, QtGui, QtWidgets
+    box = win.save_fmt
+    before = box.currentIndex()
+    sa = box.parentWidget()
+    while sa and not isinstance(sa, QtWidgets.QScrollArea):
+        sa = sa.parentWidget()
+    win.nav.setCurrentRow(win.page_index("Record"))
+    spinner(0.2)
+    win.setFocus()
+    pos = QtCore.QPointF(5, 5)
+    ev = QtGui.QWheelEvent(pos, box.mapToGlobal(pos), QtCore.QPoint(0, 0), QtCore.QPoint(0, -120),
+                           QtCore.Qt.NoButton, QtCore.Qt.NoModifier, QtCore.Qt.NoScrollPhase, False)
+    QtWidgets.QApplication.sendEvent(box, ev)
+    assert box.currentIndex() == before                 # not changed by a passing scroll
+    assert box.focusPolicy() == QtCore.Qt.StrongFocus
+    box.setFocus()
+    spinner(0.05)
+    if box.hasFocus():                                  # clicked into: the wheel works as usual
+        QtWidgets.QApplication.sendEvent(box, QtGui.QWheelEvent(
+            pos, box.mapToGlobal(pos), QtCore.QPoint(0, 0), QtCore.QPoint(0, -120), QtCore.Qt.NoButton,
+            QtCore.Qt.NoModifier, QtCore.Qt.NoScrollPhase, False))
+        assert box.currentIndex() != before
