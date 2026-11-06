@@ -1,5 +1,20 @@
 # Changelog
 
+## 4.22 — J-card maker
+- **Make a J-card** (Record → Tools → Make a tape). It designs the tape's paper insert and shows a live
+  preview with the folds marked. It fills in from **Plan sides…**:
+  - song names from the tags, with times,
+  - cover art from the songs' embedded art or a cover/folder image.
+- The front holds the cover art with a title band (or big type if there's no art). The spine text is
+  sized to fit. The track list wraps long names and shrinks the type to fit the 27 mm flap.
+- Fold-out layouts (4 or 5 panels) put the track list on the fold-out.
+- Optional tape type, noise reduction and year.
+- **Save PDF to print:** actual size (104.8 × 101.6 mm, checked by measuring the rendered PDF), with cut
+  marks, fold marks and a 50 mm check line. The paper is Letter or A4 depending on your country (Canada
+  gets Letter).
+- **Save PNG (600 dpi):** the flat card, for a print shop.
+- Remembers your look (colours, layout, paper) between cards.
+
 ## 4.21.1
 - **Fixed: the metronome could start and play nothing.** It plays through "Headphones (Mbox)" (computer
   1/2), which only reaches a headphone jack whose mix includes those channels. After a scene change or a

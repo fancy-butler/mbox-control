@@ -46,7 +46,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QPointF, QRectF
 
 APP_NAME = "Mbox Control"
-VERSION = "4.21.1"
+VERSION = "4.22"
 UPDATE_REPO = ""          # "owner/mbox-control" once the project is on GitHub; empty = no online checks
 HOME = Path.home()
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -4660,6 +4660,530 @@ class DropList(QtWidgets.QListWidget):
         e.acceptProposedAction()
 
 
+# ================================================================== 4.22: J-card maker
+# Standard cassette J-card (Norelco case): 101.6 mm tall; panels left → right on the printed side:
+# rear flap 26.99 mm | spine 12.7 mm | front 65.09 mm | (fold-out panels 63.5, 61.91 … mm, each 1/16" less).
+JCARD_H = 101.6
+JCARD_FLAP, JCARD_SPINE, JCARD_FRONT = 26.99, 12.7, 65.09
+JCARD_FOLDOUTS = (63.5, 61.91)
+TAPE_TYPES = ["", "Type I (normal)", "Type II (chrome)", "Type IV (metal)"]
+NOISE_REDUCTION = ["", "Dolby B", "Dolby C", "dbx"]
+
+
+def jcard_panels(spec):
+    """[(name, x_mm, width_mm)] left → right."""
+    widths = [("flap", JCARD_FLAP), ("spine", JCARD_SPINE), ("front", JCARD_FRONT)]
+    for i in range(max(0, int(spec.get("panels", 3)) - 3)):
+        widths.append((f"fold{i + 1}", JCARD_FOLDOUTS[i]))
+    out, x = [], 0.0
+    for name, w in widths:
+        out.append((name, x, w))
+        x += w
+    return out
+
+
+def jcard_size(spec):
+    p = jcard_panels(spec)
+    return p[-1][1] + p[-1][2], JCARD_H
+
+
+def track_tags(path):
+    """(title, artist) from a file's tags, falling back to its name."""
+    out = run_quiet("ffprobe", "-v", "error", "-show_entries", "format_tags=title,artist", "-of", "json",
+                    str(path), timeout=10) or "{}"
+    try:
+        tags = {k.lower(): v for k, v in json.loads(out).get("format", {}).get("tags", {}).items()}
+    except ValueError:
+        tags = {}
+    return tags.get("title") or Path(path).stem, tags.get("artist", "")
+
+
+def extract_cover(paths, dest):
+    """Cover art for the card: embedded art from the first song that has some, else cover/folder.jpg/png
+    beside it. → path or None."""
+    for p in paths:
+        p = Path(p)
+        r = subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(p), "-an", "-frames:v", "1", str(dest)],
+                           capture_output=True)
+        if r.returncode == 0 and Path(dest).exists() and Path(dest).stat().st_size > 0:
+            return Path(dest)
+        for name in ("cover", "folder", "front", "Cover", "Folder", "Front"):
+            for ext in ("jpg", "jpeg", "png"):
+                f = p.parent / f"{name}.{ext}"
+                if f.exists():
+                    return f
+    return None
+
+
+def auto_ink(bg):
+    c = QtGui.QColor(bg)
+    lum = 0.2126 * c.redF() + 0.7152 * c.greenF() + 0.0722 * c.blueF()
+    return "#111111" if lum > 0.55 else "#f5f5f5"
+
+
+def _fit_lines(p, lines, rect, k, max_mm, min_mm, bold_first=False):
+    """Largest font size (mm) at which `lines` fit in rect (device px). → size_mm."""
+    size = max_mm
+    while size > min_mm:
+        f = QtGui.QFont(p.font())
+        f.setPixelSize(max(1, round(size * k)))
+        fm = QtGui.QFontMetricsF(f)
+        if fm.lineSpacing() * len(lines) <= rect.height():
+            return size
+        size -= 0.1
+    return min_mm
+
+
+def render_jcard(p, spec, k, x0=0.0, y0=0.0, guides=False):
+    """Draw the card's printed (outer) side. k = device pixels per mm; (x0, y0) top-left in px."""
+    bg = QtGui.QColor(spec.get("bg") or "#1d2b44")
+    ink = QtGui.QColor(spec.get("ink") or auto_ink(bg))
+    accent = QtGui.QColor(spec.get("accent") or "#e3a52a")
+    title, artist = spec.get("title", "").strip(), spec.get("artist", "").strip()
+    panels = jcard_panels(spec)
+    W, H = jcard_size(spec)
+    R = lambda x, y, w, h: QRectF(x0 + x * k, y0 + y * k, w * k, h * k)  # noqa: E731
+
+    def font(size_mm, bold=False, italic=False):
+        f = QtGui.QFont(spec.get("font") or p.font().family())
+        f.setPixelSize(max(1, round(size_mm * k)))
+        f.setBold(bold)
+        f.setItalic(italic)
+        return f
+
+    p.save()
+    p.setRenderHint(QtGui.QPainter.Antialiasing)
+    p.setRenderHint(QtGui.QPainter.SmoothPixmapTransform)
+    p.fillRect(R(0, 0, W, H), bg)
+    geo = {n: (x, w) for n, x, w in panels}
+    pad = 3.0                                                    # safe area inside the trim
+
+    # front: cover art fills it; title band at the bottom (or big type when there's no art)
+    fx, fw = geo["front"]
+    cover = spec.get("cover")
+    img = QtGui.QImage(str(cover)) if cover and Path(cover).exists() else QtGui.QImage()
+    if not img.isNull():
+        target = R(fx, 0, fw, H)
+        s = max(target.width() / img.width(), target.height() / img.height())
+        sw, sh = target.width() / s, target.height() / s
+        src = QRectF((img.width() - sw) / 2, (img.height() - sh) / 2, sw, sh)
+        p.drawImage(target, img, src)
+        if title or artist:
+            band = R(fx, H - 22, fw, 22)
+            shade = QtGui.QColor(bg)
+            shade.setAlpha(215)
+            p.fillRect(band, shade)
+            p.setPen(ink)
+            p.setFont(font(5.0, bold=True))
+            p.drawText(R(fx + pad, H - 21, fw - 2 * pad, 11), Qt.AlignLeft | Qt.AlignVCenter,
+                       QtGui.QFontMetricsF(p.font()).elidedText(title, Qt.ElideRight, (fw - 2 * pad) * k))
+            p.setFont(font(3.4))
+            p.drawText(R(fx + pad, H - 11, fw - 2 * pad, 8), Qt.AlignLeft | Qt.AlignVCenter,
+                       QtGui.QFontMetricsF(p.font()).elidedText(artist, Qt.ElideRight, (fw - 2 * pad) * k))
+    else:
+        p.setPen(accent)
+        p.setBrush(Qt.NoBrush)
+        pen = QtGui.QPen(accent, 0.6 * k)
+        p.setPen(pen)
+        p.drawLine(QPointF(x0 + (fx + pad) * k, y0 + 30 * k), QPointF(x0 + (fx + fw - pad) * k, y0 + 30 * k))
+        p.setPen(ink)
+        p.setFont(font(7.0, bold=True))
+        p.drawText(R(fx + pad, 34, fw - 2 * pad, 40), Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, title)
+        p.setFont(font(4.0))
+        p.drawText(R(fx + pad, 76, fw - 2 * pad, 18), Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, artist)
+
+    # spine: one line along its length
+    sx, sw = geo["spine"]
+    spine = spec.get("spine") or " — ".join(t for t in (artist, title) if t)
+    p.save()
+    centre = QPointF(x0 + (sx + sw / 2) * k, y0 + H / 2 * k)
+    p.translate(centre)
+    p.rotate(90 if spec.get("flip_spine") else -90)
+    p.setPen(ink)
+    size = min(5.2, sw * 0.42)
+    p.setFont(font(size, bold=True))
+    fm = QtGui.QFontMetricsF(p.font())
+    while fm.horizontalAdvance(spine) > (H - 2 * pad) * k and size > 2.2:
+        size -= 0.2
+        p.setFont(font(size, bold=True))
+        fm = QtGui.QFontMetricsF(p.font())
+    p.drawText(QRectF(-(H / 2 - pad) * k, -sw / 2 * k, (H - 2 * pad) * k, sw * k), Qt.AlignCenter,
+               fm.elidedText(spine, Qt.ElideRight, (H - 2 * pad) * k))
+    p.restore()
+    p.setPen(QtGui.QPen(accent, 0.35 * k))
+    for edge in (sx, sx + sw):                                   # thin accent rules along the folds
+        p.drawLine(QPointF(x0 + edge * k, y0 + 4 * k), QPointF(x0 + edge * k, y0 + (H - 4) * k))
+
+    # track list: on the fold-out panel when there is one, else on the rear flap
+    list_panel = "fold1" if "fold1" in geo else "flap"
+    lx, lw = geo[list_panel]
+    sides = spec.get("sides", {})
+    show_times = spec.get("times", True)
+    lines = []
+    for side in ("A", "B"):
+        items = sides.get(side, [])
+        if not items:
+            continue
+        lines.append(("head", f"SIDE {side}", sum(d for _, d in items)))
+        for n, (name, secs) in enumerate(items, 1):
+            lines.append(("track", f"{n}. {name}", secs))
+        lines.append(("gap", "", 0))
+    if lines and lines[-1][0] == "gap":
+        lines.pop()
+    bits = [x for x in (spec.get("tape_type", ""), spec.get("nr", ""), spec.get("date", "")) if x]
+    narrow = lw < 40
+    info = ("\n" if narrow else " · ").join(bits)
+    foot = (2.6 * len(bits) if narrow else 4.0) if bits else 0.0
+    area = R(lx + 2.0, pad, lw - 4.0, H - 2 * pad - foot - 1)
+
+    def layout(size, draw=False):
+        """Lay the list out at `size` mm, wrapping long names under themselves. → height used (px)."""
+        f_track, f_head = font(size), font(size * 1.05, bold=True)
+        fm_t, fm_h = QtGui.QFontMetricsF(f_track), QtGui.QFontMetricsF(f_head)
+        y = area.top()
+        for kind, text, secs in lines:
+            if kind == "gap":
+                y += fm_t.lineSpacing() * 0.6
+                continue
+            fm = fm_h if kind == "head" else fm_t
+            t = fmt_time(secs) if (show_times and secs) else ""
+            tw = fm.horizontalAdvance(t) + (1.0 * k if t else 0)
+            box = QRectF(area.left(), y, area.width() - tw, 10_000)
+            hgt = fm.boundingRect(box, Qt.AlignLeft | Qt.TextWordWrap, text).height()
+            if draw:
+                p.setFont(f_head if kind == "head" else f_track)
+                p.setPen(accent if kind == "head" else ink)
+                p.drawText(QRectF(area.left(), y, area.width() - tw, hgt), Qt.AlignLeft | Qt.TextWordWrap, text)
+                if t:
+                    p.drawText(QRectF(area.left(), y, area.width(), fm.lineSpacing()),
+                               Qt.AlignRight | Qt.AlignTop, t)
+            y += hgt + (0.15 * k if kind == "track" else 0.25 * k)
+        return y - area.top()
+    size = 3.2 if not narrow else 2.4
+    while size > 1.25 and layout(size) > area.height():
+        size -= 0.05
+    layout(size, draw=True)
+    if info:
+        p.setFont(font(1.9))
+        p.setPen(ink)
+        p.drawText(R(lx + 2.0, H - pad - foot, lw - 4.0, foot), Qt.AlignLeft | Qt.AlignBottom | Qt.TextWordWrap,
+                   info)
+    if list_panel != "flap":                                    # flap then carries the title, small
+        fx2, fw2 = geo["flap"]
+        p.setPen(ink)
+        p.setFont(font(3.0, bold=True))
+        fm = QtGui.QFontMetricsF(p.font())
+        box = R(fx2 + 2, pad, fw2 - 4, 60)
+        th = fm.boundingRect(box, Qt.AlignLeft | Qt.TextWordWrap, title).height() if title else 0
+        p.drawText(box, Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, title)
+        p.setFont(font(2.3))
+        p.drawText(QRectF(box.left(), box.top() + th + 1.0 * k, box.width(), 40 * k),
+                   Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap, artist)
+
+    if guides:                                                   # preview only: where it folds
+        pen = QtGui.QPen(QtGui.QColor(255, 255, 255, 120), max(1.0, 0.25 * k), Qt.DashLine)
+        p.setPen(pen)
+        for _, x, _ in panels[1:]:
+            p.drawLine(QPointF(x0 + x * k, y0), QPointF(x0 + x * k, y0 + H * k))
+        p.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0, 90), max(1.0, 0.2 * k)))
+        p.setBrush(Qt.NoBrush)
+        p.drawRect(R(0, 0, W, H))
+    p.restore()
+
+
+def jcard_marks(p, spec, k, x0, y0):
+    """Cut marks at the corners and fold marks above/below the folds, outside the card."""
+    W, H = jcard_size(spec)
+    pen = QtGui.QPen(QtGui.QColor("#000000"), max(1.0, 0.15 * k))
+    p.setPen(pen)
+    gap, ln = 2.0 * k, 5.0 * k
+    for cx in (x0, x0 + W * k):
+        for cy in (y0, y0 + H * k):
+            dx = -1 if cx == x0 else 1
+            dy = -1 if cy == y0 else 1
+            p.drawLine(QPointF(cx + dx * gap, cy), QPointF(cx + dx * (gap + ln), cy))
+            p.drawLine(QPointF(cx, cy + dy * gap), QPointF(cx, cy + dy * (gap + ln)))
+    p.setPen(QtGui.QPen(QtGui.QColor("#000000"), max(1.0, 0.15 * k), Qt.DashLine))
+    for _, x, _ in jcard_panels(spec)[1:]:
+        X = x0 + x * k
+        p.drawLine(QPointF(X, y0 - gap), QPointF(X, y0 - gap - ln))
+        p.drawLine(QPointF(X, y0 + H * k + gap), QPointF(X, y0 + H * k + gap + ln))
+
+
+LETTER_COUNTRIES = {"UnitedStates", "Canada", "Mexico", "Philippines", "Chile", "Colombia", "Venezuela",
+                    "CostaRica", "Guatemala", "ElSalvador", "Panama", "PuertoRico", "DominicanRepublic"}
+
+
+def default_paper():
+    """'Letter' in the countries that print on it (Canada is metric but uses Letter), else 'A4'."""
+    loc = QtCore.QLocale()
+    terr = loc.territory() if hasattr(loc, "territory") else loc.country()
+    name = getattr(terr, "name", str(terr)).split(".")[-1]
+    return "Letter" if name in LETTER_COUNTRIES else "A4"
+
+
+def jcard_page_size(paper=None):
+    return QtGui.QPageSize(QtGui.QPageSize.Letter if (paper or default_paper()) == "Letter" else QtGui.QPageSize.A4)
+
+
+def save_jcard_pdf(spec, path, page=None):
+    """Actual size, centred near the top of the page, with cut/fold marks and a 50 mm check line."""
+    w = QtGui.QPdfWriter(str(path))
+    w.setPageSize(page or jcard_page_size(spec.get("paper")))
+    w.setPageMargins(QtCore.QMarginsF(0, 0, 0, 0))
+    w.setResolution(1200)
+    w.setTitle(spec.get("title") or "J-card")
+    w.setCreator(f"{APP_NAME} {VERSION}")
+    k = 1200 / 25.4
+    p = QtGui.QPainter(w)
+    pw = w.width()
+    W, H = jcard_size(spec)
+    x0, y0 = (pw - W * k) / 2, 25 * k
+    render_jcard(p, spec, k, x0, y0)
+    jcard_marks(p, spec, k, x0, y0)
+    p.setPen(QtGui.QPen(QtGui.QColor("#000000"), 0.3 * k))
+    ly = y0 + (H + 16) * k
+    p.drawLine(QPointF(x0, ly), QPointF(x0 + 50 * k, ly))
+    for x in (x0, x0 + 50 * k):
+        p.drawLine(QPointF(x, ly - 1.5 * k), QPointF(x, ly + 1.5 * k))
+    f = QtGui.QFont()
+    f.setPixelSize(round(2.8 * k))
+    p.setFont(f)
+    p.drawText(QRectF(x0 + 53 * k, ly - 3 * k, 150 * k, 6 * k), Qt.AlignLeft | Qt.AlignVCenter,
+               "← this line should measure exactly 50 mm. Print at 100% / “actual size” — not “fit to page”.")
+    p.drawText(QRectF(x0, ly + 4 * k, W * k + 80 * k, 14 * k), Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap,
+               "Cut along the solid corner marks. Fold at the dashed marks: spine first, then the flap. "
+               "Card stock around 160–200 g/m² folds cleanly.")
+    p.end()
+    return Path(path)
+
+
+def save_jcard_png(spec, path, dpi=600):
+    k = dpi / 25.4
+    W, H = jcard_size(spec)
+    img = QtGui.QImage(round(W * k), round(H * k), QtGui.QImage.Format_RGB32)
+    img.setDotsPerMeterX(round(dpi / 0.0254))
+    img.setDotsPerMeterY(round(dpi / 0.0254))
+    img.fill(QtGui.QColor("white"))
+    p = QtGui.QPainter(img)
+    render_jcard(p, spec, k)
+    p.end()
+    img.save(str(path))
+    return Path(path)
+
+
+class JCardDialog(QtWidgets.QDialog):
+    """Fill in the card, see it live, save a print-ready PDF (or a PNG for a print shop)."""
+
+    def __init__(self, win, sides, files):
+        super().__init__(win)
+        self.win = win
+        self.setWindowTitle("Make a J-card")
+        self.resize(1080, 640)
+        saved = dict(win.app_state.get("jcard", {}))
+        self.spec = {"title": saved.get("title", ""), "artist": saved.get("artist", ""), "spine": "",
+                     "sides": sides, "cover": None, "bg": saved.get("bg", "#1d2b44"),
+                     "accent": saved.get("accent", "#e3a52a"), "panels": saved.get("panels", 3),
+                     "tape_type": saved.get("tape_type", ""), "nr": saved.get("nr", ""),
+                     "date": str(datetime.now().year), "times": saved.get("times", True),
+                     "flip_spine": saved.get("flip_spine", False)}
+        if files:
+            art = extract_cover(files, CONF_DIR / "jcard-cover.jpg")
+            if art:
+                self.spec["cover"] = str(art)
+        outer = QtWidgets.QHBoxLayout(self)
+        form = QtWidgets.QFormLayout()
+        outer.addLayout(form, 2)
+        self.title = QtWidgets.QLineEdit(self.spec["title"])
+        self.title.setPlaceholderText("e.g. Summer mix")
+        self.artist = QtWidgets.QLineEdit(self.spec["artist"])
+        self.artist.setPlaceholderText("Artist, or “Various” / a dedication")
+        self.spine = QtWidgets.QLineEdit()
+        self.spine.setPlaceholderText("Artist — Title (automatic)")
+        for w_ in (self.title, self.artist, self.spine):
+            w_.textChanged.connect(self.changed)
+        form.addRow("Title", self.title)
+        form.addRow("Artist / subtitle", self.artist)
+        form.addRow("Spine", self.spine)
+        self.side_edit = {}
+        for side in ("A", "B"):
+            e = QtWidgets.QPlainTextEdit("\n".join(f"{n}  {fmt_time(d)}" if d else n for n, d in sides.get(side, [])))
+            e.setToolTip("One song per line. A time at the end (3:45) is shown on the right.")
+            e.setMinimumHeight(90)
+            e.textChanged.connect(self.changed)
+            form.addRow(f"Side {side}", e)
+            self.side_edit[side] = e
+        crow = QtWidgets.QHBoxLayout()
+        self.cover_lbl = muted(Path(self.spec["cover"]).name if self.spec["cover"] else "none — big type instead")
+        cb = QtWidgets.QPushButton("Choose…")
+        cb.clicked.connect(self.choose_cover)
+        cx = QtWidgets.QPushButton("None")
+        cx.clicked.connect(lambda: self.set_cover(None))
+        crow.addWidget(self.cover_lbl, 1)
+        crow.addWidget(cb)
+        crow.addWidget(cx)
+        form.addRow("Cover art", crow)
+        colrow = QtWidgets.QHBoxLayout()
+        self.colour_btns = {}
+        for key, label in (("bg", "Background"), ("accent", "Accent")):
+            b = QtWidgets.QPushButton(label)
+            b.clicked.connect(lambda _=False, key=key: self.pick_colour(key))
+            colrow.addWidget(b)
+            self.colour_btns[key] = b
+        colrow.addStretch(1)
+        form.addRow("Colours", colrow)
+        self.panels = QtWidgets.QComboBox()
+        self.panels.addItem("Standard (3 panels)", 3)
+        self.panels.addItem("With a fold-out for the track list (4 panels)", 4)
+        self.panels.addItem("Two fold-outs (5 panels)", 5)
+        self.panels.setCurrentIndex(max(0, self.panels.findData(self.spec["panels"])))
+        self.panels.currentIndexChanged.connect(self.changed)
+        form.addRow("Layout", self.panels)
+        trow = QtWidgets.QHBoxLayout()
+        self.tape = QtWidgets.QComboBox()
+        self.tape.addItems([t or "Tape type —" for t in TAPE_TYPES])
+        self.tape.setCurrentIndex(max(0, TAPE_TYPES.index(self.spec["tape_type"]) if self.spec["tape_type"] in
+                                      TAPE_TYPES else 0))
+        self.nr = QtWidgets.QComboBox()
+        self.nr.addItems([n or "Noise reduction —" for n in NOISE_REDUCTION])
+        self.nr.setCurrentIndex(NOISE_REDUCTION.index(self.spec["nr"]) if self.spec["nr"] in NOISE_REDUCTION else 0)
+        self.date = QtWidgets.QLineEdit(self.spec["date"])
+        self.date.setMaximumWidth(90)
+        for w_ in (self.tape, self.nr):
+            w_.currentIndexChanged.connect(self.changed)
+        self.date.textChanged.connect(self.changed)
+        trow.addWidget(self.tape)
+        trow.addWidget(self.nr)
+        trow.addWidget(self.date)
+        form.addRow("On the card", trow)
+        orow = QtWidgets.QHBoxLayout()
+        self.times = QtWidgets.QCheckBox("Song times")
+        self.times.setChecked(self.spec["times"])
+        self.flip = QtWidgets.QCheckBox("Flip spine text")
+        self.flip.setChecked(self.spec["flip_spine"])
+        self.flip.setToolTip("Which way the spine reads. Flip it if it's upside-down on your shelf.")
+        for w_ in (self.times, self.flip):
+            w_.toggled.connect(self.changed)
+            orow.addWidget(w_)
+        orow.addStretch(1)
+        form.addRow("", orow)
+        self.paper = QtWidgets.QComboBox()
+        self.paper.addItems(["Letter", "A4"])
+        self.paper.setCurrentText(saved.get("paper") or default_paper())
+        self.paper.currentIndexChanged.connect(self.changed)
+        form.addRow("Paper", self.paper)
+        right = QtWidgets.QVBoxLayout()
+        outer.addLayout(right, 3)
+        self.preview = QtWidgets.QLabel()
+        self.preview.setAlignment(Qt.AlignCenter)
+        self.preview.setMinimumSize(480, 420)
+        right.addWidget(self.preview, 1)
+        right.addWidget(muted("Dashed lines: folds (not printed). The PDF is actual size with cut and fold "
+                              "marks — print at 100%."))
+        brow = QtWidgets.QHBoxLayout()
+        pdf = QtWidgets.QPushButton("Save PDF to print…")
+        pdf.setObjectName("primary")
+        pdf.clicked.connect(self.save_pdf)
+        png = QtWidgets.QPushButton("Save PNG (600 dpi)…")
+        png.setToolTip("For a print shop or an image editor: the flat card, no marks.")
+        png.clicked.connect(self.save_png)
+        close = QtWidgets.QPushButton("Close")
+        close.clicked.connect(self.accept)
+        brow.addStretch(1)
+        brow.addWidget(png)
+        brow.addWidget(pdf)
+        brow.addWidget(close)
+        right.addLayout(brow)
+        self.timer = QtCore.QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.timeout.connect(self.render_preview)
+        self.paint_colour_btns()
+        self.changed()
+
+    @staticmethod
+    def parse_side(text):
+        out = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            m = re.match(r"^(.*?)\s+(\d{1,2}):(\d{2})$", line)
+            out.append((m.group(1), int(m.group(2)) * 60 + int(m.group(3))) if m else (line, 0))
+        return out
+
+    def collect(self):
+        s = self.spec
+        s.update(title=self.title.text(), artist=self.artist.text(), spine=self.spine.text(),
+                 panels=self.panels.currentData(), tape_type=TAPE_TYPES[self.tape.currentIndex()],
+                 nr=NOISE_REDUCTION[self.nr.currentIndex()], date=self.date.text(), times=self.times.isChecked(),
+                 flip_spine=self.flip.isChecked(), paper=self.paper.currentText(),
+                 sides={k: self.parse_side(e.toPlainText()) for k, e in self.side_edit.items()})
+        keep = {k: s[k] for k in ("title", "artist", "bg", "accent", "panels", "tape_type", "nr", "times",
+                                  "flip_spine", "paper")}
+        self.win.app_state["jcard"] = keep
+        return s
+
+    def changed(self, *_):
+        self.timer.start(120)
+
+    def render_preview(self):
+        spec = self.collect()
+        W, H = jcard_size(spec)
+        avail = self.preview.size()
+        k = min((avail.width() - 20) / W, (avail.height() - 20) / H)
+        img = QtGui.QImage(round(W * k) + 2, round(H * k) + 2, QtGui.QImage.Format_ARGB32_Premultiplied)
+        img.fill(Qt.transparent)
+        p = QtGui.QPainter(img)
+        render_jcard(p, spec, k, 1, 1, guides=True)
+        p.end()
+        self.preview.setPixmap(QtGui.QPixmap.fromImage(img))
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self.changed()
+
+    def set_cover(self, path):
+        self.spec["cover"] = str(path) if path else None
+        self.cover_lbl.setText(Path(path).name if path else "none — big type instead")
+        self.changed()
+
+    def choose_cover(self):
+        f, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Cover art", str(HOME / "Pictures"),
+                                                     "Images (*.jpg *.jpeg *.png *.webp *.bmp)")
+        if f:
+            self.set_cover(f)
+
+    def pick_colour(self, key):
+        c = QtWidgets.QColorDialog.getColor(QtGui.QColor(self.spec[key]), self, "Colour")
+        if c.isValid():
+            self.spec[key] = c.name()
+            self.paint_colour_btns()
+            self.changed()
+
+    def paint_colour_btns(self):
+        for key, b in self.colour_btns.items():
+            b.setStyleSheet(f"background:{self.spec[key]}; color:{auto_ink(self.spec[key])};")
+
+    def default_name(self, ext):
+        base = safe_name(self.title.text() or "J-card")
+        return str((HOME / "Documents" if (HOME / "Documents").exists() else HOME) / f"{base} J-card.{ext}")
+
+    def save_pdf(self):
+        f, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save J-card PDF", self.default_name("pdf"), "PDF (*.pdf)")
+        if f:
+            save_jcard_pdf(self.collect(), f)
+            self.win.save_app_state()
+            self.win.toast(f"Saved {Path(f).name} — print at 100% (actual size).", 8000)
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(f))
+
+    def save_png(self):
+        f, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save J-card PNG", self.default_name("png"), "PNG (*.png)")
+        if f:
+            save_jcard_png(self.collect(), f)
+            self.win.save_app_state()
+            self.win.toast(f"Saved {Path(f).name}.", 6000)
+
+
 class SpectrumHub(QtCore.QObject):
     """One live analyser per watched input, shared by every strip showing it; stops when nobody looks."""
 
@@ -7470,12 +7994,21 @@ class MainWindow(QtWidgets.QMainWindow):
         pick = QtWidgets.QPushButton("Plan sides…")
         pick.clicked.connect(self.plan_tape)
         prow.addWidget(pick)
+        jc = QtWidgets.QPushButton("Make a J-card…")
+        jc.setToolTip("Design the tape's paper insert — cover, spine, track list — and print it at actual size "
+                      "with cut and fold marks. Uses the planned sides if you've planned them.")
+        jc.clicked.connect(self.open_jcard)
+        prow.addWidget(jc)
         prow.addStretch(1)
         l.addLayout(prow)
         self.plan_out = muted("")
         self.plan_out.setTextInteractionFlags(Qt.TextSelectableByMouse)
         l.addWidget(self.plan_out)
         lay.addWidget(c)
+
+    def open_jcard(self):
+        JCardDialog(self, getattr(self, "tape_sides", {"A": [], "B": []}), getattr(self, "tape_files", [])).exec()
+        self.save_app_state()
 
     def play_tone(self, freq, dbfs):
         self.stop_tone()
@@ -7509,7 +8042,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def show_plan(self, tracks):
         mins = self.tape_len.currentData()
-        a, b, over = plan_sides([(Path(p).stem, d) for p, d in tracks], mins * 60)
+        self.tape_files = [p for p, _ in tracks]
+        names = {}
+        for p, _ in tracks:                              # "Title — Artist" from the tags, for the J-card too
+            t, a_ = track_tags(p)
+            names[p] = f"{t} — {a_}" if a_ else t
+        a, b, over = plan_sides([(names[p], d) for p, d in tracks], mins * 60)
+        self.tape_sides = {"A": a, "B": b}
 
         def side(name, items):
             tot = sum(d for _, d in items)
