@@ -163,7 +163,16 @@ pip install PySide6 numpy pytest
 pytest -q
 ```
 
-GitHub runs the same tests, plus a lint check, on every push.
+About 30 more tests play, record and EQ real audio. They need PipeWire, WirePlumber and
+pipewire-pulse installed (no sound card, nothing of yours is touched). In bash:
+
+```
+source tests/pw_stack.sh
+pytest -q
+```
+
+GitHub runs everything on every push and every Monday: once on Ubuntu, and once in an Arch
+container with whatever PipeWire Arch ships that day.
 
 ## License
 

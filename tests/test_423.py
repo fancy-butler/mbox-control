@@ -76,7 +76,6 @@ def test_subsonic_follows_the_headphones_row(win, monkeypatch):
 
 
 def test_speaker_chip_switches_sets_and_off(win, monkeypatch):
-    from PySide6 import QtCore
     win.chip_spk.clicked.emit()
     shown = [[x.text() for x in win.spk_menu.actions() if x.text()]]
     win.spk_menu.close()

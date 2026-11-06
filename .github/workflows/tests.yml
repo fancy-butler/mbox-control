@@ -1,8 +1,14 @@
 name: tests
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 9 * * 1"        # every Monday: catches a new PipeWire/Qt on Arch even when nothing was pushed
+  workflow_dispatch:
 
 jobs:
   test:
+    name: Ubuntu 24.04 (no audio)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -16,8 +22,36 @@ jobs:
       - name: Lint
         run: |
           pyflakes mbox_control.py tests
-          shellcheck -S warning install.sh
+          shellcheck -S warning install.sh tests/pw_stack.sh
       - name: Tests
         env:
           QT_QPA_PLATFORM: offscreen
         run: pytest -q
+
+  arch:
+    name: Arch, current PipeWire (real audio)
+    runs-on: ubuntu-24.04
+    container: archlinux:latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Packages (what an AUR user has today)
+        run: |
+          pacman -Syu --noconfirm --needed git python python-pyside6 python-numpy python-pytest python-pyudev \
+            ffmpeg pipewire pipewire-pulse wireplumber libpulse dbus ttf-dejavu
+      - uses: actions/checkout@v4
+      - name: Versions
+        run: |
+          pipewire --version
+          wireplumber --version
+          python -c "import PySide6; print('PySide6', PySide6.__version__)"
+      - name: Tests, including real PipeWire playback/recording/EQ
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          source tests/pw_stack.sh
+          pytest -q -rs
+      - name: PipeWire logs
+        if: failure()
+        run: tail -n 60 /tmp/mbox-pw.*/*.log
