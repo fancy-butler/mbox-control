@@ -381,3 +381,38 @@ def test_default_output_is_put_back_after_wake(win, monkeypatch, tmp_path):
 def test_events_signal_after_meters_paused_does_not_crash(win):
     win.stop_live()
     win.on_events_alive(False)                         # used to raise AttributeError (poller is None)
+
+
+def test_subsonic_slots_never_default_to_a_1k_highpass():
+    """Unset slots default to 1 kHz — fatal for a high-pass. Off parks it at 5 Hz instead."""
+    off = mc.eq_params(mc.EQ_FLAT)
+    on = mc.eq_params(dict(mc.EQ_FLAT, subsonic=True))
+    assert off["sub1"][0] == off["sub2"][0] == mc.SUBSONIC_OFF_HZ
+    assert on["sub1"][0] == on["sub2"][0] == mc.SUBSONIC_HZ
+    assert "sub1" in mc.eq_chain_conf("x", "s", "t", ["AUX7", "AUX6"])
+
+
+def test_subsonic_switch_per_speaker_set(win, monkeypatch):
+    applied, built = [], []
+    monkeypatch.setattr(win, "apply_eq", lambda: applied.append(win.eq_profile_now()))
+    monkeypatch.setattr(mc, "mbox_pw_node", lambda kind: "alsa_output.firewire-x.pro-output-0")
+    monkeypatch.setattr(mc, "write_sa600_conf", lambda sink, desc, eq=None: built.append(eq))
+    monkeypatch.setattr(mc, "restart_pipewire", lambda: None)
+    win.app_state["eq_on"] = False
+    win.app_state["subsonic_sets"] = {}
+    monkeypatch.setattr(win, "current_set", lambda: "A")
+    win.set_subsonic("A", True)
+    assert built == [True]                               # the chain gets built for the filter
+    assert win.app_state["subsonic_asked"] is True
+    assert win.eq_profile_now()["subsonic"] is True and win.eq_profile_now()["bands"] == []
+    win.set_subsonic("A", False)
+    assert built == [True, False]                        # nothing needs the chain any more
+
+
+def test_subsonic_tip_can_be_dismissed(win):
+    win.app_state.pop("subsonic_asked", None)
+    win.app_state["subsonic_sets"] = {}
+    tips = [i for i in win.health_items() if "subsonic" in i[1]]
+    assert tips and len(tips[0]) == 5
+    tips[0][4]()
+    assert not [i for i in win.health_items() if "subsonic" in i[1]]

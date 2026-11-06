@@ -112,3 +112,38 @@ def test_eq_really_changes_the_sound():
 def test_autoeq_url_includes_the_model_folder():
     url = mc.autoeq_url("oratory1990/over-ear/Sennheiser%20HD%20280%20Pro", "Sennheiser HD 280 Pro")
     assert url.endswith("/oratory1990/over-ear/Sennheiser%20HD%20280%20Pro/Sennheiser%20HD%20280%20Pro%20ParametricEQ.txt")
+
+
+@pytest.mark.skipif(not (shutil.which("pw-cli") and os.environ.get("MBOX_TEST_PIPEWIRE")),
+                    reason="needs a running PipeWire (set MBOX_TEST_PIPEWIRE=1)")
+def test_subsonic_filter_cuts_thumps_but_keeps_the_low_e():
+    """15 Hz (a pluck thump) is cut hard; 41 Hz (a bass guitar's low E) barely; off = untouched."""
+    def level(freq):
+        tone = Path(f"/tmp/mbox-sub-{freq}.wav")
+        subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+                        f"sine=frequency={freq}:duration=3", "-ac", "2", str(tone)], check=True)
+        raw = Path("/tmp/mbox-sub-test.raw")
+        rec = subprocess.Popen(["pw-record", "--target", "fake_mbox", "-P", "stream.capture.sink=true",
+                                "--channels", "8", "--channel-map", "AUX0,AUX1,AUX2,AUX3,AUX4,AUX5,AUX6,AUX7",
+                                "-P", "stream.dont-remix=true", "--format", "f32", str(raw)],
+                               stderr=subprocess.DEVNULL)
+        time.sleep(0.4)
+        subprocess.run(["pw-play", "--target", "sa600_sink", str(tone)])
+        time.sleep(0.3)
+        rec.terminate()
+        rec.wait()
+        x = np.fromfile(raw, dtype=np.float32)
+        x = x[:len(x) // 8 * 8].reshape(-1, 8)[:, 6]
+        x = x[len(x) // 4: -len(x) // 4]
+        return 20 * np.log10(np.sqrt(np.mean(x ** 2)) + 1e-12)
+    off = dict(mc.EQ_FLAT, subsonic=False)
+    on = dict(mc.EQ_FLAT, subsonic=True)
+    assert mc.set_eq_live("sa600_sink", off)
+    time.sleep(0.3)
+    t15, t41 = level(15), level(41)
+    assert mc.set_eq_live("sa600_sink", on)
+    time.sleep(0.3)
+    s15, s41 = level(15), level(41)
+    mc.set_eq_live("sa600_sink", off)
+    assert t15 - s15 > 20                     # the thump (one octave below 30 Hz): about −24 dB
+    assert t41 - s41 < 4                      # the low E: within a few dB

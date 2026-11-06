@@ -98,6 +98,13 @@ included.
 A short setup asks what's plugged in where, for example what Outputs 1/2 feed and what's on each
 input. Everything is optional, and you can change it any time in **Settings → Your setup**.
 
+## Subsonic filter
+
+**Speakers → EQ** has a **Subsonic filter** switch for each speaker set. It cuts everything below
+30 Hz (24 dB/octave): the rumble and pluck thumps that make bookshelf speakers pop, well below the
+lowest note of a bass guitar (41 Hz). Turn it off for a subwoofer or any speaker you want to hear
+everything on. It filters computer sound only, not the Mbox's internal mixer.
+
 ## Sleep and wake
 
 On some systems the Mbox's sound card doesn't come back after the PC wakes up. The FireWire unit

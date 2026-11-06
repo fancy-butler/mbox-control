@@ -1,5 +1,15 @@
 # Changelog
 
+## 4.21
+- **Subsonic filter** (Speakers → EQ, per speaker set). A 24 dB/octave high-pass at 30 Hz cuts the
+  rumble and thumps from hard bass plucks that make small speakers pop. Measured through PipeWire:
+  15 Hz down 24 dB, while a bass guitar's low E (41 Hz) loses 0.3 dB.
+  - It applies to computer sound only. The Mbox's own mixer (live inputs) can't be filtered.
+  - Existing users get a one-time suggestion to turn it on, with a ✕ to dismiss it.
+  - Switching it on or off is instant (when off, the filter sits at an inaudible 5 Hz). Only the first
+    time it's needed does the output chain get rebuilt, with one short PipeWire restart.
+- Health suggestions can now have a "don't suggest this again" ✕.
+
 ## 4.20.2
 - **Sound comes back after wake, not just the card.** While the Mbox is gone, PipeWire moves the default
   output and the app's "Speakers (Mbox)" / "Headphones (Mbox)" streams to another device, and newer

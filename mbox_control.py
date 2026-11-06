@@ -46,7 +46,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QPointF, QRectF
 
 APP_NAME = "Mbox Control"
-VERSION = "4.20.2"
+VERSION = "4.21"
 UPDATE_REPO = ""          # "owner/mbox-control" once the project is on GitHub; empty = no online checks
 HOME = Path.home()
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -2402,10 +2402,15 @@ def service_unit_ok():
 SA600_CONF = PW_CONF_DIR / "mbox-sa600.conf"
 
 
+def chain_wanted(state):
+    """The main output needs the filter chain when the EQ is on or any speaker set uses the subsonic filter."""
+    return bool(state.get("eq_on")) or any(state.get("subsonic_sets", {}).values())
+
+
 def write_sa600_conf(sink, desc="Speakers (Mbox)", eq=None):
     PW_CONF_DIR.mkdir(parents=True, exist_ok=True)
     if eq is None:
-        eq = load_json(STATE_FILE, {}).get("eq_on", False)
+        eq = chain_wanted(load_json(STATE_FILE, {}))
     if eq:                                         # same node names and channels, with the EQ in between
         SA600_CONF.write_text(eq_chain_conf(desc, "sa600_sink", sink, ["AUX7", "AUX6"]))
         return
@@ -5034,7 +5039,11 @@ def import_settings(src):
 
 # Fixed slots so any profile can be loaded live, without restarting PipeWire:
 # preamp + 2 low shelves + 2 high shelves + 12 peaking filters, per channel.
-EQ_SLOTS = [("pre", "bq_lowshelf")] + [(f"ls{i}", "bq_lowshelf") for i in (1, 2)] + \
+# sub1/sub2: a 4th-order (24 dB/oct) Butterworth high-pass — the subsonic filter. Off = parked at 5 Hz (inaudible),
+# so switching it never rebuilds the chain or restarts PipeWire.
+SUBSONIC_HZ, SUBSONIC_OFF_HZ, SUBSONIC_Q = 30.0, 5.0, (0.541, 1.307)
+EQ_SLOTS = [("sub1", "bq_highpass"), ("sub2", "bq_highpass"), ("pre", "bq_lowshelf")] + \
+           [(f"ls{i}", "bq_lowshelf") for i in (1, 2)] + \
            [(f"hs{i}", "bq_highshelf") for i in (1, 2)] + [(f"pk{i}", "bq_peaking") for i in range(1, 13)]
 EQ_FLAT = {"name": "Off (flat)", "preamp": 0.0, "bands": []}
 AUTOEQ_RAW = "https://raw.githubusercontent.com/jaakkopasanen/AutoEq/master/results/"
@@ -5063,6 +5072,8 @@ def parse_parametric_eq(text, name="Custom"):
 def eq_params(profile):
     """Profile → filter-chain control values for every slot (unused slots flat)."""
     vals = {"pre": (20000.0, 0.707, float(profile.get("preamp", 0.0)))}   # shelf below 20 kHz = overall gain
+    hz = SUBSONIC_HZ if profile.get("subsonic") else SUBSONIC_OFF_HZ
+    vals["sub1"], vals["sub2"] = (hz, SUBSONIC_Q[0], 0.0), (hz, SUBSONIC_Q[1], 0.0)
     slots = {"LSC": [s for s, _ in EQ_SLOTS if s.startswith("ls")], "HSC": [s for s, _ in EQ_SLOTS if s.startswith("hs")],
              "PK": [s for s, _ in EQ_SLOTS if s.startswith("pk")]}
     for b in profile.get("bands", []):
@@ -5077,11 +5088,13 @@ def eq_params(profile):
     return vals
 
 
-def eq_pw_params(profile, per_call=5):
+def eq_pw_params(profile, per_call=5, only=None):
     """→ pw-cli parameter lists, a few slots each. pw-cli silently drops lists longer than ~500 characters
-    (and still says OK), so a whole profile is sent in small pieces."""
+    (and still says OK), so a whole profile is sent in small pieces. `only`: slots the running chain has."""
     items = []
     for slot, (f, q, g) in eq_params(profile).items():
+        if only is not None and slot not in only:
+            continue
         items.append(f'"{slot}:Freq" {f:.2f} "{slot}:Q" {q:.3f} "{slot}:Gain" {g:.2f}')
     return ["[ " + " ".join(items[i:i + per_call]) + " ]" for i in range(0, len(items), per_call)]
 
@@ -5144,7 +5157,12 @@ def set_eq_live(sink_node, profile):
     if nid is None:
         return False
     ok = True
-    for chunk in eq_pw_params(profile):
+    try:                                                 # a chain written by an older version lacks some slots
+        text = SA600_CONF.read_text() if sink_node == "sa600_sink" else ""
+        only = {s for s, _ in EQ_SLOTS if f"name = {s} " in text} or None
+    except OSError:
+        only = None
+    for chunk in eq_pw_params(profile, only=only):
         out = run_quiet("pw-cli", "set-param", str(nid), "Props", f"{{ params = {chunk} }}")
         ok = ok and out is not None and "size 8," not in out          # "size 8" = pw-cli dropped it
     return ok
@@ -6588,6 +6606,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.app_state.get("startup_scene"):
             items.append(("tip", "Pick a startup scene so your setup comes back automatically after the "
                                  "Mbox is switched off or used in Windows.", "Choose…", self.choose_startup))
+        if not self.app_state.get("subsonic_asked") and not any(self.app_state.get("subsonic_sets", {}).values()):
+            items.append(("tip", "New: a subsonic filter stops bass thumps from popping your speakers (it cuts "
+                                 f"only below {SUBSONIC_HZ:.0f} Hz — you can turn it off per speaker set in "
+                                 "Speakers → EQ).", "Turn it on", self.enable_subsonic_everywhere,
+                          lambda: (self.app_state.__setitem__("subsonic_asked", True), self.save_app_state())))
         if WAKE_HOOK.exists() and not os.environ.get("MBOX_AMIXER"):
             items.append(("warn", "An older wake-up fix is installed that can leave the Mbox stuck after "
                                   "sleep. Replace it with the new one.", "Replace…",
@@ -6607,7 +6630,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.health_box.setVisible(bool(items))
         colours = {"error": "#f85149", "warn": "#e3a52a", "tip": ACCENT}
         icons = {"error": "●", "warn": "●", "tip": "💡"}
-        for level, text, label, fn in items:
+        for item in items:
+            level, text, label, fn = item[:4]
+            dismiss = item[4] if len(item) > 4 else None
             row = QtWidgets.QWidget()
             h = QtWidgets.QHBoxLayout(row)
             h.setContentsMargins(0, 0, 0, 0)
@@ -6622,6 +6647,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 b.setObjectName("primary" if level == "error" else "")
                 b.clicked.connect(fn)
                 h.addWidget(b)
+            if dismiss:
+                x = QtWidgets.QToolButton()
+                x.setText("✕")
+                x.setToolTip("No thanks — don't suggest this again")
+                x.clicked.connect(lambda _=False, d=dismiss: (d(), self.refresh_health()))
+                h.addWidget(x)
             lay.addWidget(row)
         self.health_title.setText("Needs attention" if any(i[0] == "error" for i in items)
                                   else "Suggestions")
@@ -9856,6 +9887,7 @@ class MainWindow(QtWidgets.QMainWindow):
         l.addLayout(top)
         self.eq_rows = QtWidgets.QGridLayout()
         self.eq_rows.setColumnStretch(1, 1)
+        self.eq_rows.setHorizontalSpacing(14)
         l.addLayout(self.eq_rows)
         brow = QtWidgets.QHBoxLayout()
         find = QtWidgets.QPushButton("Find my headphones (AutoEQ)…")
@@ -9923,6 +9955,43 @@ class MainWindow(QtWidgets.QMainWindow):
             cb.setEnabled(on)
             cb.activated.connect(lambda _, L=L, cb=cb: self.assign_eq(L, cb.currentText()))
             self.eq_rows.addWidget(cb, r, 1)
+            sub = QtWidgets.QCheckBox("Subsonic filter")
+            sub.setChecked(bool(self.app_state.get("subsonic_sets", {}).get(L)))
+            sub.setToolTip(f"Cuts everything below {SUBSONIC_HZ:.0f} Hz (24 dB/octave) — rumble and the thumps of a "
+                           "hard bass pluck that make small speakers pop. Music doesn't go that low (a bass "
+                           "guitar's lowest note is 41 Hz). Turn it off for a subwoofer or full-range speakers "
+                           "you want to hear everything on. Computer sound only.")
+            sub.toggled.connect(lambda on, L=L: self.set_subsonic(L, on))
+            self.eq_rows.addWidget(sub, r, 2)
+
+    def set_subsonic(self, letter, on):
+        before = chain_wanted(self.app_state)
+        self.app_state.setdefault("subsonic_sets", {})[letter] = bool(on)
+        self.subsonic_changed(before)
+        self.toast(f"Subsonic filter {'on' if on else 'off'} for Speakers {letter}.", 4000)
+
+    def enable_subsonic_everywhere(self):
+        before = chain_wanted(self.app_state)
+        self.app_state["subsonic_sets"] = {L: True for L in "ABC"}
+        self.subsonic_changed(before)
+        self.refresh_eq_ui()
+        self.toast("Subsonic filter on — turn it off per speaker set in Speakers → EQ.", 6000)
+
+    def subsonic_changed(self, before):
+        """Live if the chain is already there with the filter in it; otherwise (re)build it — one short
+        PipeWire restart."""
+        self.app_state["subsonic_asked"] = True
+        self.save_app_state()
+        after = chain_wanted(self.app_state)
+        sink = mbox_pw_node("sink")
+        has_filter = SA600_CONF.exists() and "name = sub1 " in SA600_CONF.read_text()
+        if sink and (after != before or (after and not has_filter)):
+            write_sa600_conf(sink, self.main_output_name(), eq=after)
+            restart_pipewire()
+            QtCore.QTimer.singleShot(2500, lambda: (fix_default_sink(), self.apply_eq()))
+        else:
+            self.apply_eq()
+        self.refresh_health()
 
     def assign_eq(self, letter, name):
         self.app_state.setdefault("eq_sets", {})[letter] = name
@@ -9942,10 +10011,13 @@ class MainWindow(QtWidgets.QMainWindow):
         prof["bands"] = list(prof.get("bands", [])) + [b for b in extra if b["g"]]
         boost = max([0.0] + [b["g"] for b in extra])
         prof["preamp"] = float(prof.get("preamp", 0.0)) - boost          # tone boosts never clip
+        if not self.app_state.get("eq_on"):
+            prof = dict(EQ_FLAT)                         # chain only there for the subsonic filter
+        prof["subsonic"] = bool(self.app_state.get("subsonic_sets", {}).get(self.current_set()))
         return prof
 
     def apply_eq(self):
-        if not self.app_state.get("eq_on") or os.environ.get("MBOX_AMIXER"):
+        if not chain_wanted(self.app_state) or os.environ.get("MBOX_AMIXER"):
             return False
         ok = set_eq_live("sa600_sink", self.eq_profile_now())
         if not ok:
@@ -9963,10 +10035,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if not sink and not os.environ.get("MBOX_AMIXER"):
             QtWidgets.QMessageBox.warning(self, APP_NAME, "Couldn't find the Mbox in PipeWire.")
             return
+        before = chain_wanted(self.app_state)
         self.app_state["eq_on"] = on
         self.save_app_state()
-        if sink:
-            write_sa600_conf(sink, self.main_output_name(), eq=on)
+        if sink and chain_wanted(self.app_state) != before:
+            write_sa600_conf(sink, self.main_output_name(), eq=chain_wanted(self.app_state))
             restart_pipewire()
             QtCore.QTimer.singleShot(2500, lambda: (fix_default_sink(), self.apply_eq()))
         self.refresh_eq_ui()
