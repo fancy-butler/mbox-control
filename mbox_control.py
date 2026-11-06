@@ -46,7 +46,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QPointF, QRectF
 
 APP_NAME = "Mbox Control"
-VERSION = "4.22"
+VERSION = "4.22.1"
 UPDATE_REPO = ""          # "owner/mbox-control" once the project is on GitHub; empty = no online checks
 HOME = Path.home()
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -5836,6 +5836,21 @@ def pw_record_raw_flag():
     return ["--raw"] if _PW_RAW else []
 
 
+def play_stdin(cmd):
+    """pw-play reading raw samples from a pipe. Newer pw-play (1.4+) expects a sound *file* on stdin unless
+    told --raw, rejects our samples and quits — silently, if nobody looks. stderr is kept for the error."""
+    return subprocess.Popen(cmd[:1] + pw_record_raw_flag() + cmd[1:] + ["-"], stdin=subprocess.PIPE,
+                            stderr=subprocess.PIPE)
+
+
+def player_error(proc):
+    try:
+        proc.wait(1)
+        return ((proc.stderr.read() or b"").decode(errors="ignore").strip().splitlines() or ["pw-play stopped"])[0]
+    except Exception:  # noqa: BLE001
+        return "pw-play stopped"
+
+
 def capture_cmd(source, auxes, rate, out="-", fmt="s16"):
     """pw-record taking exact Mbox capture channels (AUX0…) with no remixing."""
     auxes = capture_auxes(auxes)
@@ -5940,6 +5955,7 @@ def split_multitrack(src, names, folder):
 
 class Metronome(QtCore.QThread):
     """Clicks streamed live to an output; tempo, beats per bar and volume change on the fly."""
+    failed = QtCore.Signal(str)
 
     def __init__(self, target, bpm=100, beats=4, volume=0.6, rate=48000):
         super().__init__()
@@ -5962,8 +5978,9 @@ class Metronome(QtCore.QThread):
         if self.target:
             cmd += ["--target", self.target]
         try:
-            self.proc = subprocess.Popen(cmd + ["-"], stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        except OSError:
+            self.proc = play_stdin(cmd)
+        except OSError as e:
+            self.failed.emit(str(e))
             return
         hi, lo = self.click(True), self.click(False)
         block = int(self.rate * 0.02)                       # write 20 ms at a time: tempo changes land fast
@@ -5993,6 +6010,8 @@ class Metronome(QtCore.QThread):
             ahead = pos / self.rate - (time.time() - start)
             if ahead > 0.15:                                # stay ~150 ms ahead of the speakers, no more
                 time.sleep(ahead - 0.15)
+        if not self.stopping:
+            self.failed.emit(player_error(self.proc))
         if self.proc and self.proc.poll() is None:
             self.proc.terminate()
 
@@ -6121,6 +6140,7 @@ class PracticePlayer(QtCore.QThread):
     position = QtCore.Signal(float)
     looped = QtCore.Signal()
     finished_play = QtCore.Signal()
+    failed = QtCore.Signal(str)
 
     def __init__(self, data, rate, target, loop, src_start, speed):
         super().__init__()
@@ -6136,9 +6156,11 @@ class PracticePlayer(QtCore.QThread):
         if self.target:
             cmd += ["--target", self.target]
         try:
-            proc = subprocess.Popen(cmd + ["-"], stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        except OSError:
+            proc = play_stdin(cmd)
+        except OSError as e:
+            self.failed.emit(str(e))
             return
+        self.proc = proc
         frame = 4
         block = self.rate // 50 * frame                 # 20 ms
         start = time.time()
@@ -6170,8 +6192,14 @@ class PracticePlayer(QtCore.QThread):
         if self.stopping:
             proc.terminate()
         else:
-            proc.wait(3)
-            self.finished_play.emit()
+            try:
+                proc.wait(3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            if proc.returncode not in (0, None, -15):
+                self.failed.emit(player_error(proc))
+            else:
+                self.finished_play.emit()
 
     def stop(self):
         self.stopping = True
@@ -6182,6 +6210,7 @@ class PracticeStream(QtCore.QThread):
     """Whole-song playback: ffmpeg streams processed audio straight into pw-play (starts instantly)."""
     position = QtCore.Signal(float)
     finished_play = QtCore.Signal()
+    failed = QtCore.Signal(str)
 
     def __init__(self, path, start, speed, semitones, rate, target):
         super().__init__()
@@ -6198,9 +6227,11 @@ class PracticeStream(QtCore.QThread):
                                    stderr=subprocess.DEVNULL)
             cmd = ["pw-play", "--rate", str(self.rate), "--channels", "2", "--format", "s16", "-P",
                    "media.name=Practice", "-P", "media.role=Music"] + (["--target", self.target] if self.target else [])
-            out = subprocess.Popen(cmd + ["-"], stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        except OSError:
+            out = play_stdin(cmd)
+        except OSError as e:
+            self.failed.emit(str(e))
             return
+        self.proc = out
         block = self.rate // 50 * 4
         start, sent = time.time(), 0
         while not self.stopping:
@@ -6225,8 +6256,14 @@ class PracticeStream(QtCore.QThread):
         if self.stopping:
             out.terminate()
         else:
-            out.wait(3)
-            self.finished_play.emit()
+            try:
+                out.wait(3)
+            except subprocess.TimeoutExpired:
+                out.kill()
+            if out.returncode not in (0, None, -15):
+                self.failed.emit(player_error(out))
+            else:
+                self.finished_play.emit()
 
     def stop(self):
         self.stopping = True
@@ -11881,8 +11918,16 @@ class MainWindow(QtWidgets.QMainWindow):
                             [("Add Headphones (Mbox)", self.install_headphones)])
         self.metro = Metronome(target, self.met_bpm.value(), self.met_beats.value(), self.met_vol.value() / 100,
                                rate=self.rate())
+        self.metro.failed.connect(self.metronome_failed)
         self.metro.start()
         self.met_btn.setText("■  Stop")
+
+    def metronome_failed(self, err):
+        if self.metro:
+            self.metro = None
+            self.metro_route(False)
+            self.met_btn.setText("▶  Start")
+        self.hint.offer(f"<b>The metronome couldn't play.</b> {html_escape(err)}", [])
 
     def metro_route(self, on):
         """Make sure the clicks (computer 1/2, the "Headphones (Mbox)" channels) reach whatever each headphone
@@ -12115,6 +12160,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.pr_player = PracticePlayer(data, rate, target, True, a, speed)
                 self.pr_player.position.connect(self.practice_pos)
                 self.pr_player.looped.connect(self.practice_looped)
+                self.pr_player.failed.connect(self.practice_failed)
                 self.pr_player.start()
                 self.pr_play.setText("❚❚  Pause")
             job.ready.connect(go)
@@ -12124,8 +12170,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.pr_player = PracticeStream(self.pr_path, self.pr_pos, speed, semis, rate, target)
             self.pr_player.position.connect(self.practice_pos)
             self.pr_player.finished_play.connect(lambda: (self.practice_stop(), setattr(self, "pr_pos", 0.0)))
+            self.pr_player.failed.connect(self.practice_failed)
             self.pr_player.start()
             self.pr_play.setText("❚❚  Pause")
+
+    def practice_failed(self, err):
+        self.practice_stop()
+        self.toast(f"Couldn't play it: {err}", 10000)
 
     def practice_pos(self, t):
         self.pr_pos = t

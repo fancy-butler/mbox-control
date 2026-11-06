@@ -94,3 +94,45 @@ def test_cover_art_comes_from_the_songs(tmp_path):
     subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=duration=1", str(plain)], check=True)
     (tmp_path / "folder.jpg").write_bytes(cover.read_bytes())
     assert mc.extract_cover([plain], tmp_path / "out2.jpg") == tmp_path / "folder.jpg"
+
+
+def _fake_pw_play(tmp_path, monkeypatch, accepts_raw=True):
+    """A pw-play like PipeWire 1.4+: piped samples need --raw, otherwise it quits with an error."""
+    b = tmp_path / "bin"
+    b.mkdir(exist_ok=True)
+    log = tmp_path / "pw-play.log"
+    (b / "pw-play").write_text(
+        "#!/bin/sh\n"
+        f'echo "$@" >>{log}\n'
+        'case " $* " in *" --raw "*) cat >/dev/null; exit 0 ;; esac\n'
+        'echo "error: sf_open failed: File contains data in an unknown format." >&2; exit 1\n')
+    (b / "pw-play").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{b}:{__import__('os').environ['PATH']}")
+    monkeypatch.setattr(mc, "_PW_RAW", accepts_raw)
+    return log
+
+
+def test_metronome_passes_raw_to_newer_pw_play(tmp_path, monkeypatch, app):
+    log = _fake_pw_play(tmp_path, monkeypatch, accepts_raw=True)
+    m = mc.Metronome(None, 120, 4, 0.5, rate=48000)
+    errs = []
+    m.failed.connect(errs.append)
+    m.start()
+    import time
+    time.sleep(0.6)
+    m.stop()
+    app.processEvents()
+    assert "--raw" in log.read_text() and not errs
+
+
+def test_metronome_reports_when_pw_play_refuses(tmp_path, monkeypatch, app, win):
+    _fake_pw_play(tmp_path, monkeypatch, accepts_raw=False)        # an old flag check: no --raw sent
+    monkeypatch.setattr(mc, "pw_node_exists", lambda n, k: False)
+    win.toggle_metronome()
+    import time
+    end = time.time() + 3
+    while win.metro is not None and time.time() < end:
+        app.processEvents()
+        time.sleep(0.05)
+    assert win.metro is None and win.met_btn.text() == "▶  Start"
+    assert "couldn't play" in win.hint.text.text() and "unknown format" in win.hint.text.text()

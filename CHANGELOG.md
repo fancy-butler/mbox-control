@@ -1,5 +1,12 @@
 # Changelog
 
+## 4.22.1
+- **Fixed: the metronome and the practice player were silent on newer PipeWire (1.4+).** When `pw-play`
+  reads from a pipe it now expects a sound file unless given `--raw`, so it rejected the app's raw audio
+  and quit without a word. The app now passes `--raw` when pw-play supports it. If a player quits
+  anyway, the reason is shown instead of silence. This is the same PipeWire change that broke Capture
+  in 4.18.3.
+
 ## 4.22 — J-card maker
 - **Make a J-card** (Record → Tools → Make a tape). It designs the tape's paper insert and shows a live
   preview with the folds marked. It fills in from **Plan sides…**:
