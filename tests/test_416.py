@@ -137,7 +137,7 @@ def test_metronome_keeps_time(tmp_path):
     rec = subprocess.Popen(["pw-record", "--target", "fake_mbox", "-P", "stream.capture.sink=true", "--channels", "1",
                             "--format", "f32", str(raw)])
     time.sleep(0.4)
-    m = mc.Metronome("fake_mbox", bpm=120, beats=4)
+    m = mc.Metronome("fake_mbox", bpm=120, meter="4/4")
     m.start()
     time.sleep(2.6)
     m.stop()
@@ -181,3 +181,33 @@ def test_level_strip_spectrum_follows_the_input(win, two_tones, spinner, monkeyp
     top = max(range(40), key=lambda i: best[i])
     assert edges[top] <= 440 * 1.2 and edges[top + 1] >= 440 / 1.2, (top, edges[top], edges[top + 1])
     assert math.isfinite(best[top])
+
+
+@PW
+def test_metronome_six_eight_feels_in_two(tmp_path):
+    """6/8 at 60: the dotted quarter = 1 s, eighths tick every 1/3 s: LOUD soft soft MID soft soft."""
+    raw = tmp_path / "m68.raw"
+    rec = subprocess.Popen(["pw-record", "--target", "fake_mbox", "-P", "stream.capture.sink=true", "--channels", "1",
+                            "--format", "f32", str(raw)])
+    time.sleep(0.4)
+    m = mc.Metronome("fake_mbox", bpm=60, meter="6/8")
+    m.start()
+    time.sleep(2.4)
+    m.stop()
+    time.sleep(0.3)
+    rec.terminate()
+    rec.wait()
+    x = np.fromfile(raw, np.float32)
+    env = np.abs(x)
+    peaks, i, thr = [], 0, env.max() * 0.15
+    while i < len(env):
+        if env[i] > thr:
+            peaks.append((i / 48000, env[i:i + 1440].max()))
+            i += 4800
+        else:
+            i += 1
+    t = np.array([p[0] for p in peaks])
+    a = np.array([p[1] for p in peaks])
+    assert len(t) >= 6 and np.allclose(np.diff(t), 1 / 3, atol=0.01)
+    first = a[:6] / a[:6].max()
+    assert first[0] == 1.0 and first[3] > 0.7 and max(first[[1, 2, 4, 5]]) < 0.5

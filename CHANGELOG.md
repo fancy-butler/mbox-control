@@ -1,5 +1,13 @@
 # Changelog
 
+## 4.22.2
+- **Metronome: "Beats" is now a time signature.** Choose from 4/4, 3/4, 2/4, 5/4, 6/8, 9/8, 12/8, 5/8,
+  7/8, or no accent.
+  - In 6/8, 9/8 and 12/8 the tempo counts the dotted-quarter beat, the way you'd feel a jig. The eighths
+    tick softly in between, with an accent on the 1 and a lighter one on each beat.
+  - 5/8 and 7/8 count eighth notes, grouped 3+2 and 2+2+3.
+  - Your old "beats" setting carries over.
+
 ## 4.22.1
 - **Fixed: the metronome and the practice player were silent on newer PipeWire (1.4+).** When `pw-play`
   reads from a pipe it now expects a sound file unless given `--raw`, so it rejected the app's raw audio

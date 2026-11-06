@@ -114,7 +114,7 @@ def _fake_pw_play(tmp_path, monkeypatch, accepts_raw=True):
 
 def test_metronome_passes_raw_to_newer_pw_play(tmp_path, monkeypatch, app):
     log = _fake_pw_play(tmp_path, monkeypatch, accepts_raw=True)
-    m = mc.Metronome(None, 120, 4, 0.5, rate=48000)
+    m = mc.Metronome(None, 120, "4/4", 0.5, rate=48000)
     errs = []
     m.failed.connect(errs.append)
     m.start()
@@ -136,3 +136,12 @@ def test_metronome_reports_when_pw_play_refuses(tmp_path, monkeypatch, app, win)
         time.sleep(0.05)
     assert win.metro is None and win.met_btn.text() == "▶  Start"
     assert "couldn't play" in win.hint.text.text() and "unknown format" in win.hint.text.text()
+
+
+def test_time_signatures_replace_beats(win):
+    labels = [win.met_sig.itemData(i) for i in range(win.met_sig.count())]
+    assert labels[:3] == ["4/4", "3/4", "2/4"] and "6/8" in labels and "7/8" in labels
+    assert mc.METERS["7/8"][0] == [3, 1, 2, 1, 2, 1, 1]          # 2+2+3
+    assert mc.METERS["6/8"][1] == 3                                 # tempo = dotted quarter
+    win.met_sig.setCurrentIndex(win.met_sig.findData("3/4"))
+    assert win.app_state["met_sig"] == "3/4"

@@ -46,7 +46,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QPointF, QRectF
 
 APP_NAME = "Mbox Control"
-VERSION = "4.22.1"
+VERSION = "4.22.2"
 UPDATE_REPO = ""          # "owner/mbox-control" once the project is on GitHub; empty = no online checks
 HOME = Path.home()
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -5953,23 +5953,40 @@ def split_multitrack(src, names, folder):
     return outs
 
 
+# Time signatures → (clicks per bar as accent levels, clicks per tempo beat).
+# Levels: 3 = the one, 2 = a group start, 1 = a beat, 0 = a soft subdivision tick.
+# x/4: the tempo is the quarter note. 6/8, 9/8, 12/8: the tempo is the dotted quarter (how you feel a jig), with
+# the eighths ticking softly. 5/8, 7/8: the tempo is the eighth note, grouped 3+2 and 2+2+3.
+METERS = {
+    "2/4": ([3, 1], 1), "3/4": ([3, 1, 1], 1), "4/4": ([3, 1, 1, 1], 1), "5/4": ([3, 1, 1, 1, 1], 1),
+    "6/8": ([3, 0, 0, 2, 0, 0], 3), "9/8": ([3, 0, 0, 2, 0, 0, 2, 0, 0], 3),
+    "12/8": ([3, 0, 0, 2, 0, 0, 2, 0, 0, 2, 0, 0], 3),
+    "5/8": ([3, 1, 1, 2, 1], 1), "7/8": ([3, 1, 2, 1, 2, 1, 1], 1),
+    "none": ([1], 1),
+}
+METER_LABELS = [("4/4", "4/4"), ("3/4", "3/4 (waltz)"), ("2/4", "2/4 (march, polka)"), ("5/4", "5/4"),
+                ("6/8", "6/8 (jig) — tempo = dotted quarter"), ("9/8", "9/8 (slip jig) — tempo = dotted quarter"),
+                ("12/8", "12/8 (slow blues) — tempo = dotted quarter"), ("5/8", "5/8 (3+2) — tempo = eighth note"),
+                ("7/8", "7/8 (2+2+3) — tempo = eighth note"), ("none", "No accent")]
+
+
 class Metronome(QtCore.QThread):
-    """Clicks streamed live to an output; tempo, beats per bar and volume change on the fly."""
+    """Clicks streamed live to an output; tempo, time signature and volume change on the fly."""
     failed = QtCore.Signal(str)
 
-    def __init__(self, target, bpm=100, beats=4, volume=0.6, rate=48000):
+    def __init__(self, target, bpm=100, meter="4/4", volume=0.6, rate=48000):
         super().__init__()
-        self.target, self.bpm, self.beats, self.volume, self.rate = target, bpm, beats, volume, rate
+        self.target, self.bpm, self.meter, self.volume, self.rate = target, bpm, meter, volume, rate
         self.stopping = False
         self.proc = None
         self.beat_no = 0
 
-    def click(self, accent):
+    def click(self, level):
         import numpy as np
         n = int(self.rate * 0.03)
         t = np.arange(n) / self.rate
-        f = 1760.0 if accent else 1175.0
-        return (np.sin(2 * np.pi * f * t) * np.exp(-t * 180) * (1.0 if accent else 0.7)).astype(np.float32)
+        f, amp = {3: (1760.0, 1.0), 2: (1480.0, 0.85), 1: (1175.0, 0.7), 0: (1175.0, 0.32)}[level]
+        return (np.sin(2 * np.pi * f * t) * np.exp(-t * 180) * amp).astype(np.float32)
 
     def run(self):
         import numpy as np
@@ -5982,7 +5999,7 @@ class Metronome(QtCore.QThread):
         except OSError as e:
             self.failed.emit(str(e))
             return
-        hi, lo = self.click(True), self.click(False)
+        clicks = {lvl: self.click(lvl) for lvl in (0, 1, 2, 3)}
         block = int(self.rate * 0.02)                       # write 20 ms at a time: tempo changes land fast
         pos, next_click = 0, 0
         pending = np.zeros(0, np.float32)                   # the end of a click that crossed a block edge
@@ -5992,9 +6009,10 @@ class Metronome(QtCore.QThread):
             k = min(len(pending), block)
             buf[:k] += pending[:k]
             pending = pending[k:]
-            period = max(1, int(self.rate * 60.0 / max(20, min(300, self.bpm))))
+            pattern, per_beat = METERS.get(self.meter, METERS["4/4"])
+            period = max(1, int(self.rate * 60.0 / max(20, min(300, self.bpm)) / per_beat))
             while next_click < pos + block:
-                c = hi if self.beats > 1 and self.beat_no % self.beats == 0 else lo
+                c = clicks[pattern[self.beat_no % len(pattern)]]
                 off = next_click - pos
                 seg = c[:block - off]
                 buf[off:off + len(seg)] += seg
@@ -11860,12 +11878,16 @@ class MainWindow(QtWidgets.QMainWindow):
         tap.setToolTip("Tap along a few times to set the tempo.")
         tap.clicked.connect(self.tap_tempo)
         row.addWidget(tap)
-        row.addWidget(QtWidgets.QLabel("Beats"))
-        self.met_beats = QtWidgets.QSpinBox()
-        self.met_beats.setRange(1, 12)
-        self.met_beats.setValue(int(self.app_state.get("met_beats", 4)))
-        self.met_beats.valueChanged.connect(self.metronome_changed)
-        row.addWidget(self.met_beats)
+        row.addWidget(QtWidgets.QLabel("Time"))
+        self.met_sig = QtWidgets.QComboBox()
+        for key, label in METER_LABELS:
+            self.met_sig.addItem(label, key)
+        old = {2: "2/4", 3: "3/4", 4: "4/4", 5: "5/4", 6: "6/8", 1: "none"}.get(self.app_state.get("met_beats"))
+        self.met_sig.setCurrentIndex(max(0, self.met_sig.findData(self.app_state.get("met_sig") or old or "4/4")))
+        self.met_sig.setToolTip("The accented click is the one. In 6/8, 9/8 and 12/8 the tempo counts the "
+                                "dotted-quarter beat and the eighths tick softly in between.")
+        self.met_sig.currentIndexChanged.connect(self.metronome_changed)
+        row.addWidget(self.met_sig)
         self.met_vol = QtWidgets.QSlider(Qt.Horizontal)
         self.met_vol.setRange(5, 100)
         self.met_vol.setValue(int(self.app_state.get("met_vol", 60)))
@@ -11886,10 +11908,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.met_bpm.setValue(round(60 / (sum(gaps) / len(gaps))))
 
     def metronome_changed(self):
-        self.app_state.update(met_bpm=self.met_bpm.value(), met_beats=self.met_beats.value(),
+        self.app_state.update(met_bpm=self.met_bpm.value(), met_sig=self.met_sig.currentData(),
                               met_vol=self.met_vol.value())
         if self.metro:
-            self.metro.bpm, self.metro.beats = self.met_bpm.value(), self.met_beats.value()
+            self.metro.bpm, self.metro.meter = self.met_bpm.value(), self.met_sig.currentData()
             self.metro.volume = self.met_vol.value() / 100
 
     def toggle_metronome(self):
@@ -11916,7 +11938,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.hint.offer("<b>Playing the metronome on your normal output.</b> Add a “Headphones (Mbox)” "
                             "output and it clicks in the headphones only, never on the speakers.",
                             [("Add Headphones (Mbox)", self.install_headphones)])
-        self.metro = Metronome(target, self.met_bpm.value(), self.met_beats.value(), self.met_vol.value() / 100,
+        self.metro = Metronome(target, self.met_bpm.value(), self.met_sig.currentData(), self.met_vol.value() / 100,
                                rate=self.rate())
         self.metro.failed.connect(self.metronome_failed)
         self.metro.start()
