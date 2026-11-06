@@ -1,6 +1,11 @@
 # Changelog
 
 
+
+## 4.23.1
+- Turn EQ on/off now switches live. With the subsonic filter keeping the chain running, it used to change nothing until the next restart.
+- The Speakers chip on Home is a button: pick Speakers A/B/C, switch the speakers off (headphones only — the headphone EQ follows), or tick "Use the headphone EQ". It shows 🎧 when the headphone EQ is playing.
+
 ## 4.23
 - **Headphones get their own EQ.** The Mbox's headphone jack hears the same mix as the speakers, so the EQ can't follow the Spkr button for them. New Headphones row in Speakers → EQ; it plays when "Listening on headphones" is ticked or the speakers are switched off. A profile that was on Speakers B (where the AutoEQ dialog used to put headphones) is copied over.
 - AutoEQ dialog defaults to Headphones.

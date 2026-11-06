@@ -73,3 +73,35 @@ def test_subsonic_follows_the_headphones_row(win, monkeypatch):
     win.app_state["subsonic_sets"] = {"A": True, "H": False}
     win.apply_eq()
     assert sent[-1]["subsonic"] is False
+
+
+def test_speaker_chip_switches_sets_and_off(win, monkeypatch):
+    from PySide6 import QtCore
+    win.chip_spk.clicked.emit()
+    shown = [[x.text() for x in win.spk_menu.actions() if x.text()]]
+    win.spk_menu.close()
+    assert shown and shown[0][:3] == [t for t in shown[0][:3] if t.startswith("Speakers ")]
+    assert "Speakers off (headphones only)" in shown[0] and "Use the headphone EQ" in shown[0]
+    win.backend.__dict__.pop("_hist", None)            # earlier tests' writes would trip the storm guard
+    toasts = []
+    monkeypatch.setattr(win, "toast", lambda *a, **k: toasts.append(a))
+    win.switch_speakers("off")
+    assert not toasts
+    assert win.ctrl_item("spkr-button") == "Off" and win.eq_target() == "H"
+    assert win.chip_spk.text().startswith("Speakers off")
+    win.switch_speakers("B")
+    assert win.ctrl_item("spkr-button") == "Red" and "Speakers B" in win.chip_spk.text()
+    win.set_hp_listen(True)
+    assert "🎧" in win.chip_spk.text() and win.eq_target() == "H"
+
+
+def test_eq_on_off_switches_live_when_the_chain_stays(win, monkeypatch):
+    sent = setup_eq(win, monkeypatch)
+    monkeypatch.setattr(mc, "mbox_pw_node", lambda kind: "mbox")
+    monkeypatch.setattr(mc, "restart_pipewire", lambda: pytest.fail("no restart needed"))
+    monkeypatch.setattr(win, "eq_target", lambda: "H")
+    win.app_state["subsonic_sets"] = {"H": True}
+    win.toggle_eq()                                     # on → off: the subsonic filter keeps the chain
+    assert sent[-1]["name"] == "Off (flat)" and sent[-1]["subsonic"] is True
+    win.toggle_eq()
+    assert sent[-1]["name"] == "Cans"

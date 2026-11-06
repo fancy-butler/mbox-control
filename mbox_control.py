@@ -46,7 +46,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QPointF, QRectF
 
 APP_NAME = "Mbox Control"
-VERSION = "4.23"
+VERSION = "4.23.1"
 UPDATE_REPO = ""          # "owner/mbox-control" once the project is on GitHub; empty = no online checks
 HOME = Path.home()
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -1169,10 +1169,28 @@ class Knob(QtWidgets.QWidget):
 
 
 class Chip(QtWidgets.QLabel):
+    clicked = QtCore.Signal()
+
     def __init__(self):
         super().__init__()
         self.setAlignment(Qt.AlignCenter)
         self.setMinimumHeight(34)
+
+    def make_clickable(self, tip):
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip(tip)
+        self.setFocusPolicy(Qt.StrongFocus)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.LeftButton and self.rect().contains(e.position().toPoint()):
+            self.clicked.emit()
+        super().mouseReleaseEvent(e)
+
+    def keyPressEvent(self, e):
+        if e.key() in (Qt.Key_Space, Qt.Key_Return, Qt.Key_Enter):
+            self.clicked.emit()
+        else:
+            super().keyPressEvent(e)
 
     def set(self, text, colour=None):
         self.setText(text)
@@ -8570,8 +8588,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
         base = (item or "Off").split("-")[0]
         letter = SPEAKERS.get(base, (None,))[0]
-        if letter in used:
-            return False
+        if letter in used or (base == "Off" and time.monotonic() < getattr(self, "off_wanted_until", 0)):
+            return False                                 # Off chosen on screen: headphones only, keep it
         c = self.ctrl("spkr-button")
         target = LETTER_COLOUR[used[0]][0]
         if c and target in c.items:
@@ -9381,6 +9399,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chip_spk, self.chip_dim, self.chip_mono, self.chip_rate = Chip(), Chip(), Chip(), Chip()
         for c in (self.chip_spk, self.chip_dim, self.chip_mono, self.chip_rate):
             row.addWidget(c)
+        self.chip_spk.make_clickable("Click to switch speakers, turn them off, or use the headphone EQ")
+        self.chip_spk.clicked.connect(self.speaker_menu)
         row.addStretch(1)
         self.phantom_btn = QtWidgets.QPushButton("+48V off")
         self.phantom_btn.setObjectName("phantom")
@@ -9504,9 +9524,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if sc:
             name = self.label(f"spk{sc[0]}", "")
             hold = " · Aux" if spk.endswith("Blink") else ""
-            self.chip_spk.set(f"Speakers {sc[0]}" + (f" · {name}" if name else "") + hold, sc[1])
+            hp = " · 🎧 EQ" if self.app_state.get("hp_listen") else ""
+            self.chip_spk.set(f"Speakers {sc[0]}" + (f" · {name}" if name else "") + hold + hp + "  ▾", sc[1])
         else:
-            self.chip_spk.set("Speakers off")
+            self.chip_spk.set("Speakers off · 🎧  ▾")
         mute = self.ctrl_item("mute-button")
         self.chip_dim.set({"On": "DIMMED", "Blink": "MUTED"}.get(mute, "Dim/Mute off"),
                           "#e3a52a" if mute in ("On", "Blink") else None)
@@ -10607,6 +10628,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.save_app_state()
         self.apply_eq()
         QtCore.QTimer.singleShot(0, self.refresh_eq_ui)
+        self.update_status()
         self.toast("Headphone EQ on." if on else "EQ follows the Spkr button again.", 4000)
 
     def set_subsonic(self, letter, on):
@@ -10699,6 +10721,8 @@ class MainWindow(QtWidgets.QMainWindow):
             write_sa600_conf(sink, self.main_output_name(), eq=chain_wanted(self.app_state))
             restart_pipewire()
             QtCore.QTimer.singleShot(2500, lambda: (fix_default_sink(), self.apply_eq()))
+        else:
+            self.apply_eq()                              # chain already there (subsonic filter): switch live
         self.refresh_eq_ui()
         self.toast("EQ on — pick a profile for each speaker set." if on else "EQ off.", 6000)
 
@@ -10965,10 +10989,33 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.app_state["cr_enabled"]:
             self.on_speaker_change(self.ctrl_item("spkr-button"), force=True)
 
+    def speaker_menu(self):
+        """The Spkr button, from the screen: pick a set, switch the speakers off, or the headphone EQ."""
+        m = QtWidgets.QMenu(self)
+        cur = (self.ctrl_item("spkr-button") or "Off").split("-")[0]
+        for L in "ABC":
+            own = self.label(f"spk{L}", "")
+            a = m.addAction(f"Speakers {L}" + (f" — {own}" if own else ""))
+            a.setCheckable(True)
+            a.setChecked(SPEAKERS.get(cur, (None,))[0] == L)
+            a.triggered.connect(lambda _=False, L=L: self.switch_speakers(L))
+        a = m.addAction("Speakers off (headphones only)")
+        a.setCheckable(True)
+        a.setChecked(cur == "Off")
+        a.triggered.connect(lambda: self.switch_speakers("off"))
+        m.addSeparator()
+        hp = m.addAction("Use the headphone EQ")
+        hp.setCheckable(True)
+        hp.setChecked(bool(self.app_state.get("hp_listen")))
+        hp.triggered.connect(lambda on: self.set_hp_listen(on))
+        self.spk_menu = m                                     # kept alive while it's open
+        m.popup(self.chip_spk.mapToGlobal(QtCore.QPoint(0, self.chip_spk.height())))
+
     def switch_speakers(self, letter):
         c = self.ctrl("spkr-button")
         if c:
-            item = LETTER_COLOUR[letter][0]
+            item = "Off" if letter == "off" else LETTER_COLOUR[letter][0]
+            self.off_wanted_until = time.monotonic() + 5 if letter == "off" else 0
             self.write(c, [c.items.index(item)])
             self.on_speaker_change(item, force=True)
             self.update_status()
