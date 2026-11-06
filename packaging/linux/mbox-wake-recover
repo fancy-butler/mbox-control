@@ -4,7 +4,7 @@
 # Never touches firewire_ohci. Logs every step to /var/log/mbox-control-wake.log and the journal.
 SYS=${MBOX_SYSFS:-/sys}; PROC=${MBOX_PROCFS:-/proc}; RUN=${MBOX_RUNDIR:-/run}   # overridable for tests
 LOG=${MBOX_WAKE_LOG:-/var/log/mbox-control-wake.log}
-WAIT=${MBOX_WAKE_WAIT:-15}
+WAIT=${MBOX_WAKE_WAIT:-8}
 DRIVERS=" snd_dice snd_bebob snd_fireworks snd_oxfw snd_firewire_motu snd_fireface snd_firewire_digi00x snd_firewire_tascam "
 log() { echo "$(date '+%F %T') $*" >>"$LOG"; logger -t mbox-control "$*" 2>/dev/null || true; }
 daemon_for() {

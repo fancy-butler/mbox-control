@@ -122,7 +122,7 @@ Mbox Control handles this in three layers:
    `snd-dice-ctl-service`, `snd_bebob` ↔ `snd-bebob-ctl-service`, …).
 
 **Optional: automatic recovery without a password.** **Settings → App → Sleep & wake → Install
-sleep/wake fix** adds a systemd sleep hook. After every wake it waits 15 seconds and then checks
+sleep/wake fix** adds a systemd sleep hook. After every wake it gives the card 8 seconds to come back on its own, then checks
 whether a FireWire audio card is missing. Only if one is, it stops the logged-in users' audio servers,
 reloads the sound driver and starts everything again. It has no hardcoded user names or paths, and it
 logs every step to `/var/log/mbox-control-wake.log` and the journal (`journalctl -t mbox-control`).

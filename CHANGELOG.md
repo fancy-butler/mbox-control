@@ -1,5 +1,10 @@
 # Changelog
 
+## 4.20.1
+- The wake hook waits 8 seconds (was 15) for the card to come back on its own before recovering it.
+  A hand-made hook that reloads unconditionally after 3 seconds worked on the test machine, so 15
+  seconds was just extra silence.
+
 ## 4.20 — surviving sleep and wake
 - **Lets go of the Mbox before sleep.** The app listens for logind's PrepareForSleep, holds a short
   "delay" inhibitor, and closes every handle it has on the card first: meters, events, direct reads

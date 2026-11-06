@@ -46,7 +46,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QPointF, QRectF
 
 APP_NAME = "Mbox Control"
-VERSION = "4.20"
+VERSION = "4.20.1"
 UPDATE_REPO = ""          # "owner/mbox-control" once the project is on GitHub; empty = no online checks
 HOME = Path.home()
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -13634,7 +13634,7 @@ WAKE_RECOVER = r"""#!/bin/sh
 # Never touches firewire_ohci. Logs every step to /var/log/mbox-control-wake.log and the journal.
 SYS=${MBOX_SYSFS:-/sys}; PROC=${MBOX_PROCFS:-/proc}; RUN=${MBOX_RUNDIR:-/run}   # overridable for tests
 LOG=${MBOX_WAKE_LOG:-/var/log/mbox-control-wake.log}
-WAIT=${MBOX_WAKE_WAIT:-15}
+WAIT=${MBOX_WAKE_WAIT:-8}
 DRIVERS=" %(drivers)s "
 log() { echo "$(date '+%%F %%T') $*" >>"$LOG"; logger -t mbox-control "$*" 2>/dev/null || true; }
 daemon_for() {
