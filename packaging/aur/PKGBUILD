@@ -1,8 +1,8 @@
-# Maintainer: Fancy Butler <you@example.com>
-# Before publishing: set _ghuser, then run `updpkgsums && makepkg --printsrcinfo > .SRCINFO`
-_ghuser=CHANGE_ME
+# Maintainer: Fancy Butler
+# Each GitHub release carries this file with pkgver and sha256sums filled in.
+_ghuser=fancy-butler
 pkgname=mbox-control
-pkgver=4.24.1
+pkgver=4.25
 pkgrel=1
 pkgdesc="Unofficial modern control panel for the Avid Mbox Pro 3 (FireWire): mixer, routing, ripping, guitar mode"
 arch=('any')
@@ -18,7 +18,7 @@ optdepends=('guitarix: amp and effects for Guitar mode'
             'avahi: AirPlay speakers'
             'qpwgraph: see and change PipeWire connections by hand')
 source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
-sha256sums=('SKIP')   # replaced by updpkgsums once the tag exists
+sha256sums=('SKIP')   # filled in by the release job
 
 package() {
   cd "${pkgname}-${pkgver}"

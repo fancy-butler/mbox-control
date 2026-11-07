@@ -46,8 +46,8 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QPointF, QRectF
 
 APP_NAME = "Mbox Control"
-VERSION = "4.24.1"
-UPDATE_REPO = ""          # "owner/mbox-control" once the project is on GitHub; empty = no online checks
+VERSION = "4.25"
+UPDATE_REPO = "fancy-butler/mbox-control"     # where releases are published; empty = no online checks
 HOME = Path.home()
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
 CONF_DIR = XDG_CONFIG / "mbox-control"

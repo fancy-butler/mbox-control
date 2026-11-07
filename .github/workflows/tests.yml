@@ -74,3 +74,27 @@ jobs:
       - name: PipeWire logs
         if: failure()
         run: tail -n 60 /tmp/mbox-pw.*/*.log || echo "the test PipeWire never started"
+
+  release:
+    name: Release (when VERSION went up)
+    needs: [test, arch]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - name: Tag and publish if this version isn't released yet
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ver=$(python3 -c 'import re; print(re.search(r"^VERSION = \"([^\"]+)\"", open("mbox_control.py").read(), re.M)[1])')
+          if gh release view "v$ver" >/dev/null 2>&1; then echo "v$ver already released"; exit 0; fi
+          python3 tests/tools/changelog_section.py "$ver" > notes.md
+          gh release create "v$ver" --target "$GITHUB_SHA" --title "Mbox Control $ver" --notes-file notes.md
+          # A ready PKGBUILD for the AUR: version and checksum filled in
+          curl -sSfL "https://github.com/$GITHUB_REPOSITORY/archive/refs/tags/v$ver.tar.gz" -o src.tar.gz
+          sum=$(sha256sum src.tar.gz | cut -d' ' -f1)
+          sed -e "s/^pkgver=.*/pkgver=$ver/" -e "s/^pkgrel=.*/pkgrel=1/" \
+              -e "s/^sha256sums=.*/sha256sums=('$sum')/" packaging/aur/PKGBUILD > PKGBUILD
+          gh release upload "v$ver" PKGBUILD

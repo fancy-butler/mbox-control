@@ -4,6 +4,11 @@
 
 
 
+
+## 4.25
+- **Updates from GitHub.** Mbox Control now lives at github.com/fancy-butler/mbox-control. Tick Settings → Advanced → "Check for new versions once a day" and new releases are offered with one click (package installs are pointed to the package manager instead). Only GitHub is asked; nothing about you is sent.
+- Releases publish themselves: when the version goes up and every test passes, GitHub tags it, posts this changelog section as the release notes, and attaches a ready AUR PKGBUILD.
+
 ## 4.24.1
 - **Practice player stays in tune.** Slowed-down or sped-up playback could land up to 40 cents off pitch with Arch's current ffmpeg/Rubber Band (worst on low notes, like a bass's low E). Rubber Band now only stretches time, in its smooth mode, and transposing is done by exact resampling. Measured within 1 cent across the range.
 - Without Rubber Band, transposing a 44.1 kHz song came out about 1½ semitones sharp. Fixed.
