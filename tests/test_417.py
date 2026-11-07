@@ -64,9 +64,11 @@ def test_rendered_pitch_and_length(monkeypatch, tmp_path, rubberband, speed, sem
     job.run()                                         # synchronously
     x = np.frombuffer(got["d"], np.int16).reshape(-1, 2)[:, 0].astype(np.float32)
     assert abs(len(x) / 48000 - dur) < 0.05
-    seg = x[len(x) // 4: len(x) // 4 + 24000]
-    f = np.argmax(np.abs(np.fft.rfft(seg * np.hanning(len(seg))))) * 48000 / len(seg)
-    assert abs(f - freq) < 4
+    seg = x[len(x) // 4: 3 * len(x) // 4]               # the middle half, away from start/end effects
+    spec = np.abs(np.fft.rfft(seg * np.hanning(len(seg)), 8 * len(seg)))
+    f = np.argmax(spec) * 48000 / (8 * len(seg))
+    cents = 1200 * np.log2(f / freq)
+    assert abs(cents) < 10, f"{f:.1f} Hz is {cents:+.0f} cents off {freq} Hz"   # 10 cents: inaudible
 
 
 def test_practice_wave_drag_sets_loop(win, spinner):
