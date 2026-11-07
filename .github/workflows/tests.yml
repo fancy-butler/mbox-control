@@ -47,6 +47,8 @@ jobs:
           pipewire --version
           wireplumber --version
           python -c "import PySide6; print('PySide6', PySide6.__version__)"
+      - name: Rubber Band pitch probe (temporary)
+        run: python tests/tools/rb_probe.py
       - name: Tests, including real PipeWire playback/recording/EQ
         env:
           QT_QPA_PLATFORM: offscreen
