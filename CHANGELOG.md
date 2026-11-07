@@ -5,6 +5,10 @@
 
 
 
+
+## 4.25.1
+- After waking from sleep, your output choice sticks. The app put the default output back once, but if that output reappeared a few seconds late, or WirePlumber switched it again afterwards, it gave up. It now watches for a minute after waking and puts it back whenever needed; every step goes to the recovery log.
+
 ## 4.25
 - **Updates from GitHub.** Mbox Control now lives at github.com/fancy-butler/mbox-control. Tick Settings → Advanced → "Check for new versions once a day" and new releases are offered with one click (package installs are pointed to the package manager instead). Only GitHub is asked; nothing about you is sent.
 - Releases publish themselves: when the version goes up and every test passes, GitHub tags it, posts this changelog section as the release notes, and attaches a ready AUR PKGBUILD.

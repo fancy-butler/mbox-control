@@ -46,7 +46,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QPointF, QRectF
 
 APP_NAME = "Mbox Control"
-VERSION = "4.25"
+VERSION = "4.25.1"
 UPDATE_REPO = "fancy-butler/mbox-control"     # where releases are published; empty = no online checks
 HOME = Path.home()
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -7041,11 +7041,34 @@ class MainWindow(QtWidgets.QMainWindow):
         if want and want in sinks and cur != want:
             run_quiet("pactl", "set-default-sink", want, timeout=4)
             rlog(f"after wake: default output was {cur or 'none'} — put back to {want}")
+            self.watch_default_until = time.time() + 60     # WirePlumber sometimes picks again: keep an eye out
         elif want and want not in sinks:
             rlog(f"after wake: the old default output {want} isn't there (yet)")
+            self.watch_default_until = time.time() + 60
         else:
             rlog(f"after wake: audio OK — default {cur}, Mbox outputs {', '.join(mbox)}")
+        if want and time.time() < getattr(self, "watch_default_until", 0):
+            QtCore.QTimer.singleShot(4000, self.keep_default_after_wake)
         self.refresh_health()
+
+    def keep_default_after_wake(self):
+        """For a minute after waking: if the default output isn't what it was before sleep, put it back as
+        soon as that output exists. Stops early once it has held for two checks in a row."""
+        want = getattr(self, "sleep_default_sink", "")
+        if not want or self.asleep or time.time() > getattr(self, "watch_default_until", 0):
+            return
+        cur = (run_quiet("pactl", "get-default-sink", timeout=4) or "").strip()
+        if cur == want:
+            self.default_ok_streak = getattr(self, "default_ok_streak", 0) + 1
+            if self.default_ok_streak >= 2:
+                self.watch_default_until, self.default_ok_streak = 0, 0
+                return
+        else:
+            self.default_ok_streak = 0
+            if want in pw_sinks():
+                run_quiet("pactl", "set-default-sink", want, timeout=4)
+                rlog(f"after wake: default output had become {cur or 'none'} — put back to {want}")
+        QtCore.QTimer.singleShot(4000, self.keep_default_after_wake)
 
     def maybe_offer_recovery(self):
         """Card gone but the FireWire unit is there: the stuck-after-sleep case. Give the sleep hook time if

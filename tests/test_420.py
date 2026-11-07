@@ -452,3 +452,40 @@ def test_metronome_explains_when_it_cannot_reach_headphones(win, monkeypatch):
     win.toggle_metronome()
     assert not started and win.hint.isVisible() and "can't reach your headphones" in win.hint.text.text()
     assert win.metro is None
+
+
+def test_default_output_held_when_it_comes_back_late_or_is_overridden(win, monkeypatch, tmp_path):
+    monkeypatch.setattr(mc, "RECOVERY_LOG", tmp_path / "recovery.log")
+    monkeypatch.delenv("MBOX_AMIXER", raising=False)
+    state = {"default": "mbox_main", "ours": True}
+    timers = []
+    monkeypatch.setattr(mc.QtCore.QTimer, "singleShot", lambda ms, fn: timers.append(fn))
+
+    def fake(*a, **k):
+        if a[:2] == ("pactl", "get-default-sink"):
+            return state["default"] + "\n"
+        if a[:2] == ("pactl", "set-default-sink"):
+            state["default"] = a[2]
+            return ""
+        if a[:4] == ("pactl", "list", "sinks", "short"):
+            return ("7\talsa_output.pci-0000_2d_00.1.hdmi-stereo\tPipeWire\n"
+                    "9\talsa_output.firewire-0x00a07e0401000000.pro-output-0\tPipeWire\n"
+                    + ("55\tmbox_main\tPipeWire\n" if state["ours"] else ""))
+        if a[:3] == ("pactl", "-f", "json"):
+            return "[]"
+        return ""
+    monkeypatch.setattr(mc, "run_quiet", fake)
+    win.asleep = False
+    win.remember_default_sink()
+    state.update(default="alsa_output.pci-0000_2d_00.1.hdmi-stereo", ours=False)   # ours not back yet
+    win.restore_audio_after_wake()
+    assert state["default"].startswith("alsa_output.pci")
+    state["ours"] = True                                  # the EQ output appears a few seconds later
+    timers.pop()()
+    assert state["default"] == "mbox_main"
+    state["default"] = "alsa_output.pci-0000_2d_00.1.hdmi-stereo"   # WirePlumber picks again
+    timers.pop()()
+    assert state["default"] == "mbox_main"
+    timers.pop()()
+    timers.pop()()                                        # held twice in a row: stops watching
+    assert not timers and "put back to mbox_main" in (tmp_path / "recovery.log").read_text()
