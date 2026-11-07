@@ -1,6 +1,7 @@
 name: tests
 on:
   push:
+    branches: ["**"]           # not tags: a release tag is a commit that was already tested
   pull_request:
   schedule:
     - cron: "17 9 * * 1"        # every Monday: catches a new PipeWire/Qt on Arch even when nothing was pushed
@@ -11,8 +12,8 @@ jobs:
     name: Ubuntu 24.04 (no audio)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: System libraries for Qt (offscreen) and FFmpeg
@@ -38,9 +39,9 @@ jobs:
     steps:
       - name: Packages (what an AUR user has today)
         run: |
-          pacman -Syu --noconfirm --needed git python python-pyside6 python-numpy python-pytest python-pyudev \
+          pacman -Syu --noconfirm --needed git python pyside6 python-numpy python-pytest python-pyudev \
             ffmpeg pipewire pipewire-pulse wireplumber libpulse dbus ttf-dejavu
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Versions
         run: |
           pipewire --version
@@ -54,4 +55,4 @@ jobs:
           pytest -q -rs
       - name: PipeWire logs
         if: failure()
-        run: tail -n 60 /tmp/mbox-pw.*/*.log
+        run: tail -n 60 /tmp/mbox-pw.*/*.log || echo "the test PipeWire never started"
