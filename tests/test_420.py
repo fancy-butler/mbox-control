@@ -1,6 +1,7 @@
 """4.20: surviving sleep/wake — detection, the root scripts, the recovery job, the app's sleep handling."""
 import os
 import socket
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -80,7 +81,7 @@ def test_root_scripts_are_valid_and_hardcode_nobody():
         r = subprocess.run(["sh", "-n"], input=text, text=True, capture_output=True)
         assert r.returncode == 0, r.stderr
         assert str(Path.home()) not in text and os.environ.get("USER", "nobody-at-all") not in text.split()
-    if subprocess.run(["which", "shellcheck"], capture_output=True).returncode == 0:
+    if shutil.which("shellcheck"):
         for text in (mc.RELOAD_HELPER, mc.WAKE_RECOVER):
             r = subprocess.run(["shellcheck", "-s", "sh", "-"], input=text, text=True, capture_output=True)
             assert r.returncode == 0, r.stdout
@@ -285,7 +286,7 @@ def test_settings_card_and_tray_offer_recovery(win):
 
 def test_sleep_signal_reaches_the_app(app, tmp_path, monkeypatch):
     """logind's PrepareForSleep, sent on a private bus, arrives as sleeping(True/False)."""
-    if subprocess.run(["which", "dbus-daemon"], capture_output=True).returncode:
+    if not shutil.which("dbus-daemon"):
         pytest.skip("no dbus-daemon")
     proc = subprocess.Popen(["dbus-daemon", "--session", "--print-address", "--nofork"], stdout=subprocess.PIPE,
                             text=True)

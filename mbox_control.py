@@ -6216,12 +6216,14 @@ def practice_filter(speed, semitones, rate=48000):
     ratio = 2 ** (semitones / 12)
     if abs(speed - 1) < 1e-3 and not semitones:
         return ""
-    if has_rubberband():
-        return f"rubberband=tempo={speed:.4f}:pitch={ratio:.6f}:transients=crisp:pitchq=quality"
     parts = []
-    if semitones:                                       # pitch by resampling, then undo the speed change
+    if semitones:                                       # pitch by resampling (exact), then undo the speed change
         parts.append(f"asetrate={rate * ratio:.2f},aresample={rate}")
     tempo = speed / ratio if semitones else speed
+    if has_rubberband():
+        # Rubber Band only stretches time. Letting it shift pitch as well came out ~30 cents sharp with
+        # Arch's Rubber Band 4 at 0.75× −3 — out of tune to play along with.
+        return ",".join(parts + [f"rubberband=tempo={tempo:.5f}:transients=crisp"])
     while tempo < 0.5:                                  # atempo works in 0.5–2.0 steps
         parts.append("atempo=0.5")
         tempo /= 0.5
@@ -15251,6 +15253,8 @@ def main():
         pass
     else:
         win.show()
+    if os.environ.get("MBOX_SMOKE_SECONDS"):             # CI: start for real, then quit like a user would
+        QtCore.QTimer.singleShot(int(float(os.environ["MBOX_SMOKE_SECONDS"]) * 1000), app.quit)
     return app.exec()
 
 

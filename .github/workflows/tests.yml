@@ -50,9 +50,27 @@ jobs:
       - name: Tests, including real PipeWire playback/recording/EQ
         env:
           QT_QPA_PLATFORM: offscreen
+          PYTHONFAULTHANDLER: "1"
         run: |
           source tests/pw_stack.sh
           pytest -q -rs
+      - name: The real app starts and quits cleanly
+        if: always()
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHONFAULTHANDLER: "1"
+          MBOX_SMOKE_SECONDS: "5"
+          MBOX_CARD: "0"
+          MBOX_AMIXER: tests/fake_amixer.py
+          FAKE_DUMP: tests/fixtures/mbox-pro3-controls.txt
+          FAKE_STATE: /tmp/smoke-state.json
+          HOME: /tmp/smoke-home
+        run: |
+          source tests/pw_stack.sh
+          mkdir -p "$HOME"
+          for run in first second; do         # the second start reads the settings the first one saved
+            timeout 60 python mbox_control.py || { echo "::error::$run start/quit failed (exit $?)"; exit 1; }
+          done
       - name: PipeWire logs
         if: failure()
         run: tail -n 60 /tmp/mbox-pw.*/*.log || echo "the test PipeWire never started"
