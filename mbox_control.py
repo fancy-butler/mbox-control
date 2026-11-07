@@ -46,7 +46,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QPointF, QRectF
 
 APP_NAME = "Mbox Control"
-VERSION = "4.24"
+VERSION = "4.24.1"
 UPDATE_REPO = ""          # "owner/mbox-control" once the project is on GitHub; empty = no online checks
 HOME = Path.home()
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -6218,12 +6218,14 @@ def practice_filter(speed, semitones, rate=48000):
         return ""
     parts = []
     if semitones:                                       # pitch by resampling (exact), then undo the speed change
-        parts.append(f"asetrate={rate * ratio:.2f},aresample={rate}")
+        # aresample first: asetrate needs to know the real input rate, and most songs are 44.1 kHz
+        parts.append(f"aresample={rate},asetrate={rate * ratio:.2f},aresample={rate}")
     tempo = speed / ratio if semitones else speed
     if has_rubberband():
-        # Rubber Band only stretches time. Letting it shift pitch as well came out ~30 cents sharp with
-        # Arch's Rubber Band 4 at 0.75× −3 — out of tune to play along with.
-        return ",".join(parts + [f"rubberband=tempo={tempo:.5f}:transients=crisp"])
+        # Rubber Band only stretches time, in its smooth/independent mode. Its default ("crisp") mode left
+        # pure tones up to 40 cents off pitch (low E on a bass among them) on Arch's ffmpeg 9 — measured by
+        # tests/tools/rb_probe.py. Smooth stays within 1 cent everywhere.
+        return ",".join(parts + [f"rubberband=tempo={tempo:.5f}:transients=smooth:phase=independent"])
     while tempo < 0.5:                                  # atempo works in 0.5–2.0 steps
         parts.append("atempo=0.5")
         tempo /= 0.5

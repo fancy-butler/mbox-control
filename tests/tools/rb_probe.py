@@ -3,7 +3,7 @@ import subprocess
 import numpy as np
 
 def cents(freq, filt):
-    a = subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", f"sine=frequency={freq}:duration=3",
+    a = subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", f"sine=frequency={freq}:duration=3:sample_rate=48000",
                         "-af", filt, "-ac", "1", "-ar", "48000", "-f", "s16le", "-"], capture_output=True).stdout
     x = np.frombuffer(a, np.int16).astype(np.float32)
     seg = x[len(x) // 4: 3 * len(x) // 4]

@@ -3,6 +3,12 @@
 
 
 
+
+## 4.24.1
+- **Practice player stays in tune.** Slowed-down or sped-up playback could land up to 40 cents off pitch with Arch's current ffmpeg/Rubber Band (worst on low notes, like a bass's low E). Rubber Band now only stretches time, in its smooth mode, and transposing is done by exact resampling. Measured within 1 cent across the range.
+- Without Rubber Band, transposing a 44.1 kHz song came out about 1½ semitones sharp. Fixed.
+- GitHub now also tests on Arch with the current PipeWire, ffmpeg and Python, every push and every Monday, including starting and quitting the real app.
+
 ## 4.24
 - **EQ graph.** The Tone card draws what you actually hear: the full curve (profile, Tone, overall level, subsonic filter), with the profile alone dashed underneath, and which profile is playing.
 - **Neutral names.** The main output's PipeWire node is now `mbox_main` (was `sa600_sink`) and its file `mbox-main.conf` (was `mbox-sa600.conf`). Existing setups are converted once at start-up — file, saved settings and default output — with one short PipeWire restart.

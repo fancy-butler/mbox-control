@@ -86,3 +86,19 @@ def test_practice_wave_drag_sets_loop(win, spinner):
     w.mouseMoveEvent(ev(QtCore.QEvent.MouseMove, 8 + 784 * 0.5))
     w.mouseReleaseEvent(ev(QtCore.QEvent.MouseButtonRelease, 8 + 784 * 0.5))
     assert got == [(2.0, 5.0)]
+
+
+@pytest.mark.parametrize("src", [82.4, 220.0, 440.0])      # low E on a bass, A3, A4
+@pytest.mark.parametrize("speed,semis", [(0.75, 0), (1.25, 0), (0.75, -3), (0.5, 2)])
+def test_practice_filter_stays_in_tune(src, speed, semis):
+    """Every slow-down/transpose must land within 10 cents (inaudible) of the right note."""
+    filt = mc.practice_filter(speed, semis)
+    a = subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", f"sine=frequency={src}:duration=3:sample_rate=44100",   # like most songs
+                        "-af", filt, "-ac", "1", "-ar", "48000", "-f", "s16le", "-"], capture_output=True).stdout
+    x = np.frombuffer(a, np.int16).astype(np.float32)
+    assert abs(len(x) / 48000 - 3 / speed) < 0.06
+    seg = x[len(x) // 4: 3 * len(x) // 4]
+    spec = np.abs(np.fft.rfft(seg * np.hanning(len(seg)), 8 * len(seg)))
+    want = src * 2 ** (semis / 12)
+    cents = 1200 * np.log2(np.argmax(spec) * 48000 / (8 * len(seg)) / want)
+    assert abs(cents) < 10, f"{filt}: {cents:+.0f} cents"
