@@ -46,7 +46,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QPointF, QRectF
 
 APP_NAME = "Mbox Control"
-VERSION = "4.25.1"
+VERSION = "4.25.2"
 UPDATE_REPO = "fancy-butler/mbox-control"     # where releases are published; empty = no online checks
 HOME = Path.home()
 XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
@@ -2519,6 +2519,34 @@ def pw_sinks():
 
 
 OUR_LOOPBACKS = {"mbox_main_out", "mbox_headphones_out"}
+
+
+def playing_apps():
+    """{process name: app name} of other programs sending sound right now (not paused, not ours)."""
+    try:
+        data = json.loads(run_quiet("pactl", "-f", "json", "list", "sink-inputs", timeout=5) or "[]")
+    except ValueError:
+        return {}
+    out = {}
+    for si in data:
+        p = si.get("properties", {})
+        if si.get("corked") or p.get("node.name", "") in OUR_LOOPBACKS or \
+                p.get("application.process.id") == str(os.getpid()):
+            continue
+        key = p.get("application.process.binary") or p.get("application.name") or ""
+        if key:
+            out[key] = p.get("application.name") or key
+    return out
+
+
+def connected_apps():
+    """Process names of every program with a sound stream at all, paused ones included."""
+    try:
+        data = json.loads(run_quiet("pactl", "-f", "json", "list", "sink-inputs", timeout=5) or "[]")
+    except ValueError:
+        return set()
+    return {si.get("properties", {}).get("application.process.binary")
+            or si.get("properties", {}).get("application.name") or "" for si in data} - {""}
 
 
 def relink_mbox_streams():
@@ -6993,6 +7021,7 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception as e:  # noqa: BLE001
                 rlog(f"couldn't save the pre-sleep state: {e}")
             self.remember_default_sink()
+            self.remember_players("sleep")
             self.close_card_handles("going to sleep")
             self.spectrum_hub.stop_all()
             self.sleep_ctl = self.stop_ctl_daemon()
@@ -7019,6 +7048,29 @@ class MainWindow(QtWidgets.QMainWindow):
         if cur:
             self.sleep_default_sink = cur
             rlog(f"default output before: {cur}")
+
+    def remember_players(self, why):
+        self.players_before, self.players_why = playing_apps(), why
+        if self.players_before:
+            rlog(f"playing before {why}: {', '.join(sorted(self.players_before.values()))}")
+
+    def check_lost_players(self):
+        """Some players (VLC among them) never reconnect after PipeWire went away: they keep 'playing' in
+        silence. Name them, so nobody goes hunting through the Mbox for a fault that isn't there."""
+        before, why = getattr(self, "players_before", {}), getattr(self, "players_why", "sleep")
+        self.players_before = {}
+        if not before or self.asleep:
+            return
+        lost = [name for key, name in sorted(before.items()) if key not in connected_apps()]
+        if not lost:
+            rlog(f"after {why}: every player reconnected")
+            return
+        names = ", ".join(lost)
+        rlog(f"after {why}: {names} didn't reconnect to the sound system")
+        cause = "while the computer slept" if why == "sleep" else "when the repair restarted the sound system"
+        self.hint.offer(f"<b>{html_escape(names)} lost {'its' if len(lost) == 1 else 'their'} sound connection "
+                        f"{cause}.</b> The Mbox is fine — quit {html_escape(names)} completely and start "
+                        f"{'it' if len(lost) == 1 else 'them'} again.", [])
 
     def restore_audio_after_wake(self):
         """The card is back — now the PipeWire side: Mbox outputs present, our loopbacks linked to the Mbox
@@ -7105,11 +7157,13 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.recovering = True
         self.remember_default_sink()
+        self.remember_players("repair")
         rlog(f"recovery started ({'manual' if u['card'] is not None or not self.recover_offered else 'offered'})")
         self.close_card_handles("recovery")
         self.spectrum_hub.stop_all()
         self.disconnected = True
-        self.hint.offer("<b>Recovering the Mbox…</b> Sound stops for a few seconds.", [])
+        self.hint.offer("<b>Recovering the Mbox…</b> Sound stops for a few seconds, and some players (VLC, for "
+                        "one) need restarting afterwards.", [])
         self.recovery = RecoveryJob(u)
         self.recovery.step.connect(lambda m: self.toast(m, 0))
         self.recovery.done.connect(self.recovered)
@@ -7297,6 +7351,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.audio_check_pending = False
             for delay in (2000, 6000, 15000):
                 QtCore.QTimer.singleShot(delay, self.restore_audio_after_wake)
+            QtCore.QTimer.singleShot(20000, self.check_lost_players)
         rlog(f"reconnected to the Mbox (card {card})")
         self.toast("Reconnected to the Mbox.", 5000)
 
@@ -14918,8 +14973,13 @@ class RecoveryJob(QtCore.QThread):
             self.say("helper: " + out.replace("\n", " | "))
         reloaded = r.returncode == 0
         if not reloaded:
-            self.say(f"driver reload failed (exit {r.returncode})" +
-                     (" — cancelled at the password prompt" if r.returncode in (126, 127) else ""))
+            why = ""
+            if r.returncode == 126:
+                why = " — cancelled at the password prompt"
+            elif r.returncode == 127 and "Not authorized" in out:
+                why = (" — not authorized: no password prompt came up. Is a polkit agent running? "
+                       "(Plasma's starts with the desktop.)")
+            self.say(f"driver reload failed (exit {r.returncode}){why}")
         if units:
             systemd_user("start", *units, timeout=30)
             self.say(f"started {stack} again")

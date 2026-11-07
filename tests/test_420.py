@@ -489,3 +489,42 @@ def test_default_output_held_when_it_comes_back_late_or_is_overridden(win, monke
     timers.pop()()
     timers.pop()()                                        # held twice in a row: stops watching
     assert not timers and "put back to mbox_main" in (tmp_path / "recovery.log").read_text()
+
+
+def test_players_that_never_reconnect_are_named(win, monkeypatch, tmp_path):
+    import json as _json
+    monkeypatch.setattr(mc, "RECOVERY_LOG", tmp_path / "recovery.log")
+    streams = {"v": [
+        {"corked": False, "properties": {"node.name": "vlc", "application.name": "VLC media player (LibVLC 3.0.21)",
+                                         "application.process.binary": "vlc"}},
+        {"corked": True, "properties": {"node.name": "ff", "application.name": "Firefox",
+                                        "application.process.binary": "firefox"}},
+        {"corked": False, "properties": {"node.name": "mbox_main_out"}},
+    ]}
+    monkeypatch.setattr(mc, "run_quiet", lambda *a, **k: _json.dumps(streams["v"]) if "sink-inputs" in a else "")
+    offered = []
+    monkeypatch.setattr(win.hint, "offer", lambda text, buttons: offered.append(text))
+    win.asleep = False
+    win.remember_players("sleep")
+    assert win.players_before == {"vlc": "VLC media player (LibVLC 3.0.21)"}     # paused Firefox and ours: no
+    streams["v"] = [streams["v"][2]]                                             # after wake: VLC is gone
+    win.check_lost_players()
+    assert offered and "VLC media player" in offered[0] and "while the computer slept" in offered[0]
+    assert "didn't reconnect" in (tmp_path / "recovery.log").read_text()
+    offered.clear()
+    win.check_lost_players()                                                     # once per wake
+    assert not offered
+
+
+def test_players_that_came_back_are_left_alone(win, monkeypatch, tmp_path):
+    import json as _json
+    monkeypatch.setattr(mc, "RECOVERY_LOG", tmp_path / "recovery.log")
+    vlc = [{"corked": False, "properties": {"application.name": "VLC", "application.process.binary": "vlc"}}]
+    monkeypatch.setattr(mc, "run_quiet", lambda *a, **k: _json.dumps(vlc) if "sink-inputs" in a else "")
+    offered = []
+    monkeypatch.setattr(win.hint, "offer", lambda text, buttons: offered.append(text))
+    win.asleep = False
+    win.remember_players("repair")
+    vlc[0]["corked"] = True                                   # paused after the repair, but connected
+    win.check_lost_players()
+    assert not offered and "every player reconnected" in (tmp_path / "recovery.log").read_text()

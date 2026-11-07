@@ -6,6 +6,12 @@
 
 
 
+
+## 4.25.2
+- **Silent players get named.** Some players, VLC among them, never reconnect after the sound system went away (sleep, or the Repair button). They keep "playing" in silence, and it looks like the Mbox is broken. The app now remembers what was playing, and 20 seconds after waking or a repair tells you which program lost its connection and needs restarting.
+- The Repair hint warns that some players need restarting afterwards.
+- A refused driver reload ("Not authorized", no password prompt) is no longer logged as "cancelled at the password prompt".
+
 ## 4.25.1
 - After waking from sleep, your output choice sticks. The app put the default output back once, but if that output reappeared a few seconds late, or WirePlumber switched it again afterwards, it gave up. It now watches for a minute after waking and puts it back whenever needed; every step goes to the recovery log.
 
