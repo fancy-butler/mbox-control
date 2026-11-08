@@ -578,6 +578,7 @@ class WinEvents(QtCore.QObject):
 
     def start(self):
         self.backend.link.on_change = self._on_change
+        self.backend.link.log = rlog
         if not self.backend.link.running:
             self.backend.link.start()
         self.alive.emit(True)
@@ -8044,6 +8045,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.udev:
             self.udev.stop()
         self.quitting = True
+        if WINDOWS:
+            try:
+                self.backend.link.stop()                 # hang up cleanly: the driver must never wait on us
+            except Exception:  # noqa: BLE001
+                pass
         self.close()
         QtWidgets.QApplication.quit()
 

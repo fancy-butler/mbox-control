@@ -176,3 +176,26 @@ def test_output_trims(be, drv):
     be.write(t, [128, 255, 255, 255, 255, 255])
     assert drv.sets[-1] == {mw.out_param(0, 5): pytest.approx(-5.98, abs=0.02)}
     assert be.read(t.numid).values[0] == 128
+
+
+def test_a_failing_handler_never_stops_the_reader(drv):
+    """If the reader stopped, Avid's driver would block writing to us — and take all PC sound with it."""
+    logs, calls = [], []
+
+    def bad(ids):
+        calls.append(ids)
+        raise ValueError("UI exploded")
+    link = mw.DriverLink(drv.req, drv.note, on_change=bad).connect(timeout=2)
+    link.log = logs.append
+    link.meter_ids = []
+    link.start()
+    try:
+        for k in range(50):
+            drv.press(mw.P_SPKR, 1 + k % 3)
+        deadline = time.time() + 2
+        while time.time() < deadline and drv.note_out.qsize():
+            time.sleep(0.02)
+        assert drv.note_out.qsize() == 0 and link.running and len(calls) >= 40
+        assert any("change handler failed" in m for m in logs)
+    finally:
+        link.stop()

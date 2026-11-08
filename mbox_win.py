@@ -224,36 +224,72 @@ class DriverLink:
                     changed.add(i)
         return changed
 
-    def start(self, meter_interval=0.07):
-        """Follow notifications (and poll meters) in the background."""
+    def start(self, meter_interval=0.1):
+        """Follow notifications (and poll meters) in the background.
+
+        The driver writes every change to our notification pipe and waits if nobody reads it, so this loop
+        must never stop draining while we're connected: a stalled reader stalls Avid's driver service, and
+        with it all sound on the PC. Anything unexpected is logged and skipped; on a broken pipe both pipes
+        are closed at once so the driver can let go of us."""
         self.running = True
+        self.meter_interval = meter_interval
 
         def loop():
             last_poll = 0.0
             while self.running:
                 try:
-                    if self.meter_ids and time.time() - last_poll >= meter_interval:
+                    busy = False
+                    if self.meter_ids and self.meters_on and time.time() - last_poll >= self.meter_interval:
                         last_poll = time.time()
                         self.req.send(encode(KIND_QUERY, CMD_POLL, [[i, None] for i in self.meter_ids]))
-                    if self.req.available():             # replies on the request pipe: nothing to keep
+                    while self.req.available():          # replies on the request pipe: drain them
                         self._dispatch(self.req.recv())
-                    if self.note.available():
+                        busy = True
+                    while self.note.available():
                         self._dispatch(self.note.recv())
-                    else:
+                        busy = True
+                    if not busy:
                         time.sleep(0.005)
-                except OSError:
+                except OSError as e:
+                    self._log(f"driver link lost: {e}")
                     self.alive = False
-                    if self.on_change:
-                        self.on_change(None)             # None = connection lost
+                    self.running = False
+                    for p in (self.req, self.note):
+                        try:
+                            p.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    self._notify(None)
                     return
+                except Exception as e:  # noqa: BLE001 — never stop reading
+                    self._log(f"driver link: skipped a message ({type(e).__name__}: {e})")
+                    time.sleep(0.01)
         self.thread = threading.Thread(target=loop, name="mbox-driver-link", daemon=True)
         self.thread.start()
         return self
 
+    meters_on = True
+    log = None
+
+    def _log(self, msg):
+        if self.log:
+            try:
+                self.log(msg)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _notify(self, ids):
+        cb = self.on_change
+        if cb:
+            try:
+                cb(ids)
+            except Exception as e:  # noqa: BLE001 — a UI problem must not stop the reader
+                self._log(f"change handler failed: {type(e).__name__}: {e}")
+
     def _dispatch(self, msg):
         changed = self._take(msg)
-        if changed and self.on_change:
-            self.on_change(changed)
+        if changed:
+            self._notify(changed)
 
     def get(self, i, default=None):
         with self.lock:
