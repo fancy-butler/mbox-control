@@ -595,7 +595,7 @@ class WinBackend:
     def __init__(self, link):
         self.link = link
         self.view = AlsaView(link)
-        self.direct = None
+        self.card, self.direct, self.direct_tried, self.shapes = "win", None, True, {}
         link.meter_ids = self.view.meter_params()
 
     @classmethod
@@ -641,3 +641,67 @@ class WinBackend:
 
     def changed_controls(self, param_ids):
         return self.view.param_owners(param_ids)
+
+
+# ------------------------------------------------------------------------------------------------ simulation
+def _fixture_dump():
+    import json
+    from pathlib import Path
+    for p in (Path(__file__).parent / "tests/fixtures/win-driver-dump.json",
+              Path(getattr(__import__("sys"), "_MEIPASS", ".")) / "win-driver-dump.json"):
+        if p.exists():
+            return {int(k): v for k, v in json.loads(p.read_text()).items()}
+    return {}
+
+
+class FakeDriver:
+    """DriverInterface.exe in miniature: two pipes, a parameter store, the same replies."""
+
+    def __init__(self):
+        self.params = _fixture_dump()
+        self.req_out, self.note_out = __import__('queue').Queue(), __import__('queue').Queue()
+        self.sets = []
+
+        driver = self
+
+        class End:
+            def __init__(self, outq):
+                self.q, self.pending = outq, []
+
+            def available(self):
+                return self.q.qsize()
+
+            def recv(self):
+                return self.q.get(timeout=2)
+
+            def close(self):
+                pass
+
+        class Req(End):
+            def send(self, data):
+                driver.handle(data)
+
+        self.req, self.note = Req(self.req_out), End(self.note_out)
+
+    def handle(self, data):
+        kind, cmd, body = decode(data)
+        if cmd in (CMD_HELLO, CMD_READY):
+            self.req_out.put(encode(0, CMD_VALUES, [[True, cmd, None]]))
+        elif cmd == CMD_DUMP:
+            items = [[v, i, None] for i, v in sorted(self.params.items(), reverse=True)]
+            for k in range(0, len(items), 300):
+                self.note_out.put(encode(0, CMD_VALUES, items[k:k + 300]))
+        elif cmd == CMD_VALUES and kind == KIND_SET:
+            up = updates(body)
+            self.sets.append(up)
+            self.params.update(up)
+            self.note_out.put(encode(0, CMD_VALUES, [[v, i, None] for i, v in up.items()]))
+        elif cmd == CMD_POLL:
+            self.note_out.put(encode(0, CMD_VALUES, [[self.params.get(e[0]), e[0], None] for e in body]))
+
+    def press(self, i, v):
+        """Something changed on the box itself (a front-panel button)."""
+        self.params[i] = v
+        self.note_out.put(encode(0, CMD_VALUES, [[v, i, None]]))
+
+

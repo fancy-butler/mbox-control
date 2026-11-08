@@ -49,7 +49,11 @@ APP_NAME = "Mbox Control"
 VERSION = "4.25.2"
 UPDATE_REPO = "fancy-butler/mbox-control"     # where releases are published; empty = no online checks
 HOME = Path.home()
-XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
+# Windows: Avid's own driver does the hardware side (see mbox_win.py). MBOX_PLATFORM=win lets the Windows
+# code paths run anywhere, with a simulated driver (MBOX_WIN_FAKE=1), for tests and CI.
+WINDOWS = sys.platform == "win32" or os.environ.get("MBOX_PLATFORM") == "win"
+XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME") or
+                  (os.environ.get("APPDATA") if sys.platform == "win32" else "") or HOME / ".config")
 CONF_DIR = XDG_CONFIG / "mbox-control"
 SCENES_DIR = CONF_DIR / "scenes"
 PW_CONF_DIR = XDG_CONFIG / "pipewire/pipewire.conf.d"
@@ -264,6 +268,9 @@ def parse_amixer(text):
 
 
 def find_mbox_card():
+    if WINDOWS:
+        import mbox_win
+        return "win" if os.environ.get("MBOX_WIN_FAKE") or mbox_win.find_device_pipes() else None
     try:
         text = (PROCFS / "asound/cards").read_text()
     except OSError:
@@ -551,6 +558,46 @@ def is_hung(prog):
 
 def mark_hung(prog):
     HUNG[Path(prog).name] = time.time() + HUNG_PAUSE
+
+
+class WinEvents(QtCore.QObject):
+    """Windows stand-in for EventWatcher: the driver link pushes changes; this turns them into control ids."""
+    changed = QtCore.Signal(int)
+    alive = QtCore.Signal(bool)
+
+    def __init__(self, backend):
+        super().__init__()
+        self.backend = backend
+
+    def _on_change(self, ids):
+        if ids is None:
+            self.alive.emit(False)
+            return
+        for numid in sorted(self.backend.changed_controls(ids)):
+            self.changed.emit(numid)
+
+    def start(self):
+        self.backend.link.on_change = self._on_change
+        if not self.backend.link.running:
+            self.backend.link.start()
+        self.alive.emit(True)
+
+    def stop(self):
+        self.backend.link.on_change = None
+
+    def wait(self, _ms=0):
+        return True
+
+
+def open_windows_backend():
+    import mbox_win
+    if os.environ.get("MBOX_WIN_FAKE"):
+        drv = mbox_win.FakeDriver()
+        link = mbox_win.DriverLink(drv.req, drv.note).connect(timeout=3)
+        be = mbox_win.WinBackend(link)
+        be.fake = drv
+        return be
+    return mbox_win.WinBackend.open()
 
 
 def run_quiet(*cmd, timeout=4):
@@ -6902,10 +6949,32 @@ class MainWindow(QtWidgets.QMainWindow):
         self.poller = Poller(self.backend, meter_ids, fast_ids)
         self.poller.got.connect(self.on_values)
         self.poller.start()
-        self.events = EventWatcher(self.card_no)
+        self.events = WinEvents(self.backend) if WINDOWS else EventWatcher(self.card_no)
         self.events.changed.connect(self.on_event)
         self.events.alive.connect(self.on_events_alive)
         self.events.start()
+
+    def watchdog_windows(self):
+        """Windows: the only thing that can go wrong is losing the driver's pipe (box off, driver restarted)."""
+        if self.backend.link.alive and not self.disconnected:
+            return
+        if not self.disconnected:
+            self.disconnected = True
+            self.toast("Lost the connection to the Mbox — waiting for it to come back…", 0)
+        try:
+            fresh = open_windows_backend()
+        except OSError:
+            return
+        self.stop_live()
+        self.backend = fresh
+        self.disconnected = False
+        self.ctrls = self.backend.read_all()
+        self.by_name = {}
+        for c in self.ctrls.values():
+            self.by_name.setdefault(c.name, c)
+        self.start_live()
+        self.run_refreshers()
+        self.toast("Reconnected to the Mbox.", 5000)
 
     def stop_live(self):
         for t in (self.poller, self.events):
@@ -6918,6 +6987,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def watchdog(self):
         if os.environ.get("MBOX_AMIXER"):        # simulated hardware: nothing to watch
+            return
+        if WINDOWS:
+            self.watchdog_windows()
             return
         if self.asleep or self.recovering:
             return
@@ -14552,6 +14624,8 @@ def mbox_playing():
 
 
 def service_running():
+    if WINDOWS:
+        return True                                      # Avid's driver service; no separate daemon
     out = run_quiet("pgrep", "-f", "snd-dice-ctl-service")
     return bool(out and out.strip())
 
@@ -15310,6 +15384,19 @@ def main():
     set_theme(st.get("theme", "system"), st.get("accent", "system"))
     ensure_icon_theme()
     apply_theme(app)
+    if WINDOWS:
+        try:
+            backend = open_windows_backend()
+        except OSError as e:
+            QtWidgets.QMessageBox.critical(None, APP_NAME, f"{e}\n\nMbox Control uses Avid's Mbox Pro driver "
+                                           "(1.1.10) to reach the box — install it if it's missing.")
+            return 1
+        app.setWindowIcon(app_icon())
+        win = MainWindow(backend)
+        win.show()
+        if os.environ.get("MBOX_SMOKE_SECONDS"):
+            QtCore.QTimer.singleShot(int(float(os.environ["MBOX_SMOKE_SECONDS"]) * 1000), app.quit)
+        return app.exec()
     card_no = os.environ.get("MBOX_CARD") or find_mbox_card()
     if card_no is None:
         QtWidgets.QMessageBox.critical(None, APP_NAME, "No Mbox found. Is it switched on and connected over FireWire?")

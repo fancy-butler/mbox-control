@@ -22,7 +22,7 @@ jobs:
         run: pip install "PySide6>=6.5" numpy pytest pyflakes opencv-python-headless
       - name: Lint
         run: |
-          pyflakes mbox_control.py tests
+          pyflakes mbox_control.py mbox_win.py tests
           shellcheck -S warning install.sh tests/pw_stack.sh
       - name: Tests
         env:

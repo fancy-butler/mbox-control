@@ -1,0 +1,56 @@
+name: windows-app
+on:
+  push:
+    branches: [main]
+    paths: ["mbox_control.py", "mbox_win.py", "tests/test_win.py", ".github/workflows/windows-app.yml"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Packages
+        run: pip install "PySide6>=6.5" numpy pytest pyinstaller
+      - name: Windows backend tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: pytest -q tests/test_win.py
+      - name: The app starts and quits on Windows (simulated Mbox)
+        env:
+          QT_QPA_PLATFORM: offscreen
+          MBOX_WIN_FAKE: "1"
+          MBOX_SMOKE_SECONDS: "8"
+          PYTHONFAULTHANDLER: "1"
+        run: |
+          python mbox_control.py
+          if ($LASTEXITCODE -ne 0) { throw "app exited with $LASTEXITCODE" }
+          $log = Join-Path $env:APPDATA "mbox-control\crash.log"
+          if (Test-Path $log) { Get-Content $log; throw "the app logged a crash" }
+      - name: Build MboxControl.exe
+        run: >
+          pyinstaller --onefile --windowed --name MboxControl
+          --add-data "tests/fixtures/win-driver-dump.json;."
+          --hidden-import mbox_win mbox_control.py
+      - name: The built exe starts and quits (simulated Mbox)
+        env:
+          MBOX_WIN_FAKE: "1"
+          MBOX_SMOKE_SECONDS: "8"
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $p = Start-Process dist\MboxControl.exe -PassThru -Wait
+          if ($p.ExitCode -ne 0) { throw "exe exited with $($p.ExitCode)" }
+      - name: Publish as the "windows-preview" pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release view windows-preview >/dev/null 2>&1 || \
+            gh release create windows-preview --prerelease --target "$GITHUB_SHA" --title "Mbox Control for Windows (preview)" \
+              --notes "Early Windows build for testing. Needs Avid's Mbox Pro driver 1.1.10 installed. Not a finished release."
+          gh release upload windows-preview dist/MboxControl.exe --clobber

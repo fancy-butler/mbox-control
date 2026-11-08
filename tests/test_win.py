@@ -12,55 +12,7 @@ import mbox_win as mw
 DUMP = {int(k): v for k, v in json.loads((Path(__file__).parent / "fixtures/win-driver-dump.json").read_text()).items()}
 
 
-class FakeDriver:
-    """DriverInterface.exe in miniature: two pipes, a parameter store, the same replies."""
-
-    def __init__(self):
-        self.params = dict(DUMP)
-        self.req_out, self.note_out = queue.Queue(), queue.Queue()
-        self.sets = []
-
-        driver = self
-
-        class End:
-            def __init__(self, outq):
-                self.q, self.pending = outq, []
-
-            def available(self):
-                return self.q.qsize()
-
-            def recv(self):
-                return self.q.get(timeout=2)
-
-            def close(self):
-                pass
-
-        class Req(End):
-            def send(self, data):
-                driver.handle(data)
-
-        self.req, self.note = Req(self.req_out), End(self.note_out)
-
-    def handle(self, data):
-        kind, cmd, body = mw.decode(data)
-        if cmd in (mw.CMD_HELLO, mw.CMD_READY):
-            self.req_out.put(mw.encode(0, mw.CMD_VALUES, [[True, cmd, None]]))
-        elif cmd == mw.CMD_DUMP:
-            items = [[v, i, None] for i, v in sorted(self.params.items(), reverse=True)]
-            for k in range(0, len(items), 300):
-                self.note_out.put(mw.encode(0, mw.CMD_VALUES, items[k:k + 300]))
-        elif cmd == mw.CMD_VALUES and kind == mw.KIND_SET:
-            up = mw.updates(body)
-            self.sets.append(up)
-            self.params.update(up)
-            self.note_out.put(mw.encode(0, mw.CMD_VALUES, [[v, i, None] for i, v in up.items()]))
-        elif cmd == mw.CMD_POLL:
-            self.note_out.put(mw.encode(0, mw.CMD_VALUES, [[self.params.get(e[0]), e[0], None] for e in body]))
-
-    def press(self, i, v):
-        """Something changed on the box itself (a front-panel button)."""
-        self.params[i] = v
-        self.note_out.put(mw.encode(0, mw.CMD_VALUES, [[v, i, None]]))
+FakeDriver = mw.FakeDriver
 
 
 @pytest.fixture
