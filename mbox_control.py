@@ -6869,7 +6869,14 @@ class MainWindow(QtWidgets.QMainWindow):
         rv.addWidget(hw)
         rv.addWidget(self.stack, 1)
         h.addWidget(right, 1)
-        self.setCentralWidget(central)
+        # Big text scaling (a 4K TV at 300 %) makes the window's natural minimum taller than the screen:
+        # let the whole window scroll instead of refusing to shrink, and never open larger than the screen.
+        outer = QtWidgets.QScrollArea()
+        outer.setWidgetResizable(True)
+        outer.setFrameShape(QtWidgets.QFrame.NoFrame)
+        outer.setWidget(central)
+        self.setCentralWidget(outer)
+        self.fit_to_screen()
         self.run_refreshers()
 
         # live data: background meter poller + instant hardware events
@@ -6953,6 +6960,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.events.changed.connect(self.on_event)
         self.events.alive.connect(self.on_events_alive)
         self.events.start()
+
+    def fit_to_screen(self):
+        scr = (self.screen() or QtGui.QGuiApplication.primaryScreen())
+        if not scr:
+            return
+        avail = scr.availableGeometry()
+        w = min(self.width(), int(avail.width() * 0.92))
+        h = min(self.height(), int(avail.height() * 0.92))
+        self.resize(w, h)
+        self.move(avail.x() + (avail.width() - w) // 2, avail.y() + (avail.height() - h) // 2)
 
     def watchdog_windows(self):
         """Windows: the only thing that can go wrong is losing the driver's pipe (box off, driver restarted)."""
