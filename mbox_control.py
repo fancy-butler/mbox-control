@@ -2759,7 +2759,7 @@ class FlowGrid(QtWidgets.QWidget):
 
 # ================================================================== single instance & commands
 
-SOCKET_NAME = f"mbox-control-{os.getuid()}"
+SOCKET_NAME = f"mbox-control-{os.getuid() if hasattr(os, 'getuid') else os.environ.get('USERNAME', 'user')}"
 COMMANDS = {
     "show": "Open the window",
     "save-retro": "Save what I just played (last minute)",
@@ -15177,7 +15177,7 @@ def kwin_raise(folder_name):
     """Ask KWin (Plasma 5 or 6) to bring the file-manager window showing `folder_name` to the front."""
     try:
         from PySide6 import QtDBus
-        js = Path(os.environ.get("XDG_RUNTIME_DIR") or "/tmp") / f"mbox-raise-{os.getuid()}.js"
+        js = Path(os.environ.get("XDG_RUNTIME_DIR") or "/tmp") / f"mbox-raise-{os.getpid()}.js"
         js.write_text(KWIN_RAISE_JS % json.dumps(folder_name))
         bus = QtDBus.QDBusConnection.sessionBus()
         sc = QtDBus.QDBusInterface("org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", bus)
@@ -15322,7 +15322,7 @@ def diagnostics():
     except ImportError:
         pyside = "missing"
     card = find_mbox_card()
-    rows = [("Mbox Control", VERSION), ("System", osname), ("Kernel", os.uname().release),
+    rows = [("Mbox Control", VERSION), ("System", osname), ("Kernel", __import__("platform").release()),
             ("Python", sys.version.split()[0]), ("PySide6", pyside),
             ("PipeWire", (re.findall(r"libpipewire ([\d.]+)", run_quiet("pipewire", "--version") or "") or
                           ["not found"])[-1]),
