@@ -7970,7 +7970,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tray = QtWidgets.QSystemTrayIcon(knob_icon(), self)
         self.tray.messageClicked.connect(self.show_window)
         self.tray_state = None
-        menu = QtWidgets.QMenu()
+        menu = QtWidgets.QMenu(self)
         menu.addAction("Open Mbox Control").triggered.connect(self.show_window)
         menu.addSeparator()
         self.tray_mute = menu.addAction("Mute speakers")
@@ -7983,10 +7983,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tray_scenes = menu.addMenu("Scenes")
         self.fill_tray_scenes()
         menu.addSeparator()
-        menu.addAction("Recover Mbox…").triggered.connect(lambda: self.recover_mbox())
+        if not WINDOWS:
+            menu.addAction("Recover Mbox…").triggered.connect(lambda: self.recover_mbox())
         menu.addAction("Quit").triggered.connect(self.quit_app)
         self.tray_menu = menu
-        self.tray.setContextMenu(menu)
+        if sys.platform != "win32":
+            self.tray.setContextMenu(menu)        # Windows: shown by hand on right-click (Qt's doesn't open there)
         self.tray.activated.connect(self.tray_clicked)
         self.tray.setToolTip(APP_NAME)
         self.tray.show()
@@ -8007,6 +8009,10 @@ class MainWindow(QtWidgets.QMainWindow):
                     lambda _=False, n=n: self.apply_user_scene(n))
 
     def tray_clicked(self, reason):
+        if reason == QtWidgets.QSystemTrayIcon.Context and sys.platform == "win32":
+            self.activateWindow()                 # Windows closes a tray menu only if our app has focus
+            self.tray_menu.popup(QtGui.QCursor.pos())
+            return
         if reason == QtWidgets.QSystemTrayIcon.Trigger:
             q = getattr(self, "quick", None)
             if q and q.isVisible():
