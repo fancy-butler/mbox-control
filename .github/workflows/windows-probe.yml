@@ -20,6 +20,7 @@ jobs:
         run: |
           pip install frida pyinstaller
           pyinstaller --onefile --console --name MboxProbe --add-data "hook.js;." mbox_probe.py
+          pyinstaller --onefile --console --name MboxPipeTest pipe_test.py
       - name: Self-test (injects into Notepad)
         working-directory: tools/windows-probe
         run: dist\MboxProbe.exe --selftest
@@ -31,4 +32,5 @@ jobs:
           gh release view windows-probe >/dev/null 2>&1 || \
             gh release create windows-probe --prerelease --target "$GITHUB_SHA" --title "Mbox Probe (Windows)" \
               --notes "A one-off tool for mapping Avid's Mbox Pro panel. Not part of Mbox Control itself."
-          gh release upload windows-probe tools/windows-probe/dist/MboxProbe.exe --clobber
+          gh release upload windows-probe tools/windows-probe/dist/MboxProbe.exe \
+            tools/windows-probe/dist/MboxPipeTest.exe --clobber
