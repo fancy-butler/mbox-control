@@ -81,7 +81,10 @@ class Pipe:
             h = k32.CreateFileW(path, GENERIC_RW, 0, None, OPEN_EXISTING, 0, None)
             if h and h != INVALID:
                 break
-            k32.WaitNamedPipeW(path, 200)               # busy: the service hands it over in a moment
+            # not there yet (the driver creates the notification pipe just after we connect the first one)
+            # or busy: wait a moment. WaitNamedPipe returns at once if the pipe doesn't exist yet.
+            k32.WaitNamedPipeW(path, 200)
+            time.sleep(0.1)
         else:
             raise OSError(f"couldn't open {path} (error {ctypes.get_last_error()})")
         self.h = h
