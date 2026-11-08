@@ -7871,6 +7871,10 @@ class MainWindow(QtWidgets.QMainWindow):
         op = QtWidgets.QPushButton("Open app")
         op.clicked.connect(lambda: (p.hide(), self.show_window()))
         head.addWidget(op)
+        qt = QtWidgets.QPushButton("Quit")
+        qt.setToolTip("Close Mbox Control completely (the Mbox keeps its settings)")
+        qt.clicked.connect(lambda: (p.hide(), self.quit_app()))
+        head.addWidget(qt)
         v.addLayout(head)
         row = QtWidgets.QHBoxLayout()
         self.q_spk = {}
@@ -8009,6 +8013,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     lambda _=False, n=n: self.apply_user_scene(n))
 
     def tray_clicked(self, reason):
+        rlog(f"tray: {getattr(reason, 'name', reason)}") if WINDOWS else None
         if reason == QtWidgets.QSystemTrayIcon.Context and sys.platform == "win32":
             self.activateWindow()                 # Windows closes a tray menu only if our app has focus
             self.tray_menu.popup(QtGui.QCursor.pos())
