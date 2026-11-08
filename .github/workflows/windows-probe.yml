@@ -1,0 +1,34 @@
+name: windows-probe
+on:
+  push:
+    branches: [main]
+    paths: ["tools/windows-probe/**", ".github/workflows/windows-probe.yml"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Build MboxProbe.exe
+        working-directory: tools/windows-probe
+        run: |
+          pip install frida pyinstaller
+          pyinstaller --onefile --console --name MboxProbe --add-data "hook.js;." mbox_probe.py
+      - name: Self-test (injects into Notepad)
+        working-directory: tools/windows-probe
+        run: dist\MboxProbe.exe --selftest
+      - name: Publish as the "windows-probe" pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release view windows-probe >/dev/null 2>&1 || \
+            gh release create windows-probe --prerelease --target "$GITHUB_SHA" --title "Mbox Probe (Windows)" \
+              --notes "A one-off tool for mapping Avid's Mbox Pro panel. Not part of Mbox Control itself."
+          gh release upload windows-probe tools/windows-probe/dist/MboxProbe.exe --clobber
