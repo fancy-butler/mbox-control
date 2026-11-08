@@ -320,6 +320,17 @@ def lin_to_db(v):
     return -200.0 if v <= 0 else 20 * math.log10(v / UNITY)
 
 
+def trim255(db):
+    """Output trim: driver dB (0 = full) → Linux driver's 0–255 (linear, 255 = full)."""
+    if db is None or db <= SILENT_DB:
+        return 0
+    return max(0, min(255, round(255 * 10 ** (db / 20))))
+
+
+def trim_db(v):
+    return -200.0 if v <= 0 else 20 * math.log10(v / 255)
+
+
 def meter12(v):
     """Driver meter [level 0–1, timestamp] → Linux driver's 0–4095."""
     lvl = v[0] if isinstance(v, list) and v else 0.0
@@ -401,6 +412,7 @@ class AlsaView:
         self.id_spkr = add("spkr-button", "ENUMERATED", 1,
                            ["Off", "Green", "Green-Blink", "Red", "Red-Blink", "Orange", "Orange-Blink"])
         self.id_hpf = add("input-hp-filter", "BOOLEAN", 4)
+        self.id_trim = add("output-trim", "INTEGER", 6, lo=0, hi=255)
         self.id_rtype = add("reverb-type", "ENUMERATED", 1,
                             ["Room-1", "Room-2", "Room-3", "Hall-1", "Hall-2", "Plate", "Echo", "Delay"])
         self.refresh()
@@ -462,6 +474,8 @@ class AlsaView:
             c[self.id_spkr].values = [{1: 1, 2: 3, 3: 5}.get(g(P_SPKR, 0), 0)]
         if self.id_hpf in want:
             c[self.id_hpf].values = [bool(g(P_HPF + k, False)) for k in range(4)]
+        if self.id_trim in want:
+            c[self.id_trim].values = [trim255(g(out_param(o // 2, 5 if o % 2 == 0 else 8))) for o in range(6)]
         if self.id_rtype in want:
             c[self.id_rtype].values = [max(0, min(7, int(g(P_FX_TYPE, 0) or 0)))]
 
@@ -506,7 +520,8 @@ class AlsaView:
                 hit.add(self.id_rtype)
             elif OUT_BASE <= i < OUT_BASE + 6 * OUT_STRIDE:
                 f = (i - OUT_BASE) % OUT_STRIDE
-                hit.add({1: self.id_out, 3: self.id_assign, 6: self.id_out_m, 9: self.id_out_m}.get(f, self.id_out))
+                hit.add({1: self.id_out, 3: self.id_assign, 5: self.id_trim, 8: self.id_trim,
+                         6: self.id_out_m, 9: self.id_out_m}.get(f, self.id_out))
             elif FX_SEND_HW <= i < FX_SEND_SW + 16:
                 hit.update(self.id_gain[12:14])
             elif mix_base(0) <= i < mix_base(MIXES):
@@ -583,6 +598,11 @@ class AlsaView:
                     out[P_HPF + k] = bool(values[k])
         elif ctrl.numid == self.id_rtype:
             out[P_FX_TYPE] = int(values[0])
+        elif ctrl.numid == self.id_trim:
+            for o in range(6):
+                p = out_param(o // 2, 5 if o % 2 == 0 else 8)
+                if trim255(g(p)) != int(values[o]):
+                    out[p] = trim_db(int(values[o]))
         else:
             raise ValueError(f"{ctrl.name} can't be changed on Windows")
         return out

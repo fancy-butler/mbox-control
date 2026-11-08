@@ -167,3 +167,12 @@ def test_things_windows_cannot_do_say_so(be):
         be.write(by_name(c, "clock-source"), [1])
     with pytest.raises(RuntimeError):
         be.write(by_name(c, "stream-source"), [0] * 8)
+
+
+def test_output_trims(be, drv):
+    c = be.read_all()
+    t = by_name(c, "output-trim")
+    assert t.values == [255] * 6                                 # dump: every trim at 0 dB
+    be.write(t, [128, 255, 255, 255, 255, 255])
+    assert drv.sets[-1] == {mw.out_param(0, 5): pytest.approx(-5.98, abs=0.02)}
+    assert be.read(t.numid).values[0] == 128
