@@ -59,26 +59,67 @@ def parse(b, o=0):
 
 
 class Pipe:
+    """A message-mode named-pipe client, done the way Avid's own DeviceInterface.dll does it."""
+
     def __init__(self, path):
+        import ctypes
+        from ctypes import wintypes
+        self.k32 = k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.ct, self.wt = ctypes, wintypes
+        k32.CreateFileW.restype = wintypes.HANDLE
+        k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                                    wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        k32.ReadFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+                                 ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+        k32.WriteFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+                                  ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+        k32.SetNamedPipeHandleState.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD),
+                                                ctypes.c_void_p, ctypes.c_void_p]
+        k32.WaitNamedPipeW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
+        GENERIC_RW, OPEN_EXISTING, INVALID = 0xC0000000, 3, wintypes.HANDLE(-1).value
         for _ in range(50):
-            try:
-                self.f = open(path, "r+b", buffering=0)
-                return
-            except OSError:
-                time.sleep(0.1)                         # busy: the service hands it over in a moment
-        raise OSError(f"couldn't open {path}")
+            h = k32.CreateFileW(path, GENERIC_RW, 0, None, OPEN_EXISTING, 0, None)
+            if h and h != INVALID:
+                break
+            k32.WaitNamedPipeW(path, 200)               # busy: the service hands it over in a moment
+        else:
+            raise OSError(f"couldn't open {path} (error {ctypes.get_last_error()})")
+        self.h = h
+        mode = wintypes.DWORD(2)                         # PIPE_READMODE_MESSAGE
+        if not k32.SetNamedPipeHandleState(h, ctypes.byref(mode), None, None):
+            print("  (couldn't switch to message mode — carrying on in byte mode)")
+        self.buf = b""
+
+    def available(self):
+        n = self.wt.DWORD()
+        self.k32.PeekNamedPipe(self.h, None, 0, None, self.ct.byref(n), None)
+        return n.value + len(self.buf)
 
     def send(self, data):
-        self.f.write(data)
+        n = self.wt.DWORD()
+        if not self.k32.WriteFile(self.h, data, len(data), self.ct.byref(n), None):
+            raise OSError(f"write failed (error {self.ct.get_last_error()})")
+
+    def _read_some(self):
+        out = b""
+        while True:
+            buf = self.ct.create_string_buffer(65536)
+            n = self.wt.DWORD()
+            ok = self.k32.ReadFile(self.h, buf, 65536, self.ct.byref(n), None)
+            out += buf.raw[:n.value]
+            if ok:
+                return out
+            err = self.ct.get_last_error()
+            if err != 234:                               # ERROR_MORE_DATA: rest of a long message follows
+                raise OSError(f"read failed (error {err})")
 
     def recv(self):
-        head = self.f.read(12)
-        ln = struct.unpack_from("<I", head)[0]
-        rest = b""
-        while len(rest) < ln - 12:
-            rest += self.f.read(ln - 12 - len(rest))
-        kind, cmd = struct.unpack_from("<Ii", head, 4)
-        body, _ = parse(rest) if rest else (None, 0)
+        while len(self.buf) < 4 or len(self.buf) < struct.unpack_from("<I", self.buf)[0]:
+            self.buf += self._read_some()
+        ln = struct.unpack_from("<I", self.buf)[0]
+        m, self.buf = self.buf[:ln], self.buf[ln:]
+        kind, cmd = struct.unpack_from("<Ii", m, 4)
+        body, _ = parse(m, 12) if ln > 12 else (None, 0)
         return kind, cmd, body
 
 
@@ -93,15 +134,18 @@ def main():
     n_path = s_path.replace("\\SDeviceID", "\\NDeviceID")
     print("Device pipe:", s_path)
     s = Pipe(s_path)
+    n = Pipe(n_path)                                     # Avid's panel connects both before talking
     s.send(message(2, -3))
     print("handshake 1:", s.recv())
     s.send(message(2, -4))
     print("handshake 2:", s.recv())
-    n = Pipe(n_path)
     s.send(message(1, -5, [[0, 1177]]))                 # ask for every value
     values = {}
     deadline = time.time() + 5
     while time.time() < deadline and len(values) < 1000:
+        if not n.available():
+            time.sleep(0.05)
+            continue
         _kind, cmd, body = n.recv()
         if cmd == -6 and isinstance(body, list):
             for e in body:
