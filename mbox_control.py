@@ -6974,6 +6974,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def watchdog_windows(self):
         """Windows: the only thing that can go wrong is losing the driver's pipe (box off, driver restarted)."""
+        if self.asleep:
+            return
         if self.backend.link.alive and not self.disconnected:
             return
         if not self.disconnected:
@@ -14604,6 +14606,39 @@ class MainWindow(QtWidgets.QMainWindow):
         if path:
             failed = self.apply_snapshot(load_json(path, {}))
             self.toast(f"Loaded {path}" + (f" ({len(failed)} failed)" if failed else ""), 8000)
+
+    def nativeEvent(self, event_type, message):
+        """Windows sleep: hang up on Avid's driver before the PC sleeps and reconnect after it wakes, the same
+        rule as on Linux — never hold the Mbox open across sleep."""
+        if WINDOWS and sys.platform == "win32" and event_type in (b"windows_generic_MSG", "windows_generic_MSG"):
+            try:
+                import ctypes
+                from ctypes import wintypes
+                msg = ctypes.cast(int(message), ctypes.POINTER(wintypes.MSG)).contents
+                if msg.message == 0x0218:                        # WM_POWERBROADCAST
+                    if msg.wParam == 0x0004:                     # PBT_APMSUSPEND
+                        self.windows_sleep()
+                    elif msg.wParam in (0x0012, 0x0007):         # resume (automatic / suspend)
+                        QtCore.QTimer.singleShot(3000, self.windows_wake)
+            except Exception as ex:  # noqa: BLE001
+                rlog(f"power message: {ex}")
+        return super().nativeEvent(event_type, message)
+
+    def windows_sleep(self):
+        rlog("Windows is going to sleep: hanging up on the Mbox driver")
+        self.asleep = True
+        self.stop_live()
+        try:
+            self.backend.link.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        self.backend.link.alive = False
+
+    def windows_wake(self):
+        rlog("Windows woke up: reconnecting to the Mbox driver")
+        self.asleep = False
+        self.disconnected = True                                 # the watchdog reconnects (and retries)
+        self.watchdog_windows()
 
     def closeEvent(self, e):
         if self.tray and not self.quitting and self.app_state.get("close_to_tray", True):

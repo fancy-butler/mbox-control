@@ -2,7 +2,7 @@ name: windows-app
 on:
   push:
     branches: [main]
-    paths: ["mbox_control.py", "mbox_win.py", "tests/test_win.py", ".github/workflows/windows-app.yml"]
+    paths: ["mbox_control.py", "mbox_win.py", "tests/test_win.py", "packaging/windows/**", ".github/workflows/windows-app.yml"]
   workflow_dispatch:
 
 jobs:
@@ -32,19 +32,41 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "app exited with $LASTEXITCODE" }
           $log = Join-Path $env:APPDATA "mbox-control\crash.log"
           if (Test-Path $log) { Get-Content $log; throw "the app logged a crash" }
-      - name: Build MboxControl.exe
+      - name: Icon
+        run: python packaging/windows/make_icon.py packaging/windows/mbox-control.ico
+      - name: Build the app folder
         run: >
-          pyinstaller --onefile --windowed --name MboxControl
+          pyinstaller --onedir --windowed --noconfirm --name MboxControl
+          --icon packaging/windows/mbox-control.ico
           --add-data "tests/fixtures/win-driver-dump.json;."
           --hidden-import mbox_win mbox_control.py
-      - name: The built exe starts and quits (simulated Mbox)
+      - name: The built app starts and quits (simulated Mbox)
         env:
           MBOX_WIN_FAKE: "1"
           MBOX_SMOKE_SECONDS: "8"
           QT_QPA_PLATFORM: offscreen
         run: |
-          $p = Start-Process dist\MboxControl.exe -PassThru -Wait
+          $p = Start-Process dist\MboxControl\MboxControl.exe -PassThru -Wait
           if ($p.ExitCode -ne 0) { throw "exe exited with $($p.ExitCode)" }
+      - name: Installer
+        shell: bash
+        run: |
+          ver=$(python -c 'import re; print(re.search(r"^VERSION = \"([^\"]+)\"", open("mbox_control.py").read(), re.M)[1])')
+          iscc="/c/Program Files (x86)/Inno Setup 6/ISCC.exe"
+          [ -f "$iscc" ] || { choco install innosetup -y --no-progress; }
+          "$iscc" -DAppVersion="$ver" packaging/windows/mbox-control.iss
+          ls -la dist/MboxControl-Setup.exe
+      - name: Silent install, start, quit, uninstall
+        run: |
+          $p = Start-Process dist\MboxControl-Setup.exe -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/TASKS=" -PassThru -Wait
+          if ($p.ExitCode -ne 0) { throw "installer exited with $($p.ExitCode)" }
+          $exe = Join-Path ${env:ProgramFiles} "Mbox Control\MboxControl.exe"
+          if (-not (Test-Path $exe)) { throw "not installed at $exe" }
+          $env:MBOX_WIN_FAKE = "1"; $env:MBOX_SMOKE_SECONDS = "6"; $env:QT_QPA_PLATFORM = "offscreen"
+          $r = Start-Process $exe -PassThru -Wait
+          if ($r.ExitCode -ne 0) { throw "installed app exited with $($r.ExitCode)" }
+          $u = Start-Process (Join-Path ${env:ProgramFiles} "Mbox Control\unins000.exe") -ArgumentList "/VERYSILENT" -PassThru -Wait
+          if ($u.ExitCode -ne 0) { throw "uninstaller exited with $($u.ExitCode)" }
       - name: Publish as the "windows-preview" pre-release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -53,4 +75,5 @@ jobs:
           gh release view windows-preview >/dev/null 2>&1 || \
             gh release create windows-preview --prerelease --target "$GITHUB_SHA" --title "Mbox Control for Windows (preview)" \
               --notes "Early Windows build for testing. Needs Avid's Mbox Pro driver 1.1.10 installed. Not a finished release."
-          gh release upload windows-preview dist/MboxControl.exe --clobber
+          gh release delete-asset windows-preview MboxControl.exe -y 2>/dev/null || true
+          gh release upload windows-preview dist/MboxControl-Setup.exe --clobber
