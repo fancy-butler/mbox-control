@@ -57,6 +57,7 @@ jobs:
           "$iscc" -DAppVersion="$ver" packaging/windows/mbox-control.iss
           ls -la dist/MboxControl-Setup.exe
       - name: Silent install, start, quit, uninstall
+        timeout-minutes: 5
         run: |
           $p = Start-Process dist\MboxControl-Setup.exe -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/TASKS=" -PassThru -Wait
           if ($p.ExitCode -ne 0) { throw "installer exited with $($p.ExitCode)" }

@@ -57,7 +57,7 @@ function InitializeSetup(): Boolean;
 begin
   Result := True;
   if not DriverInstalled() then
-    Result := MsgBox('Avid''s Mbox Pro driver (1.1.10) doesn''t seem to be installed.' + #13#10 +
+    Result := SuppressibleMsgBox('Avid''s Mbox Pro driver (1.1.10) doesn''t seem to be installed.' + #13#10 +
                      'Mbox Control talks to the Mbox through it. Install anyway?',
-                     mbConfirmation, MB_YESNO) = IDYES;
+                     mbConfirmation, MB_YESNO, IDYES) = IDYES;
 end;
