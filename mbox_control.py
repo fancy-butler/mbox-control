@@ -7971,6 +7971,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def setup_tray(self):
         if not QtWidgets.QSystemTrayIcon.isSystemTrayAvailable():
+            rlog("tray: the desktop reports no system tray")
+            QtCore.QTimer.singleShot(5000, self.retry_tray)      # Explorer may still be starting up
             return
         self.tray = QtWidgets.QSystemTrayIcon(knob_icon(), self)
         self.tray.messageClicked.connect(self.show_window)
@@ -7998,6 +8000,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tray.setToolTip(APP_NAME)
         self.tray.show()
         QtWidgets.QApplication.setQuitOnLastWindowClosed(False)
+        QtCore.QTimer.singleShot(2000, lambda: rlog(f"tray: icon shown={self.tray.isVisible()} "
+                                                    f"geometry={self.tray.geometry().getRect()}"))
+
+    def retry_tray(self):
+        if self.tray is None and QtWidgets.QSystemTrayIcon.isSystemTrayAvailable():
+            self.setup_tray()
 
     def fill_tray_scenes(self):
         if not self.tray:
