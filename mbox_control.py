@@ -49,6 +49,13 @@ APP_NAME = "Mbox Control"
 VERSION = "4.25.2"
 UPDATE_REPO = "fancy-butler/mbox-control"     # where releases are published; empty = no online checks
 HOME = Path.home()
+if sys.platform == "win32":
+    # Windows' default text encoding is a code page, not UTF-8: names with emoji or accents would be
+    # mangled in settings files. Make UTF-8 the default for every Path text read/write in this app.
+    _read_text, _write_text = Path.read_text, Path.write_text
+    Path.read_text = lambda self, encoding="utf-8", errors=None: _read_text(self, encoding, errors)
+    Path.write_text = lambda self, data, encoding="utf-8", errors=None, newline=None: \
+        _write_text(self, data, encoding, errors, newline)
 # Windows: Avid's own driver does the hardware side (see mbox_win.py). MBOX_PLATFORM=win lets the Windows
 # code paths run anywhere, with a simulated driver (MBOX_WIN_FAKE=1), for tests and CI.
 WINDOWS = sys.platform == "win32" or os.environ.get("MBOX_PLATFORM") == "win"
@@ -402,7 +409,7 @@ class Backend:
                 import traceback
                 try:
                     CONF_DIR.mkdir(parents=True, exist_ok=True)
-                    with open(CRASH_LOG, "a") as f:
+                    with open(CRASH_LOG, "a", encoding="utf-8") as f:
                         f.write(f"--- write storm blocked {datetime.now():%H:%M:%S}: {why} ---\n"
                                 + "".join(traceback.format_stack(limit=12)))
                 except OSError:
@@ -7395,7 +7402,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tray.showMessage(APP_NAME, "The Mbox has stopped answering — switch it off and on again.",
                                   app_icon(), 15000)
         try:
-            with open(CRASH_LOG, "a") as f:
+            with open(CRASH_LOG, "a", encoding="utf-8") as f:
                 f.write(f"--- Mbox not answering at {datetime.now():%H:%M:%S} "
                         f"(amixer hung: {is_hung(AMIXER)}, pactl hung: {is_hung('pactl')}) ---\n")
         except OSError:
@@ -14775,7 +14782,7 @@ def rlog(msg):
     line = f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}"
     try:
         CONF_DIR.mkdir(parents=True, exist_ok=True)
-        with open(RECOVERY_LOG, "a") as f:
+        with open(RECOVERY_LOG, "a", encoding="utf-8") as f:
             f.write(line + "\n")
         if RECOVERY_LOG.stat().st_size > 400_000:            # keep it small: last ~half
             text = RECOVERY_LOG.read_text(errors="ignore")
@@ -15346,7 +15353,7 @@ class FreezeWatch:
         CONF_DIR.mkdir(parents=True, exist_ok=True)
         if CRASH_LOG.exists() and CRASH_LOG.stat().st_size > 400_000:
             CRASH_LOG.replace(CRASH_LOG.with_suffix(".old.log"))
-        self.f = open(CRASH_LOG, "a", buffering=1)
+        self.f = open(CRASH_LOG, "a", buffering=1, encoding="utf-8")
         self.f.write(f"\n=== Mbox Control {VERSION} started {datetime.now():%Y-%m-%d %H:%M:%S} ===\n")
         faulthandler.enable(file=self.f, all_threads=True)
         self.beat = time.monotonic()                     # stands still while the PC sleeps

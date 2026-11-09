@@ -51,7 +51,7 @@ jobs:
       - name: Installer
         shell: bash
         run: |
-          ver=$(python -c 'import re; print(re.search(r"^VERSION = \"([^\"]+)\"", open("mbox_control.py").read(), re.M)[1])')
+          ver=$(python -c 'import re; print(re.search(r"^VERSION = \"([^\"]+)\"", open("mbox_control.py", encoding="utf-8").read(), re.M)[1])')
           iscc="/c/Program Files (x86)/Inno Setup 6/ISCC.exe"
           [ -f "$iscc" ] || { choco install innosetup -y --no-progress; }
           "$iscc" -DAppVersion="$ver" packaging/windows/mbox-control.iss
