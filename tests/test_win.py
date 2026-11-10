@@ -199,3 +199,17 @@ def test_a_failing_handler_never_stops_the_reader(drv):
         assert any("change handler failed" in m for m in logs)
     finally:
         link.stop()
+
+
+def test_a_silent_driver_counts_as_lost(drv):
+    """After sleep the old pipe can stay open but never answer: the link must notice and say so."""
+    got = queue.Queue()
+    link = mw.DriverLink(drv.req, drv.note, on_change=got.put).connect(timeout=2)
+    link.meter_ids = [62]
+    link.stale_after = 0.3
+    drv.handle = lambda data: None                      # the driver stops answering
+    link.start(meter_interval=0.05)
+    try:
+        assert got.get(timeout=2) is None and not link.alive
+    finally:
+        link.stop()

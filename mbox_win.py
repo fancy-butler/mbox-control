@@ -236,8 +236,13 @@ class DriverLink:
 
         def loop():
             last_poll = 0.0
+            self.last_rx = time.time()
             while self.running:
                 try:
+                    if self.meter_ids and self.meters_on and time.time() - self.last_rx > self.stale_after:
+                        # we keep asking for meters and nothing comes back: after sleep the driver can leave
+                        # our old pipe open but dead. Treat it as lost so the app reconnects.
+                        raise OSError(f"no reply from the driver for {self.stale_after:.0f} s")
                     busy = False
                     if self.meter_ids and self.meters_on and time.time() - last_poll >= self.meter_interval:
                         last_poll = time.time()
@@ -270,6 +275,8 @@ class DriverLink:
 
     meters_on = True
     log = None
+    stale_after = 4.0
+    last_rx = 0.0
 
     def _log(self, msg):
         if self.log:
@@ -287,6 +294,7 @@ class DriverLink:
                 self._log(f"change handler failed: {type(e).__name__}: {e}")
 
     def _dispatch(self, msg):
+        self.last_rx = time.time()
         changed = self._take(msg)
         if changed:
             self._notify(changed)
