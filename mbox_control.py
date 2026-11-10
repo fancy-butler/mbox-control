@@ -567,6 +567,9 @@ def mark_hung(prog):
     HUNG[Path(prog).name] = time.time() + HUNG_PAUSE
 
 
+WIN_WAKE_DELAY_MS = int(os.environ.get("MBOX_WIN_WAKE_DELAY", "15")) * 1000
+
+
 class WinEvents(QtCore.QObject):
     """Windows stand-in for EventWatcher: the driver link pushes changes; this turns them into control ids."""
     changed = QtCore.Signal(int)
@@ -6999,6 +7002,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.reconnect_fails = 0
         rlog("reconnected to the Mbox driver")
         self.stop_live()
+        try:
+            self.backend.link.stop()                     # one connection only: hang up the old one first
+        except Exception:  # noqa: BLE001
+            pass
         self.backend = fresh
         self.disconnected = False
         self.ctrls = self.backend.read_all()
@@ -14632,7 +14639,11 @@ class MainWindow(QtWidgets.QMainWindow):
                     if msg.wParam == 0x0004:                     # PBT_APMSUSPEND
                         self.windows_sleep()
                     elif msg.wParam in (0x0012, 0x0007):         # resume (automatic / suspend)
-                        QtCore.QTimer.singleShot(3000, self.windows_wake)
+                        # Windows sends both; give Avid's driver time to bring the Mbox back by itself
+                        # before we knock on its door — talking to it mid-resume can jam it.
+                        if self.asleep and not getattr(self, "wake_pending", False):
+                            self.wake_pending = True
+                            QtCore.QTimer.singleShot(WIN_WAKE_DELAY_MS, self.windows_wake)
             except Exception as ex:  # noqa: BLE001
                 rlog(f"power message: {ex}")
         return super().nativeEvent(event_type, message)
@@ -14648,7 +14659,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.backend.link.alive = False
 
     def windows_wake(self):
-        rlog("Windows woke up: reconnecting to the Mbox driver")
+        self.wake_pending = False
+        rlog(f"Windows woke up {WIN_WAKE_DELAY_MS // 1000} s ago: reconnecting to the Mbox driver")
         self.asleep = False
         self.disconnected = True                                 # the watchdog reconnects (and retries)
         self.watchdog_windows()
