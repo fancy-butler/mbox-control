@@ -6990,8 +6990,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self.toast("Lost the connection to the Mbox — waiting for it to come back…", 0)
         try:
             fresh = open_windows_backend()
-        except OSError:
+        except Exception as e:  # noqa: BLE001 — keep trying, but say why
+            n = getattr(self, "reconnect_fails", 0)
+            self.reconnect_fails = n + 1
+            if n < 3 or n % 15 == 0:
+                rlog(f"reconnect attempt {n + 1} failed: {type(e).__name__}: {e}")
             return
+        self.reconnect_fails = 0
+        rlog("reconnected to the Mbox driver")
         self.stop_live()
         self.backend = fresh
         self.disconnected = False

@@ -668,8 +668,16 @@ class WinBackend:
         if not pipes:
             raise OSError("No Mbox found. Is it switched on, and is Avid's Mbox Pro driver installed?")
         req = WinPipe(pipes[0][0])
-        note = WinPipe(pipes[0][1])
-        link = DriverLink(req, note, on_change).connect()
+        try:
+            note = WinPipe(pipes[0][1])
+            link = DriverLink(req, note, on_change).connect()
+        except Exception:
+            req.close()                                  # never leave a half-open connection behind
+            try:
+                note.close()
+            except NameError:
+                pass
+            raise
         return cls(link)
 
     def enable_direct(self):
