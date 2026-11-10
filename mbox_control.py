@@ -46,7 +46,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QPointF, QRectF
 
 APP_NAME = "Mbox Control"
-VERSION = "4.25.2"
+VERSION = "4.26"
 UPDATE_REPO = "fancy-butler/mbox-control"     # where releases are published; empty = no online checks
 HOME = Path.home()
 if sys.platform == "win32":

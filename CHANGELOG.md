@@ -7,6 +7,12 @@
 
 
 
+
+## 4.26
+- **Windows preview.** Mbox Control runs on Windows 10/11 on top of Avid's own Mbox Pro driver (1.1.10), with no Avid panel needed. It talks to Avid's driver service over its named pipes (protocol worked out with the Windows probe; see docs/windows-protocol.md). Working so far: the mixer, routing, meters, output levels, front-panel buttons, high-pass filters, sample rate, clock and reverb type, plus the tray. It hangs up before sleep and reconnects after waking. There's an installer, built and tested on GitHub. The audio features (EQ, recording, practice player, tape) are Linux-only for now.
+- The window shrinks to any size (pages scroll) and never opens larger than the screen. That's for big text scaling such as a 4K TV at 300 %.
+- The tray's quick panel has a Quit button.
+
 ## 4.25.2
 - **Silent players get named.** Some players, VLC among them, never reconnect after the sound system went away (sleep, or the Repair button). They keep "playing" in silence, and it looks like the Mbox is broken. The app now remembers what was playing, and 20 seconds after waking or a repair tells you which program lost its connection and needs restarting.
 - The Repair hint warns that some players need restarting afterwards.
