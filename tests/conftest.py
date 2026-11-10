@@ -80,3 +80,20 @@ def amixer_log(tmp_path):
         p = tmp_path / "amixer.log"
         return p.read_text().splitlines() if p.exists() else []
     return read
+
+
+# Qt's teardown at interpreter exit can crash (exit 139) when a test left a worker thread running —
+# after every test has passed and been reported. Leave the process directly once pytest is done.
+_EXIT = {"code": 0}
+
+
+def pytest_sessionfinish(session, exitstatus):
+    _EXIT["code"] = int(exitstatus)
+
+
+def pytest_unconfigure(config):
+    import os as _os
+    import sys as _sys
+    _sys.stdout.flush()
+    _sys.stderr.flush()
+    _os._exit(_EXIT["code"])
