@@ -2,7 +2,7 @@
 # Each GitHub release carries this file with pkgver and sha256sums filled in.
 _ghuser=fancy-butler
 pkgname=mbox-control
-pkgver=4.26
+pkgver=4.26.1
 pkgrel=1
 pkgdesc="Unofficial modern control panel for the Avid Mbox Pro 3 (FireWire): mixer, routing, ripping, guitar mode"
 arch=('any')
