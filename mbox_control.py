@@ -46,7 +46,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QPointF, QRectF
 
 APP_NAME = "Mbox Control"
-VERSION = "4.27"
+VERSION = "4.27.1"
 UPDATE_REPO = "fancy-butler/mbox-control"     # where releases are published; empty = no online checks
 HOME = Path.home()
 if sys.platform == "win32":
@@ -803,7 +803,7 @@ CARD_ICONS = {   # card title → icon names (KDE Breeze first, then freedesktop
     "Quick take": ["audio-input-microphone", "media-record"], "Rip queue": ["view-list-details", "format-list-ordered"],
     "Rip tape / vinyl": ["media-record"], "Ripping": ["media-record"], "Scenes": ["view-media-playlist", "view-grid"],
     "Song identification": ["search", "edit-find"], "Speaker sets": ["audio-speakers", "audio-speakers-symbolic", "speaker", "audio-volume-high"], "Split & tag": ["edit-cut"],
-    "Standalone mode": ["network-disconnect", "system-shutdown"], "Startup & tray": ["system-run"],
+    "Standalone mode": ["network-disconnect", "system-shutdown"], "Startup & tray": ["system-run"], "Updates": ["system-software-update", "view-refresh"],
     "Suggestions": ["help-hint", "dialog-information"], "Tuner": ["view-media-visualization", "audio-x-generic"],
     "What each output feeds": ["audio-speakers", "audio-speakers-symbolic", "speaker", "audio-volume-high"], "What's plugged into each input": ["audio-input-line", "audio-card"],
     "Where sound goes": ["view-media-visualization", "audio-speakers"], "Wiring": ["insert-link", "network-connect"],
@@ -14640,6 +14640,31 @@ class MainWindow(QtWidgets.QMainWindow):
         ctt.toggled.connect(lambda on: (self.app_state.__setitem__("close_to_tray", on), self.save_app_state()))
         tl.addWidget(ctt)
         lay.addWidget(tc)
+        uc_card, ul = card("Updates")
+        ul.addWidget(QtWidgets.QLabel(f"You have version <b>{VERSION}</b>."))
+        uc = QtWidgets.QCheckBox("Check for new versions once a day")
+        uc.setChecked(bool(self.app_state.get("update_check")) and bool(UPDATE_REPO))
+        uc.setEnabled(bool(UPDATE_REPO))
+        uc.setToolTip("Asks GitHub whether there's a newer release. Nothing else is sent." if UPDATE_REPO else
+                      "Available once Mbox Control is published on GitHub.")
+        uc.toggled.connect(lambda on: (self.app_state.__setitem__("update_check", on),
+                                       self.app_state.__setitem__("update_checked_at", 0),
+                                       self.save_app_state(), self.check_update()))
+        ul.addWidget(uc)
+        tu = QtWidgets.QCheckBox("Tester mode: offer new versions I save to Downloads")
+        tu.setChecked(bool(self.app_state.get("tester_updates")))
+        tu.setToolTip("For trying test builds: a newer mbox_control.py in ~/Downloads shows up as an update.")
+        tu.toggled.connect(lambda on: (self.app_state.__setitem__("tester_updates", on), self.save_app_state(),
+                                       self.check_update()))
+        ul.addWidget(tu)
+        now = QtWidgets.QPushButton("Check now")
+        now.setEnabled(bool(UPDATE_REPO))
+        now.clicked.connect(lambda: (self.app_state.__setitem__("update_check", True), uc.setChecked(True),
+                                     self.app_state.__setitem__("update_checked_at", 0), self.save_app_state(),
+                                     self.check_update(),
+                                     self.toast("Checking GitHub… a newer version shows up on Home.", 6000)))
+        ul.addWidget(now, 0, Qt.AlignLeft)
+        lay.addWidget(uc_card)
 
         sv, svl = card("Background service & launcher")
         svl.addWidget(muted("The control service runs in the background (mbox-ctl.service) and restarts "
@@ -14829,21 +14854,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refreshers.append(lambda: self.events_lbl.setText("connected ✓" if self.events_alive
                                                                else "not available — polling instead"))
         f.addRow("App version", QtWidgets.QLabel(VERSION))
-        uc = QtWidgets.QCheckBox("Check for new versions once a day")
-        uc.setChecked(bool(self.app_state.get("update_check")) and bool(UPDATE_REPO))
-        uc.setEnabled(bool(UPDATE_REPO))
-        uc.setToolTip("Asks GitHub whether there's a newer release. Nothing else is sent." if UPDATE_REPO else
-                      "Available once Mbox Control is published on GitHub.")
-        uc.toggled.connect(lambda on: (self.app_state.__setitem__("update_check", on),
-                                       self.app_state.__setitem__("update_checked_at", 0),
-                                       self.save_app_state(), self.check_update()))
-        f.addRow("Updates", uc)
-        tu = QtWidgets.QCheckBox("Tester mode: offer new versions I save to Downloads")
-        tu.setChecked(bool(self.app_state.get("tester_updates")))
-        tu.setToolTip("For trying test builds: a newer mbox_control.py in ~/Downloads shows up as an update.")
-        tu.toggled.connect(lambda on: (self.app_state.__setitem__("tester_updates", on), self.save_app_state(),
-                                       self.check_update()))
-        f.addRow("", tu)
         dm = QtWidgets.QCheckBox("Fast meter reading (reads the Mbox directly)")
         dm.setChecked(self.app_state.get("direct_meters", True) is not False)
         dm.setToolTip("Much lighter on the CPU. If meters misbehave or the app stalls, switch it off — "

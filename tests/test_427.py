@@ -1,4 +1,6 @@
 """4.27: the Karaoke scene — mics direct to the speakers, song underneath, Mbox reverb, and back again."""
+from PySide6 import QtWidgets
+
 import mbox_control as mc
 
 
@@ -133,3 +135,11 @@ def test_dialog_builds_and_cleans_up_its_meters(win):
     assert len(win.meters) == n + 6
     d.accept()
     assert len(win.meters) == n
+
+
+def test_updates_live_in_settings(win):
+    i = win.page_index("Settings")
+    page = win.stack.widget(i) if hasattr(win, "stack") else None
+    texts = [w.text() for w in win.findChildren(QtWidgets.QPushButton)]
+    assert "Check now" in texts
+    assert page is None or any(b.text() == "Check now" for b in page.findChildren(QtWidgets.QPushButton))
