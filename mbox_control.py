@@ -46,7 +46,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, QPointF, QRectF
 
 APP_NAME = "Mbox Control"
-VERSION = "4.26.1"
+VERSION = "4.27"
 UPDATE_REPO = "fancy-butler/mbox-control"     # where releases are published; empty = no online checks
 HOME = Path.home()
 if sys.platform == "win32":
@@ -68,6 +68,7 @@ LABELS_FILE = CONF_DIR / "labels.json"
 STATE_FILE = CONF_DIR / "app-state.json"
 ORIGINAL_SNAPSHOT = CONF_DIR / "original-state.json"
 UNDO_SNAPSHOT = CONF_DIR / "before-last-scene.json"
+KARAOKE_BEFORE = CONF_DIR / "before-karaoke.json"     # what Karaoke puts back when you leave it
 SERVICE_PATH = Path(os.environ.get(
     "MBOX_CTL_SERVICE", HOME / "snd-firewire-ctl-services/target/release/snd-dice-ctl-service"))
 if not SERVICE_PATH.exists():
@@ -1703,7 +1704,13 @@ SCENES = [
      "check": ["Rear Outputs 3 and 4 → tape deck LINE IN (1/4\" TRS-to-RCA cables).",
                "Set record level on the deck."],
      "jacks": ["out3", "out4"]},
-    {"id": "record", "name": "🎤  Record mic / instrument",
+    {"id": "karaoke", "name": "🎤  Karaoke", "short": "Mics + song → speakers, zero delay",
+     "what": "Your mics go straight to Outputs 1/2 through the Mbox (no computer delay), with the "
+             "computer's song underneath and the Mbox's own reverb on the voices.",
+     "check": ["Mics plugged in, gain set so the loudest singing stays out of the red.",
+               "In your karaoke app, turn its own mic sound off (KARAO-Q: Microphones → Effects only)."],
+     "jacks": ["out1", "out2"]},
+    {"id": "record", "name": "🎙  Record mic / instrument",
      "short": "Inputs 1–4 → computer + Headphone A",
      "what": "Inputs 1–4 → computer, with zero-latency monitoring of inputs 1–4 plus computer "
              "playback on Headphone A.",
@@ -1721,6 +1728,38 @@ SCENES = [
                "When you're done: Effects page → Stop guitar mode."],
      "jacks": ["front1", "out1", "out2"]},
 ]
+
+
+# Karaoke: which inputs are mics and how the scene mixes them. Remembered in app_state["karaoke"].
+KARAOKE_DEFAULT = {"mics": ["Analog-A-1", "Analog-A-2"], "levels": {}, "balance": 0, "condenser": False,
+                   "reverb": True, "reverb_type": 3, "reverb_amount": 35, "active": False}
+REVERB_TYPES = ["Room 1", "Room 2", "Room 3", "Hall 1", "Hall 2", "Plate", "Echo", "Delay"]
+KARAOKE_SONG_DB = -6.0           # the song sits 6 dB under the mics at the middle of the balance
+KARAOKE_REVERB_OUT = 200         # effect return level (0–255): the amount is set by the mics' sends
+REVERB_MAX_RATE = 96000          # the Mbox's effect stops above 96 kHz
+
+
+def db_gain(db):
+    """dB (0 = unity) → Mbox mixer gain value."""
+    return 0 if db <= -60 else min(GAIN_MAX, round(UNITY * 10 ** (db / 20)))
+
+
+def karaoke_levels(cfg, mic):
+    """(mic gain, song gain) for one mic: balance −12…+12 dB (+ = more mics), plus the mic's own trim."""
+    bal = max(-12.0, min(12.0, float(cfg.get("balance", 0))))
+    trim = max(-30.0, min(0.0, float(cfg.get("levels", {}).get(mic, 0))))
+    return db_gain(min(0.0, bal) + trim), db_gain(KARAOKE_SONG_DB - max(0.0, bal))
+
+
+def karaoke_send(cfg):
+    """Mic → reverb send gain from the 0–100 amount (0 = no reverb)."""
+    a = max(0, min(100, int(cfg.get("reverb_amount", 35))))
+    return 0 if a == 0 else db_gain(-24 + a * 0.24)      # 100 % = 0 dB send, 35 % ≈ −15.6 dB
+
+
+def mic_jack(item):
+    n = int(item[-1])
+    return f"front{n}" if n <= 2 else (f"mic{n}" if n <= 4 else f"aux{n}")
 
 
 # ================================================================== ripping
@@ -7484,6 +7523,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def check_reset(self):
         if self.marker_present():
             return
+        if self.karaoke_cfg()["active"]:
+            QtCore.QTimer.singleShot(0, self.reapply_karaoke)
         name = self.app_state.get("startup_scene")
         if name and (SCENES_DIR / f"{name}.json").exists():
             self.apply_snapshot(load_json(SCENES_DIR / f"{name}.json", {}))
@@ -8133,6 +8174,11 @@ class MainWindow(QtWidgets.QMainWindow):
                           "When you're done: Effects page → Stop guitar mode."]
             v["jacks"] = [f"front{int(i[-1])}" if int(i[-1]) <= 2 else f"mic{i[-1]}" for i in self.guitar_inputs()] \
                 + ["out1", "out2"]
+        if s["id"] == "karaoke":
+            k = self.karaoke_cfg()
+            names = [("In " if int(m[-1]) <= 4 else "Aux ") + m[-1] for m in k["mics"]] or ["no mics picked"]
+            v["short"] = ("ON · " if k["active"] else "") + " + ".join(names) + " → speakers, no delay"
+            v["jacks"] = [mic_jack(m) for m in k["mics"]] + ["out1", "out2"]
         if s["id"] == "rip":
             st = self.app_state["setup"]
             v["short"] = f"{pair_label(st['rip'])} → computer"
@@ -9892,6 +9938,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---------------------------------------------------------------- scenes
     def ask_scene(self, s):
+        if s["id"] == "karaoke":
+            self.karaoke_dialog()
+            return
         s = self.scene_view(s)
         box = QtWidgets.QMessageBox(self)
         box.setWindowTitle(s["name"].strip())
@@ -9952,7 +10001,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.reload_state()
         save_json(UNDO_SNAPSHOT, self.snapshot())
         U = UNITY
-        if sid == "listen":
+        if sid != "karaoke" and self.karaoke_cfg()["active"]:
+            self.leave_karaoke(quiet=True)            # put back what was there before karaoke, then the new scene
+        if sid == "karaoke":
+            self.enter_karaoke()
+        elif sid == "listen":
             self.route_pair_to_mix(0, 1)
             self.mix_clear(1)
             self.mix_put(1, PC_LEFT, U, 0)
@@ -10000,10 +10053,253 @@ class MainWindow(QtWidgets.QMainWindow):
         self.reload_state()
         self.run_refreshers()
 
+    # ---------------------------------------------------------------- karaoke
+    def karaoke_cfg(self):
+        k = self.app_state.setdefault("karaoke", {})
+        for key, v in KARAOKE_DEFAULT.items():
+            k.setdefault(key, json.loads(json.dumps(v)))
+        return k
+
+    def input_name(self, item):
+        n = int(item[-1])
+        jack = f"Input {n}" if n <= 4 else f"Aux {n}"
+        name = self.label(f"in{n - 1}", "")
+        return f"{jack} ({name[:18]})" if name else jack
+
+    def enter_karaoke(self):
+        k = self.karaoke_cfg()
+        if not k["active"]:
+            save_json(KARAOKE_BEFORE, self.snapshot())
+            k["active"] = True
+            rlog("karaoke: on (saved the setup from before)")
+        ph = self.ctrl("phantom-powering")
+        if ph and ph.values[0] and not k["condenser"]:
+            self.write(ph, [False])                  # dynamic and wireless mics don't want +48V
+            rlog("karaoke: +48V off")
+        self.karaoke_write()
+        self.save_app_state()
+        self.rebuild_scene_grid()
+
+    def karaoke_write(self):
+        """Mix 1 → Outputs 1/2: the mics (direct monitor, zero delay), the song, the reverb return."""
+        k = self.karaoke_cfg()
+        mics = [m for m in k["mics"] if self.slot_of(m) is not None]
+        self.route_pair_to_mix(0, 1)
+        self.mix_clear(1)
+        song = karaoke_levels(k, "")[1]
+        self.mix_put(1, PC_LEFT, song, 0)
+        self.mix_put(1, PC_RIGHT, 0, song)
+        for left in self.app_state["setup"].get("always_on", []):      # e.g. the TV, unless it's a mic now
+            for item, lr in ((left, (UNITY, 0)), (pair_right(left), (0, UNITY))):
+                if item not in mics:
+                    self.mix_put(1, item, *lr)
+        for m in mics:
+            self.mix_put(1, m, *from_pan(karaoke_levels(k, m)[0], 0))
+            self.set_stream(int(m[-1]) - 1, m)       # and to the computer: capture channel n = input n
+        self.karaoke_reverb(mics)
+        self.reload_state()
+        self.run_refreshers()
+
+    def karaoke_reverb(self, mics):
+        k = self.karaoke_cfg()
+        on = bool(k["reverb"]) and self.ctrl("reverb-type") is not None and self.rate() <= REVERB_MAX_RATE
+        send = karaoke_send(k) if on else 0
+        mic_slots = {self.slot_of(m) for m in mics}
+        for bus in FX_BUS:                           # only the mics feed the reverb: no reverb on the song
+            c = self.ctrl("mixer-source-gain", bus)
+            if c:
+                vals = [round(send * math.sqrt(0.5)) if i in mic_slots else 0 for i in range(len(c.values))]
+                if vals != c.values:
+                    self.write(c, vals)
+        if not on:
+            if k["reverb"] and self.rate() > REVERB_MAX_RATE:
+                self.toast(f"The Mbox's reverb doesn't run at {self.rate() / 1000:g} kHz: karaoke is on "
+                           "without it. Use 96 kHz or lower for the reverb.", 9000)
+            return
+        self.route_pair(10, f"Mixer-{FX_BUS[0] + 1}", f"Mixer-{FX_BUS[1] + 1}")
+        self.write_element("reverb-type", 0, 0, int(k["reverb_type"]))
+        self.write_element("reverb-output-volume", 0, 0, KARAOKE_REVERB_OUT)
+        self.mix_put(1, "Reverb-1", UNITY, 0)
+        self.mix_put(1, "Reverb-2", 0, UNITY)
+
+    def reapply_karaoke(self):
+        """The Mbox was reset or replugged while karaoke was on: set it up again."""
+        if self.karaoke_cfg()["active"]:
+            self.reload_state()
+            self.enter_karaoke()
+            rlog("karaoke: re-applied after the Mbox came back")
+            self.toast("Karaoke is back on.", 5000)
+
+    def leave_karaoke(self, quiet=False):
+        k = self.karaoke_cfg()
+        if not k["active"]:
+            return
+        k["active"] = False
+        self.save_app_state()
+        before = load_json(KARAOKE_BEFORE, {})
+        ph = self.ctrl("phantom-powering")
+        if ph and ph.key in before and before[ph.key] and before[ph.key][0] and not ph.values[0]:
+            before.pop(ph.key)                       # never switch +48V on by itself: a ribbon mic could be in
+            self.toast("+48V was on before karaoke. Turn it back on from Home if you need it.", 9000)
+        elif not quiet:
+            self.toast("Karaoke off: everything is back the way it was.", 6000)
+        if before:
+            self.apply_snapshot(before)
+        rlog("karaoke: off (restored the setup from before)")
+        self.rebuild_scene_grid()
+
+    def karaoke_dialog(self):
+        k = self.karaoke_cfg()
+        d = QtWidgets.QDialog(self)
+        d.setWindowTitle("Karaoke")
+        d.setMinimumWidth(620)
+        v = QtWidgets.QVBoxLayout(d)
+        v.setSpacing(12)
+        v.addWidget(QtWidgets.QLabel("<b style='font-size:16px'>🎤  Karaoke</b>"))
+        v.addWidget(muted("Your mics go straight to the speakers inside the Mbox: no computer delay. The song "
+                          "plays underneath and the Mbox's own reverb goes on the voices. Turn your karaoke "
+                          "app's own mic sound off (KARAO-Q: Microphones → Effects only)."))
+        live = QtCore.QTimer(d)
+        live.setSingleShot(True)
+        live.setInterval(150)
+        live.timeout.connect(lambda: k["active"] and self.karaoke_write())
+
+        def changed():
+            self.save_app_state()
+            live.start()
+
+        mc, ml = card("Mics", "Tick the inputs with a mic. Sing your loudest: the meter should peak in the amber "
+                              "(−12 to −6 dB), never red. Red means it's distorting before it reaches these "
+                              "sliders: turn down the gain knob (inputs 1–4) or the receiver's output (Aux 5/6).")
+        g = QtWidgets.QGridLayout()
+        g.setHorizontalSpacing(12)
+        meters = []
+        for r, (item, _) in enumerate(INPUT_JACKS):
+            cb = QtWidgets.QCheckBox(self.input_name(item))
+            cb.setChecked(item in k["mics"])
+            m = Meter(thick=10)
+            slot = self.slot_of(item)
+            if slot is not None:
+                entry = ("mixer-source-meter", slot, m)
+                self.meters.append(entry)
+                meters.append(entry)
+            sl = QtWidgets.QSlider(Qt.Horizontal)
+            sl.setRange(-30, 0)
+            sl.setValue(int(k["levels"].get(item, 0)))
+            sl.setFixedWidth(120)
+            sl.setToolTip("This mic's level in the mix (after the Mbox's converter)")
+            val = QtWidgets.QLabel(f"{sl.value():+d} dB")
+            val.setFixedWidth(52)
+            knob = QtWidgets.QLabel("gain: Mbox knob" if int(item[-1]) <= 4 else "gain: on the receiver")
+            knob.setObjectName("muted")
+            sl.setEnabled(cb.isChecked())
+
+            def tick(on, item=item, sl=sl):
+                mics = [x for x in k["mics"] if x != item] + ([item] if on else [])
+                k["mics"] = [x for x, _ in INPUT_JACKS if x in mics]
+                sl.setEnabled(on)
+                changed()
+                self.rebuild_scene_grid()
+
+            def level(x, item=item, val=val):
+                k["levels"][item] = x
+                val.setText(f"{x:+d} dB")
+                changed()
+            cb.setMinimumWidth(cb.sizeHint().width())
+            cb.toggled.connect(tick)
+            sl.valueChanged.connect(level)
+            g.addWidget(cb, r, 0)
+            g.addWidget(m, r, 1)
+            g.addWidget(sl, r, 2)
+            g.addWidget(val, r, 3)
+            g.addWidget(knob, r, 4)
+        g.setColumnStretch(1, 1)
+        ml.addLayout(g)
+        cond = QtWidgets.QCheckBox("A condenser mic is on inputs 1–4 (keep +48V; it powers all four at once)")
+        cond.setChecked(bool(k["condenser"]))
+        cond.toggled.connect(lambda on: (k.__setitem__("condenser", on), self.save_app_state()))
+        ml.addWidget(cond)
+        v.addWidget(mc)
+
+        bc, bl = card("Mics vs song")
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("More song"))
+        bal = QtWidgets.QSlider(Qt.Horizontal)
+        bal.setRange(-12, 12)
+        bal.setValue(int(k["balance"]))
+        bal.setToolTip("Middle: the song sits 6 dB under the mics")
+        row.addWidget(bal, 1)
+        row.addWidget(QtWidgets.QLabel("More mics"))
+        bl.addLayout(row)
+        bal.valueChanged.connect(lambda x: (k.__setitem__("balance", x), changed()))
+        v.addWidget(bc)
+
+        rc, rl = card("Reverb on the mics", "The Mbox's own effect: zero delay, so your karaoke app's mic "
+                                            "effects can stay off. Not available above 96 kHz.")
+        has_fx = self.ctrl("reverb-type") is not None
+        rv = QtWidgets.QCheckBox("Reverb on")
+        rv.setChecked(bool(k["reverb"]))
+        typ = QtWidgets.QComboBox()
+        typ.addItems(REVERB_TYPES)
+        typ.setCurrentIndex(int(k["reverb_type"]))
+        amt = QtWidgets.QSlider(Qt.Horizontal)
+        amt.setRange(0, 100)
+        amt.setValue(int(k["reverb_amount"]))
+        rrow = QtWidgets.QHBoxLayout()
+        for w_ in (rv, typ, QtWidgets.QLabel("Amount"), amt):
+            rrow.addWidget(w_)
+        rrow.setStretch(3, 1)
+        rl.addLayout(rrow)
+        for w_ in (rv, typ, amt):
+            w_.setEnabled(has_fx)
+        rv.toggled.connect(lambda on: (k.__setitem__("reverb", on), changed()))
+        typ.currentIndexChanged.connect(lambda i: (k.__setitem__("reverb_type", i), changed()))
+        amt.valueChanged.connect(lambda x: (k.__setitem__("reverb_amount", x), changed()))
+        v.addWidget(rc)
+
+        btns = QtWidgets.QHBoxLayout()
+        go = QtWidgets.QPushButton()
+        go.setObjectName("primary")
+        stop = QtWidgets.QPushButton("Leave karaoke")
+        close = QtWidgets.QPushButton("Close")
+
+        def sync():
+            go.setText("Karaoke is on ✓" if k["active"] else "Start karaoke")
+            go.setEnabled(not k["active"])
+            stop.setEnabled(bool(k["active"]))
+
+        def start():
+            if not k["mics"]:
+                self.toast("Tick at least one mic input first.")
+                return
+            self._run_scene(self.scene_view(next(x for x in SCENES if x["id"] == "karaoke")))
+            sync()
+        go.clicked.connect(start)
+        stop.clicked.connect(lambda: (self.leave_karaoke(), sync()))
+        close.clicked.connect(d.accept)
+        sync()
+        btns.addWidget(go)
+        btns.addWidget(stop)
+        btns.addStretch(1)
+        btns.addWidget(close)
+        v.addLayout(btns)
+
+        def gone():
+            self.meters = [x for x in self.meters if x not in meters]
+            if live.isActive():
+                live.stop()
+                if k["active"]:
+                    self.karaoke_write()
+        d.finished.connect(gone)
+        d.show()
+        self.karaoke_dlg = d
+        return d
+
     def undo_scene(self):
         if not UNDO_SNAPSHOT.exists():
             self.toast("No scene to undo yet.")
             return
+        self.karaoke_cfg()["active"] = False
         self.apply_snapshot(load_json(UNDO_SNAPSHOT, {}))
         if hasattr(self, "hw_view"):
             self.hw_view.highlight = set()
@@ -10022,6 +10318,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def apply_user_scene(self, name):
         self.reload_state()
         save_json(UNDO_SNAPSHOT, self.snapshot())
+        self.karaoke_cfg()["active"] = False         # a saved scene replaces everything, karaoke included
         self.apply_snapshot(load_json(SCENES_DIR / f"{name}.json", {}))
         self.toast(f"Applied your scene “{name}”.")
 

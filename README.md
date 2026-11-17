@@ -17,8 +17,9 @@ control of everything else the box can do, and a few things it never could.
   Cables light up while sound is going through them.
 - **Router and mixer.** Covers all 6 stereo mixes, the outputs, both headphone outputs and S/PDIF. Pan, mute, solo and link work on any channel.
 - **Speaker sets.** Gives the front **Spkr** button real A/B/C speaker switching. Mute and dim work too.
-- **Scenes.** One click sets the box up for listening, ripping, recording or playing guitar
-  through the computer. Undo puts everything back. You can also save your own scenes.
+- **Scenes.** One click sets the box up for listening, ripping, recording, karaoke or playing guitar
+  through the computer. Karaoke sends your mics straight to the speakers with no computer delay,
+  with the song underneath and the Mbox's own reverb on the voices. Undo puts everything back. You can also save your own scenes.
 - **Ripping tapes and records.** Hands-free mode starts recording when the music starts and stops
   at the end of the side. You can split by silence or by song count on a waveform, and look up
   titles on MusicBrainz or Discogs. Tracks save as tagged FLAC with cover art and ReplayGain. It

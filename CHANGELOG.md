@@ -9,6 +9,12 @@
 
 
 
+## 4.27
+- **Karaoke scene.** One click sends your mics straight to Outputs 1/2 inside the Mbox. There's no computer delay, so your karaoke app only adds effects (KARAO-Q: Microphones → Effects only). The computer's song plays underneath, 6 dB down, with a mics-vs-song balance slider. The Mbox's own reverb goes on the voices only, never the song (pick the type and amount; off above 96 kHz). +48V goes off unless you say a condenser mic is plugged in. Each mic is also sent to its own capture channel (input n → channel n), so your karaoke app still hears it.
+- The scene's window lets you tick which inputs are mics and set a level for each. Live meters show where to set the gain knobs. The Mbox has no software gain control, so the meters say which knob to turn: the Mbox's own for inputs 1–4, the receiver's for Aux 5/6.
+- Leaving karaoke (another scene, or Leave karaoke) puts back exactly what was there before. The one exception is +48V, which the app never switches back on by itself. Karaoke comes back on its own if the Mbox is reset or replugged while it's on.
+- The Record scene's icon is now 🎙, so the two mic scenes are easy to tell apart.
+
 ## 4.26.1
 - Windows: after waking, the app waits 15 s before reconnecting so Avid's driver can bring the Mbox back first, reconnects only once (Windows announces waking twice), and always hangs up an old connection before making a new one.
 
